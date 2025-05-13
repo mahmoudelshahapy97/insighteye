@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres_container
+    restart: always
+    environment:
+      POSTGRES_DB: insighteye_db
+      POSTGRES_USER: insighteye_user
+      POSTGRES_PASSWORD: insighteye*+#@
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: '2'  # Limit to 2 CPUs
+          memory: 4G # Limit to 4GB RAM
+
+  qdrant:
+    restart: always
+    image: qdrant/qdrant 
+    container_name: qdrant_container
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    environment:
+      QDRANT__STORAGE__OPTIMIZERS__NUM_SEGMENTS_THREADS: 4  # Number of threads for optimization
+      QDRANT__STORAGE__OPTIMIZERS__MAX_OPTIMIZATION_THREADS: 4  # Maximum threads for optimization
+      QDRANT__STORAGE__PERFORMANCE__DEFAULT_SEGMENT_NUMBER: 8  # Default number of segments
+    deploy:
+      resources:
+        limits:
+          cpus: '4'  # Allocate 4 CPU cores
+          memory: 8G  # Allocate 8GB RAM
+        reservations:
+          cpus: '2'  # Ensure at least 2 CPU cores
+
+volumes:
+  postgres_data:
+  qdrant_storage:
+  

@@ -1,0 +1,83 @@
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.env
+
+data/
+denoise/
+input/
+model_cache/
+models/
+nemo_msdd_configs/
+uploads/
+videos/
+volumes/
+chromadb/
+.pytest_cache/
+htmlcov/
+logs/
+qdrant_storage/
+postgres_data/
+insighteye/
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore log files and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Ignore dependency directories
+node_modules/
+vendor/
+venv/
+*/__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+
+# Ignore build and distribution files
+dist/
+build/
+*.o
+*.so
+*.dll
+*.exe
+*.out
+*.class
+target/
+
+# Ignore IDE/editor specific files
+.vscode/
+.idea/
+*.sublime-workspace
+
+# Ignore environment and config files
+.env
+*.bak
+#config.yaml
+secrets.json
+
+# Ignore database files
+*.sqlite3
+*.db
+
+# Ignore generated documentation
+docs/_build/
+
+# Ignore coverage reports
+coverage/
+*.cover
+*.lcov
+*.coverage
+
+# Ignore compiled Python files
+*.pyc
+*.pyo
+
+
+###############
