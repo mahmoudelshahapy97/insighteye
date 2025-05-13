@@ -566,7 +566,7 @@ async def get_timestamp_range_alternative(camera_id: Optional[str] = None, usern
                     #         match=models.MatchValue(value=camera_ids[0])
                     #     )
                     # )
-                    ust_conditions.append(
+                    must_conditions.append(
                         models.FieldCondition(
                             key="camera_id",
                             match=models.MatchValue(value=camera_ids[0])

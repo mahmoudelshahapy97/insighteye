@@ -1174,7 +1174,10 @@ class StreamManager:
                     cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     label = f"Person #{i+1}: {conf:.2f}"
                     cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-            
+                    
+            text = f"Total People: {person_count}"
+            cv2.putText(annotated_frame, text, (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
             # # Draw total count with more visible styling
             # # Background rectangle for better visibility
             # text = f"Total People: {person_count}"
@@ -1195,6 +1198,7 @@ class StreamManager:
             # text_x = bg_x1 + 5
             # text_y = bg_y1 + text_height + 5 # Adjusted for baseline
             # cv2.putText(annotated_frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            # cv2.putText(annotated_frame, text, (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
             return annotated_frame, person_count
 
