@@ -21,7 +21,7 @@ services:
 
   qdrant:
     restart: always
-    image: qdrant/qdrant 
+    image: qdrant/qdrant:v1.14.0 
     container_name: qdrant_container
     ports:
       - "6333:6333"
@@ -36,9 +36,9 @@ services:
       resources:
         limits:
           cpus: '4'  # Allocate 4 CPU cores
-          memory: 8G  # Allocate 8GB RAM
+          memory: 12G  # Allocate 8GB RAM
         reservations:
-          cpus: '2'  # Ensure at least 2 CPU cores
+          cpus: '4'  # Ensure at least 2 CPU cores
 
 volumes:
   postgres_data:

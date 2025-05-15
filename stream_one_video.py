@@ -1269,8 +1269,32 @@ class StreamManager:
                     vectors_config=models.VectorParams(
                         size=1,  # Using minimal vector size since we're primarily using payload
                         distance=models.Distance.COSINE
-                    )
+                    ),
+                    # Add optimized index for timestamp and camera_id fields
+                    optimizers_config=models.OptimizersConfigDiff(
+                        indexing_threshold=0,  # Index immediately
+                    ),
+                    # Add sparse vectors for faster filtering
+                    sparse_vectors_config={
+                        "sparse": models.SparseVectorParams(
+                            index=models.SparseIndexParams()
+                        )
+                    }
                 )
+
+                # Create field indexes after collection creation
+                self.qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="timestamp",
+                    field_schema=models.PayloadSchemaType.FLOAT  
+                )
+                self.qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="camera_id",
+                    field_schema=models.PayloadSchemaType.KEYWORD
+                )
+            
+                
 
                 # # Create collection using thread pool to avoid blocking
                 # loop = asyncio.get_event_loop()
@@ -1294,8 +1318,31 @@ class StreamManager:
                     vectors_config=models.VectorParams(
                         size=1,
                         distance=models.Distance.COSINE
-                    )
+                    ),
+                    # Add optimized index for timestamp and camera_id fields
+                    optimizers_config=models.OptimizersConfigDiff(
+                        indexing_threshold=0,  # Index immediately
+                    ),
+                    # Add sparse vectors for faster filtering
+                    sparse_vectors_config={
+                        "sparse": models.SparseVectorParams(
+                            index=models.SparseIndexParams()
+                        )
+                    }
                 )
+
+                # Create field indexes after collection creation
+                self.qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="timestamp",
+                    field_schema=models.PayloadSchemaType.FLOAT  
+                )
+                self.qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="camera_id",
+                    field_schema=models.PayloadSchemaType.KEYWORD
+                )
+    
                 # # Create collection using thread pool to avoid blocking
                 # loop = asyncio.get_event_loop()
                 # await loop.run_in_executor(
