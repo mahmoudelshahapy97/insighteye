@@ -105,6 +105,7 @@ async def search_results(
     end_time: Optional[str] = Query(None), 
     page: Optional[int] = Query(1), 
     per_page: Optional[int] = Query(6, ge=1), #, le=12
+    full_data: Optional[bool] = Query(True),
     username: str = Depends(session_manager.get_current_user)):
     """
     Optimized endpoint to search for recorded data with pagination and filtering.
@@ -151,7 +152,7 @@ async def search_results(
         
         # Run count and data fetch in parallel
         count_task = asyncio.create_task(get_results_count(filter_obj, user_collection))
-        results_task = asyncio.create_task(get_paginated_results(filter_obj, user_collection, offset, per_page))
+        results_task = asyncio.create_task(get_paginated_results(filter_obj, user_collection, offset, per_page, full_data))
         
         # Wait for both tasks to complete
         total_count, current_page_results = await asyncio.gather(count_task, results_task)
@@ -183,7 +184,7 @@ async def search_results(
                 }
             except Exception as ts_err:
                 logger.warning(f"Could not get timestamp range metadata: {ts_err}")
-
+        
         return JSONResponse(content={
             "data": current_page_results,
             "current_page": current_page if total_count > 0 else 1,
@@ -220,7 +221,7 @@ async def get_results_count(filter_obj, collection_name: str):
             detail=f"Count operation failed: {str(e)}"
         )
 
-async def get_paginated_results(filter_obj, collection_name: str, offset: int, limit: int=1):
+async def get_paginated_results(filter_obj, collection_name: str, offset: int, limit: int=1, full_data: bool=True):
     """Get only the results needed for the current page"""
     try:
         # Use scroll API with pagination to get exactly what we need
@@ -238,18 +239,30 @@ async def get_paginated_results(filter_obj, collection_name: str, offset: int, l
         for point in points:
             if not point.payload:
                 continue
-                
-            result = {
-                "frame": point.payload.get("frame"),
-                "metadata": {
-                    "camera_id": point.payload.get("camera_id"),
-                    "name": point.payload.get("name", "Unknown"),
-                    "timestamp": point.payload.get("timestamp"),
-                    "date": point.payload.get("date"),
-                    "time": point.payload.get("time"),
-                    "person_count": point.payload.get("person_count", 0)
+            if full_data:    
+                result = {
+                    "frame": point.payload.get("frame"),
+                    "metadata": {
+                        "camera_id": point.payload.get("camera_id"),
+                        "name": point.payload.get("name", "Unknown"),
+                        "timestamp": point.payload.get("timestamp"),
+                        "date": point.payload.get("date"),
+                        "time": point.payload.get("time"),
+                        "person_count": point.payload.get("person_count", 0)
+                    }
                 }
-            }
+            else:
+                result = {
+                    "metadata": {
+                        "camera_id": point.payload.get("camera_id"),
+                        "name": point.payload.get("name", "Unknown"),
+                        "timestamp": point.payload.get("timestamp"),
+                        "date": point.payload.get("date"),
+                        "time": point.payload.get("time"),
+                        "person_count": point.payload.get("person_count", 0)
+                    }
+                }
+
             search_results.append(result)
             
         # Sort results by timestamp (newer first)

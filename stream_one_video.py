@@ -1176,7 +1176,7 @@ class StreamManager:
                     cv2.putText(annotated_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                     
             text = f"Total People: {person_count}"
-            cv2.putText(annotated_frame, text, (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(annotated_frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
             # # Draw total count with more visible styling
             # # Background rectangle for better visibility
