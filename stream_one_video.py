@@ -945,7 +945,7 @@ class StreamManager:
             if not cap.isOpened():
                 for i in range(max_reconnect_attempts):
                     logging.warning(f"Retrying connection to {source}, attempt {i+1}/{max_reconnect_attempts}")
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(5.0)
                     cap = cv2.VideoCapture(source)#, cv2.CAP_FFMPEG)
                     if cap.isOpened():
                         break
@@ -985,7 +985,7 @@ class StreamManager:
                         raise RuntimeError(f"Could not reconnect to {source} after {max_reconnect_attempts} attempts")
                     
                     # Try to reconnect
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(5.0)
                     if cap:
                         cap.release()
                     cap = cv2.VideoCapture(source)#, cv2.CAP_FFMPEG)

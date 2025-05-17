@@ -224,24 +224,37 @@ async def get_results_count(filter_obj, collection_name: str):
 async def get_paginated_results(filter_obj, collection_name: str, offset: int, limit: int=1, full_data: bool=True):
     """Get only the results needed for the current page"""
     try:
-        # Use scroll API with pagination to get exactly what we need
-        points, _ = qdrant_client.scroll(
-            collection_name=collection_name,
-            limit=limit,
-            offset=offset,  # Use calculated offset from pagination
-            with_payload=True,
-            with_vectors=False,
-            scroll_filter=filter_obj
-        )
-        
+        if full_data:
+            # Use scroll API with pagination to get exactly what we need
+            points, _ = qdrant_client.scroll(
+                collection_name=collection_name,
+                # limit=limit,
+                # offset=offset,  # Use calculated offset from pagination
+                with_payload=True,
+                with_vectors=False,
+                scroll_filter=filter_obj
+                # sort=models.SortParams(field="timestamp", order="desc")  # Add explicit sorting
+            )
+        else:
+            # Use scroll API with pagination to get exactly what we need
+            points, _ = qdrant_client.scroll(
+                collection_name=collection_name,
+                limit=limit,
+                offset=offset,  # Use calculated offset from pagination
+                with_payload=True,
+                with_vectors=False,
+                scroll_filter=filter_obj
+                # sort=models.SortParams(field="timestamp", order="desc")  # Add explicit sorting
+            )
+
         # Format results
         search_results = []
         for point in points:
             if not point.payload:
                 continue
+
             if full_data:    
                 result = {
-                    "frame": point.payload.get("frame"),
                     "metadata": {
                         "camera_id": point.payload.get("camera_id"),
                         "name": point.payload.get("name", "Unknown"),
@@ -253,6 +266,7 @@ async def get_paginated_results(filter_obj, collection_name: str, offset: int, l
                 }
             else:
                 result = {
+                    "frame": point.payload.get("frame"),
                     "metadata": {
                         "camera_id": point.payload.get("camera_id"),
                         "name": point.payload.get("name", "Unknown"),
