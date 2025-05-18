@@ -105,7 +105,7 @@ async def search_results(
     end_time: Optional[str] = Query(None), 
     page: Optional[int] = Query(1), 
     per_page: Optional[int] = Query(6, ge=1), #, le=12
-    full_data: Optional[bool] = Query(True),
+    full_data: Optional[bool] = Query(False),
     username: str = Depends(session_manager.get_current_user)):
     """
     Optimized endpoint to search for recorded data with pagination and filtering.
@@ -152,7 +152,11 @@ async def search_results(
         
         # Run count and data fetch in parallel
         count_task = asyncio.create_task(get_results_count(filter_obj, user_collection))
-        results_task = asyncio.create_task(get_paginated_results(filter_obj, user_collection, offset, per_page, full_data))
+        
+        if full_data:
+            results_task = asyncio.create_task(get_all_qdrant_data(filter_obj, user_collection))
+        else:
+            results_task = asyncio.create_task(get_paginated_results(filter_obj, user_collection, offset, per_page))
         
         # Wait for both tasks to complete
         total_count, current_page_results = await asyncio.gather(count_task, results_task)
@@ -221,31 +225,20 @@ async def get_results_count(filter_obj, collection_name: str):
             detail=f"Count operation failed: {str(e)}"
         )
 
-async def get_paginated_results(filter_obj, collection_name: str, offset: int, limit: int=1, full_data: bool=True):
+async def get_paginated_results(filter_obj, collection_name: str, offset: int, limit: int=1):
     """Get only the results needed for the current page"""
     try:
-        if full_data:
-            # Use scroll API with pagination to get exactly what we need
-            points, _ = qdrant_client.scroll(
-                collection_name=collection_name,
-                # limit=limit,
-                # offset=offset,  # Use calculated offset from pagination
-                with_payload=True,
-                with_vectors=False,
-                scroll_filter=filter_obj
-                # sort=models.SortParams(field="timestamp", order="desc")  # Add explicit sorting
-            )
-        else:
-            # Use scroll API with pagination to get exactly what we need
-            points, _ = qdrant_client.scroll(
-                collection_name=collection_name,
-                limit=limit,
-                offset=offset,  # Use calculated offset from pagination
-                with_payload=True,
-                with_vectors=False,
-                scroll_filter=filter_obj
-                # sort=models.SortParams(field="timestamp", order="desc")  # Add explicit sorting
-            )
+
+        # Use scroll API with pagination to get exactly what we need
+        points, _ = qdrant_client.scroll(
+            collection_name=collection_name,
+            limit=limit,
+            offset=offset,  # Use calculated offset from pagination
+            with_payload=True,
+            with_vectors=False,
+            scroll_filter=filter_obj
+            # sort=models.SortParams(field="timestamp", order="desc")  # Add explicit sorting
+        )
 
         # Format results
         search_results = []
@@ -253,29 +246,17 @@ async def get_paginated_results(filter_obj, collection_name: str, offset: int, l
             if not point.payload:
                 continue
 
-            if full_data:    
-                result = {
-                    "metadata": {
-                        "camera_id": point.payload.get("camera_id"),
-                        "name": point.payload.get("name", "Unknown"),
-                        "timestamp": point.payload.get("timestamp"),
-                        "date": point.payload.get("date"),
-                        "time": point.payload.get("time"),
-                        "person_count": point.payload.get("person_count", 0)
-                    }
+            result = {
+                "frame": point.payload.get("frame"),
+                "metadata": {
+                    "camera_id": point.payload.get("camera_id"),
+                    "name": point.payload.get("name", "Unknown"),
+                    "timestamp": point.payload.get("timestamp"),
+                    "date": point.payload.get("date"),
+                    "time": point.payload.get("time"),
+                    "person_count": point.payload.get("person_count", 0)
                 }
-            else:
-                result = {
-                    "frame": point.payload.get("frame"),
-                    "metadata": {
-                        "camera_id": point.payload.get("camera_id"),
-                        "name": point.payload.get("name", "Unknown"),
-                        "timestamp": point.payload.get("timestamp"),
-                        "date": point.payload.get("date"),
-                        "time": point.payload.get("time"),
-                        "person_count": point.payload.get("person_count", 0)
-                    }
-                }
+            }
 
             search_results.append(result)
             
@@ -290,6 +271,61 @@ async def get_paginated_results(filter_obj, collection_name: str, offset: int, l
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Search operation failed: {str(e)}"
         )
+
+async def get_all_qdrant_data(filter_obj, collection_name, batch_size=100):
+    """
+    Retrieve all points from a Qdrant collection asynchronously using offset-based pagination.
+    
+    Args:
+        filter_obj: Filter object to apply
+        collection_name: Name of the collection
+        batch_size: Number of points to retrieve per batch
+        
+    Returns:
+        List of all points in the collection
+    """
+    all_points = []
+    offset = 0
+    
+    while True:
+        # Get batch of points
+        points, next_page_offset = qdrant_client.scroll(
+            collection_name=collection_name,
+            limit=batch_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+            scroll_filter=filter_obj
+        )
+        
+        if not points:
+            break
+            
+        for point in points:
+            if not point.payload:
+                continue
+
+            result = {
+                "metadata": {
+                    "camera_id": point.payload.get("camera_id"),
+                    "name": point.payload.get("name", "Unknown"),
+                    "timestamp": point.payload.get("timestamp"),
+                    "date": point.payload.get("date"),
+                    "time": point.payload.get("time"),
+                    "person_count": point.payload.get("person_count", 0)
+                }
+            }
+            # Add point to result
+            all_points.append(result)  # Use append instead of extend
+            
+        # Update offset for next iteration
+        offset = next_page_offset
+        
+        # If next_page_offset is None, we've reached the end
+        if next_page_offset is None:
+            break
+    
+    return all_points
 
 def build_filter_from_query(query: SearchQuery):
     """
