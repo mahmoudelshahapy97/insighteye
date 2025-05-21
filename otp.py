@@ -81,7 +81,7 @@ async def generate_otp(request: OTPRequest):
         logger.error(f"Error in generate_otp endpoint for {request.email}: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=create_response_body(success=False, message="Failed to generate OTP due to an internal error")
+            detail=create_response(success=False, message="Failed to generate OTP due to an internal error")
         )
         # return create_response(
         #     success=False,
