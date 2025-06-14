@@ -33,6 +33,7 @@ from token_expiration import TokenExpirationStrategy
 from datetime import datetime
 from database import initialize_database
 
+
 # # Create tables if they don't exist
 # logging.info("Create tables if they don't exist")
 # initialize_database()
