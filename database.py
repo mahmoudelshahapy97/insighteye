@@ -140,6 +140,8 @@ def drop_all_tables():
             detail="Internal server error during table drop operation."
         )
 
+drop_all_tables()
+
 # Add this to database.py
 def execute_db_transaction(queries_and_params):
     """Execute multiple queries in a single transaction"""
@@ -354,138 +356,6 @@ def validate_video_source(source: str) -> str:
             raise ValueError("Local source must be a video file with extension: " + ", ".join(video_extensions))
     
     return source
-
-# # Database connection pool
-# connection_pool = None
-
-# def initialize_db_pool(dbname, user, password, host, port, min_conn=1, max_conn=10):
-#     """Initialize the database connection pool."""
-#     global connection_pool
-#     try:
-#         connection_pool = psycopg2.pool.ThreadedConnectionPool(
-#             min_conn, max_conn,
-#             dbname=dbname,
-#             user=user,
-#             password=password,
-#             host=host,
-#             port=port
-#         )
-#         logger.info("Database connection pool initialized")
-#     except psycopg2.Error as e:
-#         logger.critical(f"Failed to initialize database pool: {e}")
-#         raise
-
-# @contextmanager
-# def get_db_connection():
-#     """Get a database connection from the pool with context management."""
-#     conn = None
-#     try:
-#         conn = connection_pool.getconn()
-#         # Register UUID adapter for consistent type handling
-#         psycopg2.extras.register_uuid()
-#         yield conn
-#     except psycopg2.OperationalError as e:
-#         logger.error(f"Database connection error: {e}")
-#         raise HTTPException(status_code=500, detail="Database connection error")
-#     finally:
-#         if conn:
-#             connection_pool.putconn(conn)
-
-# @contextmanager
-# def get_db_cursor(commit=False):
-#     """Get a database cursor with automatic transaction management."""
-#     with get_db_connection() as conn:
-#         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-#         try:
-#             yield cur
-#             if commit:
-#                 conn.commit()
-#         except psycopg2.Error as e:
-#             conn.rollback()
-#             logger.error(f"Database error: {e}")
-#             error_message = str(e)
-#             # Sanitize error messages for production
-#             if "permission denied" in error_message.lower():
-#                 raise HTTPException(status_code=403, detail="Permission denied")
-#             elif "duplicate key" in error_message.lower():
-#                 raise HTTPException(status_code=409, detail="Duplicate entry")
-#             elif "not found" in error_message.lower():
-#                 raise HTTPException(status_code=404, detail="Resource not found")
-#             else:
-#                 raise HTTPException(status_code=500, detail="Database error")
-#         finally:
-#             cur.close()
-
-# def execute_query(query: str, params: Optional[tuple] = None, fetch_one: bool = False, 
-#                  fetch_all: bool = False, return_rowcount: bool = False) -> Any:
-#     """Execute a database query with consistent error handling."""
-#     with get_db_cursor(commit=True) as cur:
-#         cur.execute(query, params or ())
-        
-#         if fetch_one:
-#             return cur.fetchone()
-#         elif fetch_all:
-#             return cur.fetchall()
-#         elif return_rowcount:
-#             return cur.rowcount
-#         return None
-
-# def execute_batch(queries_and_params: List[Tuple[str, tuple]]) -> bool:
-#     """Execute multiple queries in a single transaction."""
-#     with get_db_connection() as conn:
-#         try:
-#             with conn.cursor() as cur:
-#                 for query, params in queries_and_params:
-#                     cur.execute(query, params or ())
-#             conn.commit()
-#             return True
-#         except psycopg2.Error as e:
-#             conn.rollback()
-#             logger.error(f"Batch execution error: {e}")
-#             raise HTTPException(status_code=500, detail="Database batch operation failed")
-
-# def format_uuid(value) -> str:
-#     """Ensure consistent UUID formatting as string."""
-#     if value is None:
-#         return None
-#     return str(value)
-
-# def format_db_result(row, dict_cursor=True) -> Dict:
-#     """Format database row results with proper type handling."""
-#     if not row:
-#         return None
-    
-#     result = dict(row) if dict_cursor else row
-    
-#     # Convert any UUID fields to strings for JSON serialization
-#     if isinstance(result, dict):
-#         for key, value in result.items():
-#             if key.endswith('_id') and value is not None:
-#                 result[key] = format_uuid(value)
-    
-#     return result
-
-# # Create a connection pool
-# connection_pool = psycopg2.pool.SimpleConnectionPool(
-#     user=config['database']['user'],
-#     password=config['database']['password'],
-#     database=config['database']['dbname'],
-#     host=config['database']['host'],
-#     port=config['database']['port'],
-#     minconn=1,
-#     maxconn=10
-# )
-
-# def get_db_connection():
-#     """Gets a connection from the connection pool."""
-#     try:
-#         return connection_pool.getconn()
-#     except psycopg2.OperationalError as e:
-#         raise HTTPException(status_code=500, detail=f"Database connection error: {e}")
-
-# def release_db_connection(conn):
-#     """Returns a connection to the connection pool."""
-#     connection_pool.putconn(conn)
 
 # Database connection pool
 connection_pool = None

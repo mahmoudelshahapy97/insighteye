@@ -1,4 +1,5 @@
-from fastapi import HTTPException, Response, Body, Path, status
+#utils.py
+from fastapi import HTTPException, status
 # import datetime
 import json
 import psycopg2
@@ -19,18 +20,79 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from schemas_models import TokenRequest, ValidateSessionRequest, GetUsernameFromSessionRequest, TokenRequest
 import time
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time as dt_time 
+from uuid import UUID
+# Qdrant specific imports
+from qdrant_client import QdrantClient, models as qdrant_models
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("app.log"),
-        logging.StreamHandler()
-    ])
 logger = logging.getLogger(__name__)
 
 _models = {}
+
+# --- QDRANT UTILITIES ---
+BASE_QDRANT_COLLECTION_NAME = config.get("qdrant_collection_name", "person_counts")
+_workspace_collection_init_cache = {} # Cache for workspace collection initialization status
+
+def get_workspace_qdrant_collection_name(workspace_id: Union[str, UUID]) -> str:
+    """
+    Generates the Qdrant collection name for a given workspace.
+    All data related to a workspace will be stored in this single collection.
+    Example: person_counts_ws_xxxxxxxx_xxxx_xxxx_xxxx_xxxxxxxxxxxx
+    """
+    # Sanitize UUID string for collection name (replace hyphens)
+    return f"{BASE_QDRANT_COLLECTION_NAME}_ws_{str(workspace_id).replace('-', '_')}"
+
+def ensure_workspace_qdrant_collection_exists(client: QdrantClient, workspace_id: Union[str, UUID]):
+    """
+    Ensures that a Qdrant collection for the given workspace_id exists.
+    Creates it if it doesn't, with appropriate payload indexes.
+    """
+    collection_name = get_workspace_qdrant_collection_name(workspace_id)
+    global _workspace_collection_init_cache # If you want to keep the cache
+
+    if collection_name in _workspace_collection_init_cache:
+        return
+
+    try:
+        # More robust check if collection exists
+        try:
+            client.get_collection(collection_name=collection_name)
+            logger.debug(f"Qdrant collection '{collection_name}' already exists.")
+            _workspace_collection_init_cache[collection_name] = True
+            return # Collection exists
+        except Exception as e:
+            if "not found" in str(e).lower() or (hasattr(e, 'status_code') and e.status_code == 404):
+                pass # Collection does not exist, proceed to create
+            else:
+                raise # Other error during check
+
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config=qdrant_models.VectorParams(size=1, distance=qdrant_models.Distance.DOT),
+        )
+        logger.info(f"Created Qdrant collection: {collection_name} for workspace {workspace_id}")
+
+        payload_indexes_map = {
+            "timestamp": qdrant_models.PayloadSchemaType.FLOAT,
+            "camera_id": qdrant_models.PayloadSchemaType.KEYWORD,
+            "username": qdrant_models.PayloadSchemaType.KEYWORD, # Owner of the data point
+            "date": qdrant_models.PayloadSchemaType.KEYWORD,
+        }
+        for field, schema_type in payload_indexes_map.items():
+            try:
+                client.create_payload_index(collection_name, field_name=field, field_schema=schema_type)
+                logger.info(f"Created payload index for field '{field}' in collection '{collection_name}'.")
+            except Exception as e_idx:
+                if "already exists" in str(e_idx).lower():
+                    logger.info(f"Payload index for field '{field}' already exists in '{collection_name}'.")
+                else:
+                    logger.warning(f"Could not create payload index for '{field}' in '{collection_name}': {e_idx}")
+        
+        _workspace_collection_init_cache[collection_name] = True
+    except Exception as e:
+        logger.error(f"Error ensuring Qdrant collection '{collection_name}' exists for workspace {workspace_id}: {e}", exc_info=True)
+        # Re-raise to make the caller aware of the failure
+        raise HTTPException(status_code=500, detail=f"Failed to initialize Qdrant workspace collection: {collection_name}")
 
 def handle_exceptions(func):
     async def wrapper(*args, **kwargs):
@@ -165,7 +227,7 @@ def parse_iso_date(date_str: str) -> str:
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid date format: {date_str}. Expected YYYY-MM-DD.")
 
-def parse_time_string(time_str: Optional[str], default_time: time) -> time:
+def parse_time_string(time_str: Optional[str], default_time: dt_time) -> dt_time:
     """Parses HH:MM or HH:MM:SS format, returns default on failure or None input."""
     if time_str is None:
         return default_time
@@ -176,7 +238,7 @@ def parse_time_string(time_str: Optional[str], default_time: time) -> time:
         second = parts[2] if len(parts) > 2 else 0
         # Basic validation
         if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59:
-            return time(hour, minute, second)
+            return dt_time(hour, minute, second)
         else:
             logger.warning(f"Invalid time component value in '{time_str}'. Using default: {default_time}")
             return default_time
@@ -187,9 +249,125 @@ def parse_time_string(time_str: Optional[str], default_time: time) -> time:
 def paginate_list(data, per_page):
     return [data[i : i + per_page] for i in range(0, len(data), per_page)]
 
+def make_prediction(camera_id, data):
+    """
+    Makes predictions using an XGBoost model based on historical data.
+    Returns predictions for next hour, day, and week.
+    Falls back to average-based prediction if models aren't available.
+    """
+    if not data or len(data) == 0:
+        logging.info(f"No data available for camera {camera_id}. Returning zero predictions.")
+        return {
+            "next_hour": 0,
+            "next_day": 0,
+            "next_week": 0
+        }
+    
+    # Convert the data to a DataFrame for easier processing
+    records = []
+    for item in data:
+        try:
+            timestamp = item["metadata"]["timestamp"]
+            person_count = item["metadata"]["person_count"]
+            records.append({
+                "timestamp": timestamp,
+                "person_count": person_count,
+                "camera_id": item["metadata"]["camera_id"]
+            })
+        except KeyError as e:
+            logging.warning(f"Skipping record with missing metadata field: {e}")
+            continue
+    
+    # If we couldn't extract any valid records, return zeros
+    if not records:
+        logging.warning(f"No valid records found for camera {camera_id}. Returning zero predictions.")
+        return {
+            "next_hour": 0,
+            "next_day": 0,
+            "next_week": 0
+        }
+    
+    df = pd.DataFrame(records)
+    
+    # Get model paths
+    model_path = f"models/{camera_id}"
+    hourly_model_path = f"{model_path}_hourly.model"
+    daily_model_path = f"{model_path}_daily.model"
+    weekly_model_path = f"{model_path}_weekly.model"
+    
+    # Check if model files exist before trying to load them
+    import os
+    models_exist = (
+        os.path.exists(hourly_model_path) and 
+        os.path.exists(daily_model_path) and 
+        os.path.exists(weekly_model_path)
+    )
+    
+    if not models_exist:
+        logging.info(f"XGBoost models not found for camera {camera_id}. Using fallback prediction method.")
+        return use_fallback_prediction(df)
+    
+    try:
+        # Try to load models if they exist
+        hourly_model = xgb.Booster()
+        hourly_model.load_model(hourly_model_path)
+        
+        daily_model = xgb.Booster()
+        daily_model.load_model(daily_model_path)
+        
+        weekly_model = xgb.Booster()
+        weekly_model.load_model(weekly_model_path)
+        
+        # Convert timestamp to datetime and extract features
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit='s')
+        df["hour"] = df["datetime"].dt.hour
+        df["day_of_week"] = df["datetime"].dt.dayofweek
+        df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
+        
+        # Calculate rolling statistics as features
+        df = df.sort_values("timestamp")
+        df["rolling_mean_3h"] = df["person_count"].rolling(window=3, min_periods=1).mean()
+        df["rolling_mean_24h"] = df["person_count"].rolling(window=24, min_periods=1).mean()
+        
+        # Get the most recent data point
+        latest_data = df.iloc[-1]
+        
+        # Create feature array for prediction
+        features = np.array([
+            latest_data["hour"],
+            latest_data["day_of_week"],
+            latest_data["is_weekend"],
+            latest_data["rolling_mean_3h"],
+            latest_data["rolling_mean_24h"],
+            latest_data["person_count"]
+        ]).reshape(1, -1)
+        
+        # Convert to DMatrix for XGBoost
+        dmatrix = xgb.DMatrix(features)
+        
+        # Make predictions
+        next_hour_prediction = round(float(hourly_model.predict(dmatrix)[0]))
+        next_day_prediction = round(float(daily_model.predict(dmatrix)[0]))
+        next_week_prediction = round(float(weekly_model.predict(dmatrix)[0]))
+        
+        # Ensure predictions are non-negative
+        next_hour_prediction = max(0, next_hour_prediction)
+        next_day_prediction = max(0, next_day_prediction)
+        next_week_prediction = max(0, next_week_prediction)
+        
+        logging.info(f"Successfully used XGBoost models for camera {camera_id}")
+        return {
+            "next_hour": next_hour_prediction,
+            "next_day": next_day_prediction,
+            "next_week": next_week_prediction
+        }
+    
+    except Exception as e:
+        logging.error(f"Error using XGBoost models for camera {camera_id}: {e}")
+        return use_fallback_prediction(df)
+
 def paginate_list1(data, page, per_page):
     return [data[i] for i in range((page - 1) * per_page, min(page * per_page, len(data)))]
-
 
 def make_prediction_defalut(camera_id, data):
     """
@@ -208,98 +386,6 @@ def make_prediction_defalut(camera_id, data):
         "next_day": round(average_count * 1.1),
         "next_week": round(average_count * 1.05)
         }
-
-# def make_prediction(camera_id, data):
-#     """
-#     Makes predictions using an XGBoost model based on historical data.
-#     Returns predictions for next hour, day, and week.
-#     """
-#     if not data or len(data) == 0:
-#         # Return default predictions if no data is available
-#         return {
-#             "next_hour": 0,
-#             "next_day": 0,
-#             "next_week": 0
-#         }
-    
-#     # Convert the data to a DataFrame for easier processing
-#     records = []
-#     for item in data:
-#         timestamp = item["metadata"]["timestamp"]
-#         person_count = item["metadata"]["person_count"]
-#         records.append({
-#             "timestamp": timestamp,
-#             "person_count": person_count,
-#             "camera_id": item["metadata"]["camera_id"]
-#         })
-    
-#     df = pd.DataFrame(records)
-    
-#     # Convert timestamp to datetime and extract features
-#     df["datetime"] = pd.to_datetime(df["timestamp"], unit='s')
-#     df["hour"] = df["datetime"].dt.hour
-#     df["day_of_week"] = df["datetime"].dt.dayofweek
-#     df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
-    
-#     # Calculate rolling statistics as features
-#     df = df.sort_values("timestamp")
-#     df["rolling_mean_3h"] = df["person_count"].rolling(window=3, min_periods=1).mean()
-#     df["rolling_mean_24h"] = df["person_count"].rolling(window=24, min_periods=1).mean()
-    
-#     # Load the pre-trained models
-#     model_path = f"models/{camera_id}"
-#     try:
-#         hourly_model = xgb.Booster()
-#         hourly_model.load_model(f"{model_path}_hourly.model")
-        
-#         daily_model = xgb.Booster()
-#         daily_model.load_model(f"{model_path}_daily.model")
-        
-#         weekly_model = xgb.Booster()
-#         weekly_model.load_model(f"{model_path}_weekly.model")
-#     except Exception as e:
-#         logging.error(f"Failed to load XGBoost models for camera {camera_id}: {e}")
-#         # Fallback to a simple average-based prediction if models aren't available
-#         total_count = sum([item["metadata"]["person_count"] for item in data])
-#         average_count = total_count / len(data)
-#         return {
-#             "next_hour": round(average_count * 1.2),
-#             "next_day": round(average_count * 1.1),
-#             "next_week": round(average_count * 1.05)
-#         }
-    
-#     # Prepare features for prediction
-#     # Get the most recent data point
-#     latest_data = df.iloc[-1]
-    
-#     # Create feature array for prediction
-#     features = np.array([
-#         latest_data["hour"],
-#         latest_data["day_of_week"],
-#         latest_data["is_weekend"],
-#         latest_data["rolling_mean_3h"],
-#         latest_data["rolling_mean_24h"],
-#         latest_data["person_count"]
-#     ]).reshape(1, -1)
-    
-#     # Convert to DMatrix for XGBoost
-#     dmatrix = xgb.DMatrix(features)
-    
-#     # Make predictions
-#     next_hour_prediction = round(float(hourly_model.predict(dmatrix)[0]))
-#     next_day_prediction = round(float(daily_model.predict(dmatrix)[0]))
-#     next_week_prediction = round(float(weekly_model.predict(dmatrix)[0]))
-    
-#     # Ensure predictions are non-negative
-#     next_hour_prediction = max(0, next_hour_prediction)
-#     next_day_prediction = max(0, next_day_prediction)
-#     next_week_prediction = max(0, next_week_prediction)
-    
-#     return {
-#         "next_hour": next_hour_prediction,
-#         "next_day": next_day_prediction,
-#         "next_week": next_week_prediction
-#     }
 
 def make_prediction_all_cameras(camera_id, data):
     """
@@ -448,123 +534,6 @@ def make_prediction_all_cameras(camera_id, data):
         "next_week": next_week_prediction
     }
 
-def make_prediction(camera_id, data):
-    """
-    Makes predictions using an XGBoost model based on historical data.
-    Returns predictions for next hour, day, and week.
-    Falls back to average-based prediction if models aren't available.
-    """
-    if not data or len(data) == 0:
-        logging.info(f"No data available for camera {camera_id}. Returning zero predictions.")
-        return {
-            "next_hour": 0,
-            "next_day": 0,
-            "next_week": 0
-        }
-    
-    # Convert the data to a DataFrame for easier processing
-    records = []
-    for item in data:
-        try:
-            timestamp = item["metadata"]["timestamp"]
-            person_count = item["metadata"]["person_count"]
-            records.append({
-                "timestamp": timestamp,
-                "person_count": person_count,
-                "camera_id": item["metadata"]["camera_id"]
-            })
-        except KeyError as e:
-            logging.warning(f"Skipping record with missing metadata field: {e}")
-            continue
-    
-    # If we couldn't extract any valid records, return zeros
-    if not records:
-        logging.warning(f"No valid records found for camera {camera_id}. Returning zero predictions.")
-        return {
-            "next_hour": 0,
-            "next_day": 0,
-            "next_week": 0
-        }
-    
-    df = pd.DataFrame(records)
-    
-    # Get model paths
-    model_path = f"models/{camera_id}"
-    hourly_model_path = f"{model_path}_hourly.model"
-    daily_model_path = f"{model_path}_daily.model"
-    weekly_model_path = f"{model_path}_weekly.model"
-    
-    # Check if model files exist before trying to load them
-    import os
-    models_exist = (
-        os.path.exists(hourly_model_path) and 
-        os.path.exists(daily_model_path) and 
-        os.path.exists(weekly_model_path)
-    )
-    
-    if not models_exist:
-        logging.info(f"XGBoost models not found for camera {camera_id}. Using fallback prediction method.")
-        return use_fallback_prediction(df)
-    
-    try:
-        # Try to load models if they exist
-        hourly_model = xgb.Booster()
-        hourly_model.load_model(hourly_model_path)
-        
-        daily_model = xgb.Booster()
-        daily_model.load_model(daily_model_path)
-        
-        weekly_model = xgb.Booster()
-        weekly_model.load_model(weekly_model_path)
-        
-        # Convert timestamp to datetime and extract features
-        df["datetime"] = pd.to_datetime(df["timestamp"], unit='s')
-        df["hour"] = df["datetime"].dt.hour
-        df["day_of_week"] = df["datetime"].dt.dayofweek
-        df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
-        
-        # Calculate rolling statistics as features
-        df = df.sort_values("timestamp")
-        df["rolling_mean_3h"] = df["person_count"].rolling(window=3, min_periods=1).mean()
-        df["rolling_mean_24h"] = df["person_count"].rolling(window=24, min_periods=1).mean()
-        
-        # Get the most recent data point
-        latest_data = df.iloc[-1]
-        
-        # Create feature array for prediction
-        features = np.array([
-            latest_data["hour"],
-            latest_data["day_of_week"],
-            latest_data["is_weekend"],
-            latest_data["rolling_mean_3h"],
-            latest_data["rolling_mean_24h"],
-            latest_data["person_count"]
-        ]).reshape(1, -1)
-        
-        # Convert to DMatrix for XGBoost
-        dmatrix = xgb.DMatrix(features)
-        
-        # Make predictions
-        next_hour_prediction = round(float(hourly_model.predict(dmatrix)[0]))
-        next_day_prediction = round(float(daily_model.predict(dmatrix)[0]))
-        next_week_prediction = round(float(weekly_model.predict(dmatrix)[0]))
-        
-        # Ensure predictions are non-negative
-        next_hour_prediction = max(0, next_hour_prediction)
-        next_day_prediction = max(0, next_day_prediction)
-        next_week_prediction = max(0, next_week_prediction)
-        
-        logging.info(f"Successfully used XGBoost models for camera {camera_id}")
-        return {
-            "next_hour": next_hour_prediction,
-            "next_day": next_day_prediction,
-            "next_week": next_week_prediction
-        }
-    
-    except Exception as e:
-        logging.error(f"Error using XGBoost models for camera {camera_id}: {e}")
-        return use_fallback_prediction(df)
-
 def use_fallback_prediction(df):
     """
     Fallback prediction method based on simple averages.
@@ -633,93 +602,129 @@ def datetime_filter(timestamp, format="%Y-%m-%d %H:%M:%S"):
     if timestamp:
         return datetime.fromtimestamp(timestamp).strftime(format)
     return ""
-    
-async def send_email(email, subject: str, body: str):
-    """Sends to the specified email address."""
-    try:
-        sender_email = config.get("otp_sender_email", "your-email@gmail.com")
-        sender_password = config.get("smtp_password", "your-app-password")
-        smtp_server = config.get("smtp_server")
-        smtp_port = config.get("smtp_port")
 
-        if not sender_email or not sender_password:
-            logger.error("SMTP credentials not configured")
+async def send_email(recipient_email: str, subject: str, body: str, html_body: Optional[str] = None): # Added html_body optional
+    """Sends an email to the specified recipient_email address."""
+    try:
+        # These are the credentials for the email account *sending* the email
+        app_sender_email = config.get("otp_sender_email") # Your application's sending email
+        app_sender_password = config.get("smtp_password")
+        smtp_server_host = config.get("smtp_server")
+        smtp_server_port = config.get("smtp_port")
+
+        if not all([app_sender_email, app_sender_password, smtp_server_host, smtp_server_port]):
+            logger.error("SMTP server, port, or credentials not fully configured for send_email.")
             return False
 
         message = MIMEMultipart("alternative")
         message["Subject"] = subject
-        message["From"] =  sender_email
-        message["To"] = email
-        
-        # Create the plain-text and HTML version of your message
+        message["From"] = app_sender_email # Email is from your application
+        message["To"] = recipient_email
+
+        # Attach plain text part
         text_part = MIMEText(body, "plain")
-        
-        # HTML version of the message
-        html_body = f"""
-            <html>
-                <body>
-                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 5px;">
-                    <h2 style="color: #333; text-align: center;">One-Time Password</h2>
-                    <p>Your OTP code is:</p>
-                    <div style="text-align: center; padding: 10px; background-color: #f5f5f5; font-size: 24px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
-                    body.strip().split(':')[1].strip().split('\n')[0]
-                    </div>
-                    <p>This code will expire in 10 minutes.</p>
-                    <p>If you did not request this code, please ignore this email.</p>
-                    <hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;">
-                    <p style="font-size: 12px; color: #777; text-align: center;">This is an automated message, please do not reply to this email.</p>
-                </div>
-                </body>
-            </html>
-            """
-
-        # html_part = MIMEText(html_body, "html")
-        
-        # Add HTML/plain-text parts to MIMEMultipart message
         message.attach(text_part)
-        # message.attach(html_part)
-        
-        # Create secure connection and send email
-        context = ssl.create_default_context()
 
+        # Attach HTML part if provided
+        if html_body:
+            html_part = MIMEText(html_body, "html")
+            message.attach(html_part)
+        # Example HTML body structure from your original code (adapt as needed)
+        # elif "One-Time Password" in subject: # Crude way to detect OTP email
+        #     # This OTP extraction logic from your original code is very fragile and likely incorrect:
+        #     # otp_code_extracted = body.strip().split(':')[1].strip().split('\n')[0] # This is risky
+        #     # Instead, the OTP should be passed directly to this function if it's an OTP email.
+        #     # For a generic send_email, you'd pass the full HTML body.
+
+        #     # For OTP, you'd construct html_body before calling send_email or pass OTP directly
+        #     # otp_html_body = f"""... OTP: {otp_code_passed_in} ..."""
+        #     # html_part = MIMEText(otp_html_body, "html")
+        #     # message.attach(html_part)
+        #     pass # Keep it simple for now, pass html_body if needed
+
+
+        context = ssl.create_default_context()
         try:
-            with smtplib.SMTP(smtp_server, smtp_port) as server:
+            with smtplib.SMTP(smtp_server_host, smtp_server_port) as server:
                 server.ehlo()
                 server.starttls(context=context)
                 server.ehlo()
-                server.login(sender_email, sender_password)
-                server.sendmail(sender_email, email, message.as_string())
-                logging.info(f"email sent successfully to {email}")
+                server.login(app_sender_email, app_sender_password)
+                server.sendmail(
+                    from_addr=app_sender_email,       # Envelope sender
+                    to_addrs=recipient_email,         # Envelope recipient
+                    msg=message.as_string()
+                )
+                logging.info(f"Email sent successfully to {recipient_email} with subject '{subject}'")
             return True
-        except Exception as e:
-            logging.error(f"Error sending email: {e}")
+        except smtplib.SMTPAuthenticationError:
+            logger.error(f"SMTP Authentication Error for {app_sender_email}. Check credentials.")
             return False
-            
+        except smtplib.SMTPRecipientsRefused:
+            logger.error(f"Recipient refused for email to {recipient_email}.")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending email via SMTP to {recipient_email}: {e}", exc_info=True)
+            return False
     except Exception as e:
-        logger.error(f"Error in send_email: {str(e)}")
+        logger.error(f"General error in send_email setup for {recipient_email}: {str(e)}", exc_info=True)
         return False
 
-async def send_email_from_client(email, subject, body):
-    """Sends to the specified email address."""
-
-    sender_email = config.get("otp_sender_email", "your-email@gmail.com")
-    sender_password = config.get("smtp_password", "your-app-password")
-
-    message = MIMEMultipart()
-    message["From"] =  sender_email
-    message["To"] = email
-    message["Subject"] = subject
-    message.attach(MIMEText(body, "plain"))
-
+async def send_email_from_client_to_admin(
+    admin_recipient_email: str,
+    subject: str,
+    body: str,
+    reply_to_email: Optional[str] = None # Optional: email of the client for Reply-To
+):
+    """
+    Sends an email TO an admin/support address, appearing FROM the system's sender email.
+    Optionally sets the Reply-To header to the client's email.
+    """
     try:
-        with smtplib.SMTP(config.get("smtp_server"), config.get("smtp_port")) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.sendmail(email, sender_email, message.as_string())
-            logging.info(f"email sent successfully to {email}")
-        return True
+        # Credentials for the email account *sending* the email
+        app_sender_email = config.get("otp_sender_email") # Your application's sending email
+        app_sender_password = config.get("smtp_password")
+        smtp_server_host = config.get("smtp_server")
+        smtp_server_port = config.get("smtp_port")
+
+        if not all([app_sender_email, app_sender_password, smtp_server_host, smtp_server_port]):
+            logger.error("SMTP server, port, or credentials not fully configured for send_email_from_client_to_admin.")
+            return False
+
+        message = MIMEMultipart()
+        message["From"] = app_sender_email  # Email is from your application
+        message["To"] = admin_recipient_email # Email is TO your admin/support
+        message["Subject"] = subject
+        if reply_to_email:
+            message.add_header('Reply-To', reply_to_email) # Set Reply-To for easy response
+
+        message.attach(MIMEText(body, "plain"))
+
+        context = ssl.create_default_context()
+        try:
+            with smtplib.SMTP(smtp_server_host, smtp_server_port) as server:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+                server.login(app_sender_email, app_sender_password)
+                server.sendmail(
+                    from_addr=app_sender_email,        # Envelope sender (your app's email)
+                    to_addrs=admin_recipient_email,    # Envelope recipient (admin's email)
+                    msg=message.as_string()
+                )
+                logging.info(f"Admin notification email sent successfully to {admin_recipient_email} regarding inquiry from {reply_to_email or 'unknown sender'} with subject '{subject}'")
+            return True
+        except smtplib.SMTPAuthenticationError:
+            logger.error(f"SMTP Authentication Error for {app_sender_email} (admin notification). Check credentials.")
+            return False
+        except smtplib.SMTPRecipientsRefused:
+            logger.error(f"Recipient refused for admin notification email to {admin_recipient_email}.")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending admin notification email via SMTP to {admin_recipient_email}: {e}", exc_info=True)
+            return False
     except Exception as e:
-        logging.error(f"Error sending email: {e}")
+        logger.error(f"General error in send_email_from_client_to_admin setup for {admin_recipient_email}: {str(e)}", exc_info=True)
         return False
 
 
@@ -770,12 +775,20 @@ def get_ChatOpenAI_model(model_id, base_url, temperature, num_predict, format_):
 def get_ChatOllama_model(model_id, temperature, num_predict, format_):
     """Get or create LLaVA model"""
     if model_id not in _models:
-        _models[model_id] = ChatOllama(
-            model=model_id,
-            temperature = temperature,
-            num_predict = num_predict,
-            format=format_ 
-        )
+        try:
+            _models[model_id] = ChatOllama(
+                model=model_id,
+                temperature=temperature,
+                num_predict=num_predict,
+                format=format_,
+                # base_url="http://localhost:11434"  # Explicit base URL
+            )
+            # Test the connection
+            test_response = _models[model_id].invoke([{"role": "user", "content": "test"}])
+            logger.info(f"Model {model_id} connection verified")
+        except Exception as e:
+            logger.error(f"Failed to connect to Ollama model {model_id}: {e}")
+            raise
     return _models[model_id]
 
 async def generate_chat_response(
@@ -788,55 +801,46 @@ async def generate_chat_response(
     stream: bool = False,
     format_: str = "",
     image: Optional[str] = "",
-    # functions: Optional[List] = None
 ):
     """Core logic for generating a chat response"""
-    if not image:
+    try:
+        if not image:
+            model_id = config['models']['chat']['llama']
+            model = get_ChatOllama_model(model_id, temperature, max_tokens, format_)
+            logger.info("Model loaded successfully")
+
+            messages = format_chat_history(history, system_prompt=system_prompt, context=context)
+            messages.append({"role": "human", "content": prompt})
+        else:
+            model_id = config['models']['chat']['llava']
+            model = get_ChatOllama_model(model_id, temperature, max_tokens, format_)
+            logger.info("Model loaded successfully")
+
+            messages = format_chat_history(history, system_prompt=system_prompt, context=context)
+            content_parts = [
+                {"type": "image_url", "image_url": f"data:image/jpeg;base64,{image}"},
+                {"type": "text", "text": prompt}
+            ]
+            messages.append({"role": "user", "content": content_parts})
+
+        if stream:
+            async def generate_response():
+                try:
+                    async for chunk in model.astream(messages):
+                        yield chunk.content
+                        await asyncio.sleep(0.01)
+                except Exception as e:
+                    logger.error(f"Streaming error: {e}")
+                    yield f"Error: Unable to connect to AI model. Please check if Ollama is running."
+            return generate_response()
+
+        response = await model.ainvoke(messages)
+        return response.content
         
-        model_id = config['models']['chat']['llama']
-        # base_url = config['models']['chat']['base_url']
-        model = get_ChatOllama_model(model_id, temperature, max_tokens, format_)
-        # model = get_ChatOpenAI_model(model_id, base_url, temperature, max_tokens, format_)
-        logger.info("Model loaded successfully")
-
-        messages = format_chat_history(
-            history,
-            system_prompt=system_prompt,
-            context=context
-        )
-        messages.append({"role": "human", "content": prompt})
-    else:
-        model_id = config['models']['chat']['llava']
-        model = get_ChatOllama_model(model_id, temperature, max_tokens, format_)
-        logger.info("Model loaded successfully")
-
-        messages = format_chat_history(
-            history,
-            system_prompt=system_prompt,
-            context=context
-        )
-        content_parts = []
-        text_part = {"type": "text", "text": prompt}
-        image_part = {
-            "type": "image_url",
-            "image_url": f"data:image/jpeg;base64,{image}",
-        }
+    except Exception as e:
+        logger.error(f"Error in generate_chat_response: {e}")
+        return "Error: Unable to connect to AI model. Please ensure Ollama is running and the required models are available."
         
-        content_parts.append(image_part)
-        content_parts.append(text_part)
-
-        messages.append({"role": "user", "content": content_parts})
-
-    if stream:
-        async def generate_response():
-            async for chunk in model.astream(messages):
-                yield chunk.content
-                await asyncio.sleep(0.01)  # Yield periodically to keep the connection alive
-        return generate_response()
-
-    response = await model.ainvoke(messages)
-    return response.content
-
 def format_chat_history(
     history: Union[str, List[Dict[str, str]]],
     system_prompt: str,
@@ -881,22 +885,3 @@ def validate_text(text: str) -> str:
     # Remove unsafe characters
     text = ''.join(char for char in text if char.isprintable())
     return text.strip()
-
-"""
-import yagmail
-
-# Email credentials
-sender_email = "your_email@gmail.com"
-app_password = "your_app_password"  # Use an App Password
-
-# Initialize Yagmail
-yag = yagmail.SMTP(sender_email, app_password)
-
-# Send email
-yag.send(
-    to="recipient@example.com",
-    subject="Test Email",
-    contents="Hello, this is a test email from yagmail!"
-)
-print("Email sent successfully!")
-"""

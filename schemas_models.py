@@ -1,10 +1,9 @@
+# schemas_models.py
 from pydantic_settings import BaseSettings
 from pydantic import BaseModel, RootModel, EmailStr, Field, validator, constr
 from typing import Generator, Dict, List, Optional, Tuple, Any, Set, Union
 from uuid import UUID
-import time
 from datetime import datetime
-import pytz
 from fastapi import Header, Cookie
 
 class Settings(BaseSettings):
@@ -24,9 +23,10 @@ class PKCERequest(BaseModel):
 ###### Log ######
 class LogEntry(BaseModel):
     """Schema for a log entry."""
-    log_id: str
-    created_at: str
-    content: str
+    log_id: Optional[str] = None
+    workspace_id: Optional[str] = None
+    created_at: Optional[str] = None
+    content: Optional[str] = None
     username: Optional[str] = None
     action_type: Optional[str] = None
     ip_address: Optional[str] = None
@@ -48,6 +48,7 @@ class LogFilterRequest(BaseModel):
     offset: int = Field(0, ge=0)
     sort_by: str = "created_at"
     sort_direction: str = "desc"
+    workspace_id: Optional[UUID] = None
 
 ###### Chat ######
 class BaseChatRequest(BaseModel):
@@ -56,7 +57,7 @@ class BaseChatRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=512, ge=1, le=2048)
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     format_: Optional[str] = Field(default='')
-    stream: Optional[bool] = Field(default=False)
+    stream: Optional[bool] = Field(default=True)#True
 
 class ChatRequest(BaseChatRequest):
     """Basic chat request"""
@@ -72,12 +73,74 @@ class TokenPair(BaseModel):
     # expires_at: datetime = Field(..., description="Access token expiration timestamp")
     expires_at: str = Field(..., description="Access token expiration timestamp in ISO format")
 
+# Update TokenData model to include workspace_id
 class TokenData(BaseModel):
     user_id: str
-    exp: int = Field(..., description="Expiration timestamp")
-    token_type: str = Field(..., description="Token type: access or refresh")
+    workspace_id: Optional[str] = None
+    exp: int
+    token_type: str
     needs_refresh: Optional[bool] = False
 
+# Workspace Models
+class WorkspaceBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = None
+
+class WorkspaceCreate(WorkspaceBase):
+    pass
+
+class WorkspaceUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class WorkspaceInDB(WorkspaceBase):
+    workspace_id: UUID
+    created_at: datetime
+    updated_at: datetime
+    is_active: bool
+
+class WorkspaceWithMemberInfo(WorkspaceInDB):
+    member_role: str
+    member_count: Optional[int] = None
+
+# Workspace Member Models
+class WorkspaceMemberBase(BaseModel):
+    workspace_id: UUID
+    user_id: UUID
+    role: str = Field(..., pattern="^(member|admin|viewer)$")
+
+class WorkspaceMemberCreate(BaseModel):
+    user_id: UUID
+    role: str = Field("member", pattern="^(member|admin|viewer)$")
+
+class WorkspaceMemberUpdate(BaseModel):
+    role: str = Field(..., pattern="^(member|admin|viewer)$")
+
+class WorkspaceMemberInDB(WorkspaceMemberBase):
+    membership_id: UUID
+    username: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkspaceResponse(BaseModel):
+    workspace_id: UUID
+    name: str
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    is_active: bool
+    
+class WorkspaceMemberResponse(BaseModel):
+    membership_id: UUID
+    workspace_id: UUID
+    user_id: UUID
+    username: str
+    role: str
+    created_at: datetime
+    updated_at: datetime
+    
 class RefreshTokenRequest(BaseModel):
     refresh_token: str = Field(..., description="Refresh token to get new access token")
 
@@ -188,9 +251,9 @@ class TokenListResponse(BaseModel):
 # Request Models
 class CreateUserRequest(BaseModel):
     username: str = Field(..., description="Username for the new user")
-    # username: constr(min_length=1)
     password: str = Field(..., description="Password for the new user")
     email: EmailStr = Field(..., description="Email address for the new user")
+    role: str = Field("user", pattern="^(user|admin)$")#|moderator|workspace_admin
 
 class LoginRequest(BaseModel):
     username: Optional[str] = Field(None, description="Username of the user")
@@ -260,6 +323,8 @@ class UsersListResponse1(RootModel[List[UserResponse]]):
 class OTPRequest(BaseModel):
     email: EmailStr
     length: Optional[int] = Field(default=6, ge=4, le=10)
+    purpose: str = 'login'
+    expiration: Optional[int] = Field(default=None, ge=60, le=3600)
 
     @validator('length')
     def validate_length(cls, v):
@@ -267,10 +332,18 @@ class OTPRequest(BaseModel):
             raise ValueError('OTP length must be between 4 and 10 digits')
         return v
 
+    @validator('purpose')
+    def validate_purpose(cls, v):
+        allowed = {'login', 'password_reset', 'email_verification'}
+        if v not in allowed:
+            raise ValueError(f"Purpose must be one of {allowed}")
+        return v
+
 class OTPVerification(BaseModel):
     email: EmailStr
     otp: str
     expiration: Optional[int] = Field(default=600, ge=60, le=3600)
+    purpose: str = 'login'
 
     @validator('otp')
     def validate_otp(cls, v):
@@ -278,12 +351,42 @@ class OTPVerification(BaseModel):
             raise ValueError('OTP must contain only digits')
         return v
 
+    @validator('purpose')
+    def validate_purpose(cls, v):
+        allowed = {'login', 'password_reset', 'email_verification'}
+        if v not in allowed:
+            raise ValueError(f"Purpose must be one of {allowed}")
+        return v
+    
 class OTPDeletion(BaseModel):
     email: EmailStr
+    purpose: str = 'login'
+
+    @validator('purpose')
+    def validate_purpose(cls, v):
+        allowed = {'login', 'password_reset', 'email_verification'}
+        if v not in allowed:
+            raise ValueError(f"Purpose must be one of {allowed}")
+        return v
 
 class OTPSendEmail(BaseModel):
     email: EmailStr
     otp: str
+    purpose: str = 'login'
+    expiration: Optional[int] = Field(default=None, ge=60, le=3600)
+
+    @validator('otp')
+    def validate_otp(cls, v):
+        if not v.isdigit():
+            raise ValueError('OTP must contain only digits')
+        return v
+
+    @validator('purpose')
+    def validate_purpose(cls, v):
+        allowed = {'login', 'password_reset', 'email_verification'}
+        if v not in allowed:
+            raise ValueError(f"Purpose must be one of {allowed}")
+        return v
 
 ###### SESSION REQUEST MODELS ######
 
@@ -369,7 +472,7 @@ class CameraStreamQueryParams(BaseModel):
 class StreamCreate(BaseModel):
     name: str
     path: str
-    type: str
+    type: str = Field("local", pattern="^(rtsp|http|local|other|video file)$")
     status: str = Field("inactive", description="Status: active, inactive")
     is_streaming: bool = False
 
@@ -542,3 +645,20 @@ class ProjectMetadata(BaseModel):
     description: Optional[str] = Field(None, description="Project description")
     last_updated: datetime = Field(default_factory=datetime.now)
     features: Optional[Dict[str, bool]] = Field(default_factory=dict)
+
+# SQLQuery
+class SQLQueryRequest(BaseModel):
+    query: str = Field(..., description="The SQL query to execute.")
+    params: Optional[List[Any]] = Field(None, description="Optional list of parameters for parameterized queries.")
+
+class SQLQueryResponse(BaseModel):
+    success: bool
+    message: str
+    data: Optional[Any] = Field(None, description="Query result data, if any (e.g., list of records for SELECT, row count for DML).")
+
+class User(BaseModel):
+    user_id: UUID
+    username: str
+    role: str 
+    is_active: bool
+
