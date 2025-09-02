@@ -1,0 +1,57 @@
+sudo apt update && sudo apt upgrade -y
+sudo apt install nginx -y
+sudo apt install supervisor -y
+sudo apt install postgresql-client -y
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y docker.io
+sudo systemctl enable --now docker
+
+sudo apt install zenity -y
+sudo apt update  
+sudo apt install git -y
+sudo apt install build-essential -y
+sudo apt install g++
+sudo apt install python3-dev
+########################
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install python3.10 python3.10-venv python3.10-dev python3.10-distutils -y
+sudo apt install libgl1
+########################
+python3.10 -m venv insighteye
+source insighteye/bin/activate
+pip install -r requirements.txt
+
+
+mkdir -p /home/ubuntu/insighteye/backend/postgres_data
+mkdir -p /home/ubuntu/insighteye/backend/qdrant_storage
+
+sudo chown 999:999 /home/ubuntu/insighteye/backend/postgres_data
+
+sudo chown 1000:1000 /home/ubuntu/insighteye/backend/qdrant_storage
+
+sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+
+sudo usermod -aG docker ${USER}
+newgrp docker
+groups
+
+docker --version
+docker-compose --version
+docker-compose down -v
+docker-compose up -d
+docker ps
+docker logs postgres_container
+
+docker-compose down -v
+docker volume prune -f
+
+psql -h localhost -p 5432 -U insighteye_user -d insighteye_db
+SELECT version();
+\q
+
+
+curl -k https://16.170.216.227/insighteye/docs
+curl -k https://localhost/insighteye/docs
+

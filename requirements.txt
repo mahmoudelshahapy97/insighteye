@@ -22,7 +22,6 @@ langchain
 langchain-ollama 
 #jwt
 python-dotenv
-apscheduler
 xgboost
 anyio
 #smtplib
@@ -32,3 +31,14 @@ asyncpg
 pyotp
 langchain_community
 PyJWT
+tenacity
+apscheduler
+
+pytest-mock
+pytest-asyncio
+pytest-tornasync
+pytest-trio
+pytest-twisted
+pytest 
+pytest-asyncio
+pytest-cov

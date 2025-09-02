@@ -1,4 +1,4 @@
-#config.py
+#async_config.py
 import yaml
 
 def load_config(config_path="async_config.yaml"):

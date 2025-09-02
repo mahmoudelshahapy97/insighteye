@@ -15,7 +15,7 @@ from jwt import DecodeError, PyJWTError
 import logging
 import hashlib
 # import json 
-from token_expiration import TokenExpirationStrategy
+from async_token_expiration import TokenExpirationStrategy
 from async_user_manager import UserManager 
 
 logger = logging.getLogger(__name__)
@@ -605,61 +605,12 @@ class SessionManager:
         if not token_data:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired access token", headers={"WWW-Authenticate": "Bearer"})
         
-        # Add debugging information
-        logger.debug(f"Token data for user lookup: {token_data.user_id}")
-        try:
+        user_details = await self.user_manager.get_user_by_id(UUID(token_data.user_id)) # Ensure UUID
 
-            user_details = await self.user_manager.get_user_by_id(UUID(token_data.user_id)) # Ensure UUID
-
-            # Debug what we got back
-            logger.debug(f"User details retrieved: {user_details}")
-            
-            if not user_details:
-                logger.warning(f"No user found for user_id {token_data.user_id}")
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED, 
-                    detail="User not found for provided token", 
-                    headers={"WWW-Authenticate": "Bearer"}
-                )
-
-            if not user_details.get("is_active"):
-                logger.warning(f"User {token_data.user_id} is not active")
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED, 
-                    detail="User account is inactive", 
-                    headers={"WWW-Authenticate": "Bearer"}
-                )
-
-
-            username = user_details.get("username")
-            if not username:
-                logger.error(f"Username is None for user_id {token_data.user_id}. Full user_details: {user_details}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                    detail="Username not found in user record"
-                )
-            
-            # Ensure username is a string
-            if isinstance(username, (list, tuple)) and len(username) > 0:
-                logger.warning(f"Username returned as sequence: {username}, taking first element")
-                return str(username[0])
-            elif isinstance(username, str):
-                return username
-            else:
-                logger.error(f"Username has unexpected type: {type(username)}, value: {username}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                    detail="Invalid username format in user record"
-                )
-
-        except Exception as e:
-            if isinstance(e, HTTPException):
-                raise  # Re-raise HTTP exceptions as-is
-            logger.error(f"Error retrieving user details for user_id {token_data.user_id}: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                detail="Error retrieving user information"
-            )
+        if not user_details or not user_details.get("is_active"):
+            logger.warning(f"Authenticated user_id {token_data.user_id} not found or inactive in DB.")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User associated with token not found or is inactive.", headers={"WWW-Authenticate": "Bearer"})
+        return user_details["username"]
 
     async def get_token_from_header(self, credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
         """Extracts token and checks if it's blacklisted."""

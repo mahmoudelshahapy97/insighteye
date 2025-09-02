@@ -1,0 +1,96 @@
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    
+    server_name 16.170.216.227;
+    
+    # Redirect all HTTP requests to HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    
+    root /var/www/html;
+    index index.html index.htm index.nginx-debian.html;
+    server_name 16.170.216.227;
+    
+    # Self-signed certificate for IP address
+    ssl_certificate /etc/ssl/certs/nginx-ip-cert.crt;
+    ssl_certificate_key /etc/ssl/private/nginx-ip-cert.key;
+    
+    # SSL settings
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    
+    location /insighteye/ {
+        proxy_pass http://127.0.0.1:8000/;
+        
+        # Proxy headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Timeouts for long-running requests
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+    
+    # Increase the maximum allowed size for requests
+    client_max_body_size 100M;
+}
+
+
+#sudo apt install certbot python3-certbot-nginx
+#sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/nginx-selfsigned.key -out /etc/ssl/certs/nginx-selfsigned.crt
+
+## Generate new self-signed certificate and key
+#sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/nginx-selfsigned.key -out /etc/ssl/certs/nginx-selfsigned.crt -subj "/CN=16.170.216.227"
+
+## Set correct permissions
+#sudo chmod 644 /etc/ssl/certs/nginx-selfsigned.crt
+#sudo chmod 640 /etc/ssl/private/nginx-selfsigned.key
+#sudo chown root:www-data /etc/ssl/private/nginx-selfsigned.key
+
+## Verify Nginx configuration
+sudo nginx -t
+
+## Restart Nginx completely (not just reload)
+#sudo systemctl stop nginx
+#sudo systemctl start nginx
+
+#sudo certbot --nginx -d insighteye.io
+#dig insighteye.io
+
+#ssl_certificate /etc/letsencrypt/live/insighteye.io/fullchain.pem;     
+#ssl_certificate_key /etc/letsencrypt/live/insighteye.io/privkey.pem;
+
+#sudo nano /etc/nginx/sites-available/insighteye
+#sudo nano /etc/nginx/sites-enabled/insighteye
+
+
+# Copy the configuration file
+sudo cp nginx-ip-config.conf /etc/nginx/sites-available/ip-site
+
+# Create symbolic link
+sudo ln -sf /etc/nginx/sites-available/ip-site /etc/nginx/sites-enabled/
+
+# Test Nginx configuration
+sudo nginx -t
+
+# Restart Nginx if test passes
+sudo systemctl restart nginx
+
+# Verify certificate contains IP address
+openssl x509 -in /etc/nginx/ssl/nginx-ip-cert.crt -text -noout | grep -A1 'Subject Alternative Name'

@@ -1,4 +1,4 @@
-
+# config.yaml
 project:
   description: Insighteye API with various ML capabilities
   name: Insighteye API
@@ -11,7 +11,7 @@ app:
   description: Insighteye API with various ML capabilities
   host: 127.0.0.1
   name: Insighteye API
-  port: 8000
+  port: 8010
   version: 1.0.0
   log_level: info
   workers: 8
@@ -20,19 +20,20 @@ logging:
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
   level: INFO
 
-origins:
+cors_origins:
   - "13.61.228.251"
   - "http://13.61.228.251"
   - "http://localhost:8000"
   - "http://localhost:3000"
   - "localhost"
 
-allowed_hosts:
-  - "13.61.228.251"
-  - "http://13.61.228.251"
-  - "http://localhost:8000"
-  - "http://localhost:3000"
+trusted_hosts:
+  - "127.0.0.1"
   - "localhost"
+
+otp_rate_limit_seconds: 60
+otp_expiration_seconds: 600
+
 
 ACCESS_TOKEN_EXPIRE_MINUTES: 1500 #min
 REFRESH_TOKEN_EXPIRE_DAYS: 15 #days
@@ -41,8 +42,10 @@ session_timeout: 600 #seconds
 # secrets.token_urlsafe(32)
 SECRET_KEY: e20d4027c260b6452f7607db8e7e4d02994d65a67d245665ba597e1d374cc2b4
 # model_path: "yolov8n.pt"
-model_path: "yolov9c_80_ultralitics_second_train.pt"
 # model_path: "yolov9c_80_ultralitics_second_train.pt"
+people_model_path: "people.pt"
+gender_model_path: "gender.pt"
+fire_model_path: "fire.pt"
 max_workers: 4
 
 sender_email: "Insighteye@gateworx.net"
@@ -64,6 +67,10 @@ qdrant_collection_name: "person_counts"
 query_timeout: 50
 qdrant_fetch_limit: 50
 
+
+milvus_uri: "http://localhost:19530"
+milvus_token: "root:Milvus"
+
 session_id: "2gXz1vQjW7-M6XsHwZp9D1BEXyL3oAqVfJbYK9t5U2c"
 
 database:
@@ -73,8 +80,8 @@ database:
   host: "localhost"
   port: "5432"
 
-host: "127.0.0.1"
-port: 8000
+server_host: "127.0.0.1"
+server_port: 8000
 fastapi_root_path: "/insighteye"
 
 stream_cleanup_interval_seconds: 60.0
@@ -85,6 +92,7 @@ models:
   chat:
     embeddings: mixedbread-ai/mxbai-embed-large-v1
     format: json
+    #llama: llama3.2:3b-instruct-fp16
     llama: llama3.2:1b
     phi: vanilj/Phi-4:Q8_0
     phi4: phi4
@@ -104,3 +112,68 @@ prompts:
   text_chat: You are a helpful assistant that can answer questions about the text.
 
 max_history_length: 100
+
+# Add random delay to prevent simultaneous access
+file_access_jitter_seconds: 2.0
+
+# Improved buffer settings
+cv_frame_buffer_size: 1  
+
+# Maximum concurrent streams per file
+max_streams_per_file: 2
+shared_stream_buffer_size: 3
+shared_stream_timeout_seconds: 30.0
+
+frame_skip: 300  # Reduced from 2
+
+# Shorter delays and timeouts
+stream_reconnect_delay_base_seconds: 1.0
+stream_reconnect_delay_frame_read_seconds: 2.0
+max_consecutive_frame_failures: 15  # Reduced threshold
+
+
+# Prevent multiple streams from same file
+prevent_duplicate_file_streams: True
+file_access_timeout_seconds: 10.0
+
+# Enable stream sharing for same source
+enable_stream_sharing: True
+
+# Performance settings
+shared_stream_max_fps: 30
+video_file_manager_cleanup_interval: 300  # 5 minutes
+
+# Error handling
+shared_stream_reconnect_delay: 2.0
+shared_stream_max_reconnect_attempts: 5
+stream_max_reconnect_attempts: 3
+
+# Memory management
+max_shared_streams: 50
+shared_stream_memory_limit_mb: 100
+
+# Debugging
+log_shared_stream_stats: true
+log_shared_stream_stats_interval: 30
+
+video_loop_on_end: true
+video_validation_enabled: true
+max_video_restart_attempts: 10
+
+# Timeouts
+stream_stop_timeout_seconds: 10.0
+stream_stale_threshold_seconds: 45.0
+stream_manager_poll_interval_seconds: 2.0
+
+# File validation
+validate_video_files_before_processing: true
+video_file_validation_timeout: 10.0
+
+# Performance
+yolo_max_input_dim: 640  # Reduced for better performance
+stream_db_activity_update_interval_seconds: 5.0  # More frequent DB updates
+
+# Video-specific settings
+video_loop_enabled: true
+video_restart_on_end: true
+short_video_optimization: true

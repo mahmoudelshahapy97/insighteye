@@ -5,6 +5,7 @@ from typing import Generator, Dict, List, Optional, Tuple, Any, Set, Union
 from uuid import UUID
 from datetime import datetime
 from fastapi import Header, Cookie
+from decimal import Decimal
 
 class Settings(BaseSettings):
     smtp_server: str = "smtp.gmail.com"
@@ -57,7 +58,7 @@ class BaseChatRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=512, ge=1, le=2048)
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     format_: Optional[str] = Field(default='')
-    stream: Optional[bool] = Field(default=True)#True
+    stream: Optional[bool] = Field(default=False)
 
 class ChatRequest(BaseChatRequest):
     """Basic chat request"""
@@ -122,7 +123,6 @@ class WorkspaceMemberInDB(WorkspaceMemberBase):
     username: str
     created_at: datetime
     updated_at: datetime
-
 
 class WorkspaceResponse(BaseModel):
     workspace_id: UUID
@@ -461,29 +461,101 @@ class CurrentUserResponse(BaseModel):
 ###### CAMERA ######
 class StreamQueryParams(BaseModel):
     frame_delay: Optional[float] = 0
-    frame_skip: Optional[int] = 5
+    frame_skip: Optional[int] = 300
     conf: Optional[float] = 0.4
 
 class CameraStreamQueryParams(BaseModel):
     frame_delay: Optional[float] = 0
-    frame_skip: Optional[int] = 5
+    frame_skip: Optional[int] = 300
     conf: Optional[float] = 0.4
 
 class StreamCreate(BaseModel):
-    name: str
-    path: str
-    type: str = Field("local", pattern="^(rtsp|http|local|other|video file)$")
-    status: str = Field("inactive", description="Status: active, inactive")
-    is_streaming: bool = False
+    # Required fields
+    name: str = Field(..., max_length=50)
+    path: str = Field(..., max_length=255)
+    type: str = Field(default='local', pattern='^(rtsp|http|local|other|video file)$')
+    status: str = Field(default='inactive', pattern='^(active|inactive|error|processing)$')
+    is_streaming: bool = Field(default=False)
+    
+    # Optional location and metadata fields
+    location: Optional[str] = Field(None, max_length=100)
+    area: Optional[str] = Field(None, max_length=100)
+    building: Optional[str] = Field(None, max_length=100)
+    floor_level: Optional[str] = Field(None, max_length=20)
+    zone: Optional[str] = Field(None, max_length=50)
+    latitude: Optional[Decimal] = Field(None, ge=-90, le=90, decimal_places=8)
+    longitude: Optional[Decimal] = Field(None, ge=-180, le=180, decimal_places=8)
+    
+    # Optional alert fields
+    count_threshold_greater: Optional[int] = Field(None, ge=0)
+    count_threshold_less: Optional[int] = Field(None, ge=0)
+    alert_enabled: bool = Field(default=False)
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "name": "Main Entrance Camera",
+                "path": "/dev/video0",
+                "type": "local",
+                "status": "active",
+                "is_streaming": True,
+                "location": "Building A Entrance",
+                "area": "Reception",
+                "building": "Building A",
+                "floor_level": "Ground Floor",
+                "zone": "Security Zone 1",
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "count_threshold_greater": 10,
+                "count_threshold_less": 2,
+                "alert_enabled": True
+            }
+        }
 
 class StreamUpdate(BaseModel):
-    id: str
-    name: Optional[str]
-    path: Optional[str]
-    type: Optional[str]
-    status: Optional[str] = Field("inactive", description="Status: active, inactive")
-    is_streaming: Optional[bool] = False
+    # Required fields
+    id: str = Field(...)
+    name: str = Field(..., max_length=50)
+    path: str = Field(..., max_length=255)
+    type: str = Field(default='local', pattern='^(rtsp|http|local|other|video file)$')
+    status: str = Field(default='inactive', pattern='^(active|inactive|error|processing)$')
+    is_streaming: bool = Field(default=False)
     
+    # Optional location and metadata fields
+    location: Optional[str] = Field(None, max_length=100)
+    area: Optional[str] = Field(None, max_length=100)
+    building: Optional[str] = Field(None, max_length=100)
+    floor_level: Optional[str] = Field(None, max_length=20)
+    zone: Optional[str] = Field(None, max_length=50)
+    latitude: Optional[Decimal] = Field(None, ge=-90, le=90, decimal_places=8)
+    longitude: Optional[Decimal] = Field(None, ge=-180, le=180, decimal_places=8)
+    
+    # Optional alert fields
+    count_threshold_greater: Optional[int] = Field(None, ge=0)
+    count_threshold_less: Optional[int] = Field(None, ge=0)
+    alert_enabled: bool = Field(default=False)
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "id": "091312-312312-12312-231232-1321",
+                "name": "Main Entrance Camera",
+                "path": "/dev/video0",
+                "type": "local",
+                "status": "active",
+                "is_streaming": True,
+                "location": "Building A Entrance",
+                "area": "Reception",
+                "building": "Building A",
+                "floor_level": "Ground Floor",
+                "zone": "Security Zone 1",
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "count_threshold_greater": 10,
+                "count_threshold_less": 2,
+                "alert_enabled": True
+            }
+        }
 
 class StreamUpdateList(BaseModel):
     streams: List[StreamUpdate]
@@ -662,3 +734,596 @@ class User(BaseModel):
     role: str 
     is_active: bool
 
+class CameraBulkUploadResult(BaseModel):
+    total_processed: int
+    successful_uploads: int
+    failed_uploads: int
+    successful_cameras: List[Dict[str, Any]]
+    failed_cameras: List[Dict[str, Any]]
+    errors: List[str]
+
+class CameraCSVRecord(BaseModel):
+    name: str
+    path: str
+    type: str = "local"
+    status: str = "inactive"
+    is_streaming: bool = False
+    
+    @validator('type')
+    def validate_type(cls, v):
+        allowed_types = ['rtsp', 'http', 'local', 'other', 'video file']
+        if v not in allowed_types:
+            raise ValueError(f'Type must be one of: {allowed_types}')
+        return v
+    
+    @validator('status')
+    def validate_status(cls, v):
+        allowed_statuses = ['active', 'inactive', 'error', 'processing']
+        if v not in allowed_statuses:
+            raise ValueError(f'Status must be one of: {allowed_statuses}')
+        return v
+
+
+# Location Management Models
+class LocationBase(BaseModel):
+    location_name: str = Field(..., min_length=1, max_length=100)
+    area_name: Optional[str] = Field(None, max_length=100)
+    building: Optional[str] = Field(None, max_length=100)
+    floor_level: Optional[str] = Field(None, max_length=20)
+    zone: Optional[str] = Field(None, max_length=50)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    description: Optional[str] = None
+
+class LocationCreate(LocationBase):
+    pass
+
+class LocationUpdate(BaseModel):
+    location_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    area_name: Optional[str] = Field(None, max_length=100)
+    building: Optional[str] = Field(None, max_length=100)
+    floor_level: Optional[str] = Field(None, max_length=20)
+    zone: Optional[str] = Field(None, max_length=50)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class LocationResponse(LocationBase):
+    location_id: str
+    workspace_id: str
+    is_active: bool
+    created_at: str
+    updated_at: str
+    camera_count: Optional[int] = 0
+
+# Enhanced Camera Models with Location
+class StreamCreateWithLocation(BaseModel):
+    name: str
+    path: str
+    type: str = Field("local", pattern="^(rtsp|http|local|other|video file)$")
+    status: str = Field("inactive", description="Status: active, inactive")
+    is_streaming: bool = False
+    # Location fields
+    location: Optional[str] = Field(None, max_length=100)
+    area: Optional[str] = Field(None, max_length=100)
+    building: Optional[str] = Field(None, max_length=100)
+    floor_level: Optional[str] = Field(None, max_length=20)
+    zone: Optional[str] = Field(None, max_length=50)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+
+class StreamUpdateWithLocation(BaseModel):
+    id: str
+    name: Optional[str] = None
+    path: Optional[str] = None
+    type: Optional[str] = None
+    status: Optional[str] = Field(None, description="Status: active, inactive")
+    is_streaming: Optional[bool] = None
+    # Location fields
+    location: Optional[str] = Field(None, max_length=100)
+    area: Optional[str] = Field(None, max_length=100)
+    building: Optional[str] = Field(None, max_length=100)
+    floor_level: Optional[str] = Field(None, max_length=20)
+    zone: Optional[str] = Field(None, max_length=50)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+
+# Enhanced CSV Record with Location
+class CameraCSVRecordWithLocation(BaseModel):
+    name: str
+    path: str
+    type: str = "local"
+    status: str = "inactive"
+    is_streaming: bool = False
+    # Location fields (optional in CSV)
+    location: Optional[str] = None
+    area: Optional[str] = None
+    building: Optional[str] = None
+    floor_level: Optional[str] = None
+    zone: Optional[str] = None
+    latitude: Optional[str] = None
+    longitude: Optional[str] = None
+    
+    @validator('type')
+    def validate_type(cls, v):
+        allowed_types = ['rtsp', 'http', 'local', 'other', 'video file']
+        if v not in allowed_types:
+            raise ValueError(f'Type must be one of: {allowed_types}')
+        return v
+    
+    @validator('status')
+    def validate_status(cls, v):
+        allowed_statuses = ['active', 'inactive', 'error', 'processing']
+        if v not in allowed_statuses:
+            raise ValueError(f'Status must be one of: {allowed_statuses}')
+        return v
+    
+    @validator('latitude')
+    def validate_latitude(cls, v):
+        if v is not None:
+            try:
+                lat = float(v)
+                if not -90 <= lat <= 90:
+                    raise ValueError('Latitude must be between -90 and 90')
+                return lat
+            except (ValueError, TypeError):
+                raise ValueError('Invalid latitude format')
+        return v
+    
+    @validator('longitude')
+    def validate_longitude(cls, v):
+        if v is not None:
+            try:
+                lng = float(v)
+                if not -180 <= lng <= 180:
+                    raise ValueError('Longitude must be between -180 and 180')
+                return lng
+            except (ValueError, TypeError):
+                raise ValueError('Invalid longitude format')
+        return v
+
+# Location-based Search Models
+class LocationSearchQuery(BaseModel):
+    location: Optional[str] = None
+    area: Optional[str] = None
+    building: Optional[str] = None
+    floor_level: Optional[str] = None
+    zone: Optional[str] = None
+    # Existing search fields
+    camera_id: Optional[Union[str, List[str]]] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+
+class LocationHierarchy(BaseModel):
+    floor_level: Optional[str] = None
+    building: Optional[str] = None
+    zone: Optional[str] = None
+    area: Optional[str] = None
+    location: Optional[str] = None
+    camera_count: int = 0
+
+class LocationStatsResponse(BaseModel):
+    workspace_id: str
+    workspace_name: str
+    location: Optional[str] = None
+    area: Optional[str] = None
+    building: Optional[str] = None
+    floor_level: Optional[str] = None
+    zone: Optional[str] = None
+    total_cameras: int = 0
+    active_cameras: int = 0
+    inactive_cameras: int = 0
+    error_cameras: int = 0
+    streaming_cameras: int = 0
+    camera_ids: List[str] = []
+    camera_names: List[str] = []
+
+class CameraLocationGroup(BaseModel):
+    group_type: str  # 'location', 'area', 'building', 'zone'
+    group_name: str
+    camera_count: int
+    cameras: List[Dict[str, Any]]
+    active_count: int = 0
+    inactive_count: int = 0
+    streaming_count: int = 0
+
+class LocationHierarchyResponse(BaseModel):
+    workspace_id: str
+    hierarchy: List[LocationHierarchy]
+    total_locations: int
+    floor_level: List[str] = []
+    buildings: List[str] = []
+    zones: List[str] = []
+    areas: List[str] = []
+    locations: List[str] = []
+
+class CameraGroupResponse(BaseModel):
+    groups: List[CameraLocationGroup]
+    total_groups: int
+    total_cameras: int
+    group_type: str
+
+# Bulk location assignment
+class BulkLocationAssignment(BaseModel):
+    camera_ids: List[str]
+    location: Optional[str] = None
+    area: Optional[str] = None
+    building: Optional[str] = None
+    floor_level: Optional[str] = None
+    zone: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+class BulkLocationAssignmentResult(BaseModel):
+    total_processed: int
+    successful_assignments: int
+    failed_assignments: int
+    updated_cameras: List[str]
+    failed_cameras: List[Dict[str, Any]]
+    errors: List[str]
+
+class ThresholdSettings(BaseModel):
+    count_threshold_greater: Optional[int] = None
+    count_threshold_less: Optional[int] = None
+    alert_enabled: bool = False
+
+################################################################################
+################################################################################
+class CameraAlertSettings(BaseModel):
+    """Model for camera alert threshold settings."""
+    count_threshold_greater: Optional[int] = Field(None, ge=0, description="Alert when count is greater than this value")
+    count_threshold_less: Optional[int] = Field(None, ge=0, description="Alert when count is less than this value")
+    alert_enabled: bool = Field(False, description="Whether alerts are enabled for this camera")
+    
+    @validator('count_threshold_greater', 'count_threshold_less')
+    def validate_thresholds(cls, v):
+        if v is not None and v < 0:
+            raise ValueError('Threshold values must be non-negative')
+        return v
+    
+    @validator('count_threshold_less')
+    def validate_threshold_logic(cls, v, values):
+        if v is not None and 'count_threshold_greater' in values and values['count_threshold_greater'] is not None:
+            if v >= values['count_threshold_greater']:
+                raise ValueError('count_threshold_less must be less than count_threshold_greater')
+        return v
+
+class CameraCSVRecordWithLocationAndAlerts(BaseModel):
+    """Model for CSV record with location and alert data."""
+    name: str = Field(..., min_length=1, max_length=50)
+    path: str = Field(..., min_length=1, max_length=255)
+    type: str = Field(default="local")
+    status: str = Field(default="inactive")
+    is_streaming: bool = Field(default=False)
+    location: Optional[str] = Field(None, max_length=100)
+    area: Optional[str] = Field(None, max_length=100)
+    building: Optional[str] = Field(None, max_length=100)
+    floor_level: Optional[str] = Field(None, max_length=20)
+    zone: Optional[str] = Field(None, max_length=50)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    count_threshold_greater: Optional[int] = Field(None, ge=0)
+    count_threshold_less: Optional[int] = Field(None, ge=0)
+    alert_enabled: bool = Field(default=False)
+    
+    @validator('type')
+    def validate_type(cls, v):
+        allowed_types = ['rtsp', 'http', 'local', 'other', 'video file']
+        if v not in allowed_types:
+            raise ValueError(f'Type must be one of: {allowed_types}')
+        return v
+    
+    @validator('status')
+    def validate_status(cls, v):
+        allowed_statuses = ['active', 'inactive', 'error', 'processing']
+        if v not in allowed_statuses:
+            raise ValueError(f'Status must be one of: {allowed_statuses}')
+        return v
+    
+    @validator('count_threshold_less')
+    def validate_threshold_logic(cls, v, values):
+        if v is not None and 'count_threshold_greater' in values and values['count_threshold_greater'] is not None:
+            if v >= values['count_threshold_greater']:
+                raise ValueError('count_threshold_less must be less than count_threshold_greater')
+        return v
+
+class BulkLocationAssignmentWithAlerts(BaseModel):
+    """Model for bulk location assignment with alert settings."""
+    camera_ids: List[str] = Field(..., min_items=1, description="List of camera IDs to update")
+    location: Optional[str] = Field(None, max_length=100)
+    area: Optional[str] = Field(None, max_length=100)
+    building: Optional[str] = Field(None, max_length=100)
+    floor_level: Optional[str] = Field(None, max_length=20)
+    zone: Optional[str] = Field(None, max_length=50)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    count_threshold_greater: Optional[int] = Field(None, ge=0)
+    count_threshold_less: Optional[int] = Field(None, ge=0)
+    alert_enabled: Optional[bool] = Field(None)
+    
+    @validator('count_threshold_less')
+    def validate_threshold_logic(cls, v, values):
+        if v is not None and 'count_threshold_greater' in values and values['count_threshold_greater'] is not None:
+            if v >= values['count_threshold_greater']:
+                raise ValueError('count_threshold_less must be less than count_threshold_greater')
+        return v
+
+class CameraLocationGroupWithAlerts(BaseModel):
+    """Enhanced camera location group with alert information."""
+    group_type: str = Field(..., description="Type of grouping (location, area, building, zone)")
+    group_name: str = Field(..., description="Name of the group")
+    camera_count: int = Field(..., ge=0, description="Total number of cameras in this group")
+    cameras: List[Dict[str, Any]] = Field(default_factory=list, description="List of cameras in this group")
+    active_count: int = Field(default=0, ge=0, description="Number of active cameras")
+    inactive_count: int = Field(default=0, ge=0, description="Number of inactive cameras")
+    streaming_count: int = Field(default=0, ge=0, description="Number of streaming cameras")
+    alert_enabled_count: int = Field(default=0, ge=0, description="Number of cameras with alerts enabled")
+
+class CameraGroupResponseWithAlerts(BaseModel):
+    """Enhanced camera group response with alert information."""
+    groups: List[CameraLocationGroupWithAlerts] = Field(default_factory=list)
+    total_groups: int = Field(..., ge=0)
+    total_cameras: int = Field(..., ge=0)
+    group_type: str = Field(..., description="Type of grouping used")
+    total_alert_enabled: int = Field(default=0, ge=0, description="Total cameras with alerts enabled")
+
+class LocationStatsResponseWithAlerts(BaseModel):
+    """Enhanced location statistics response with alert information."""
+    workspace_id: str = Field(..., description="Workspace ID")
+    workspace_name: str = Field(..., description="Workspace name")
+    location: Optional[str] = Field(None, description="Location name")
+    area: Optional[str] = Field(None, description="Area name")
+    building: Optional[str] = Field(None, description="Building name")
+    floor_level: Optional[str] = Field(None, description="floor_level name")
+    zone: Optional[str] = Field(None, description="Zone name")
+    total_cameras: int = Field(..., ge=0, description="Total number of cameras")
+    active_cameras: int = Field(..., ge=0, description="Number of active cameras")
+    inactive_cameras: int = Field(..., ge=0, description="Number of inactive cameras")
+    error_cameras: int = Field(..., ge=0, description="Number of cameras with errors")
+    streaming_cameras: int = Field(..., ge=0, description="Number of streaming cameras")
+    alert_enabled_cameras: int = Field(default=0, ge=0, description="Number of cameras with alerts enabled")
+    camera_ids: List[str] = Field(default_factory=list, description="List of camera IDs")
+    camera_names: List[str] = Field(default_factory=list, description="List of camera names")
+    alert_configurations: List[Dict[str, Any]] = Field(default_factory=list, description="Alert configurations for cameras")
+
+class CameraDetailedResponse(BaseModel):
+    """Detailed camera response with alert settings."""
+    stream_id: str = Field(..., description="Camera stream ID")
+    name: str = Field(..., description="Camera name")
+    path: str = Field(..., description="Camera path/URL")
+    type: str = Field(..., description="Camera type")
+    status: str = Field(..., description="Camera status")
+    is_streaming: bool = Field(..., description="Whether camera is streaming")
+    location: Optional[str] = Field(None, description="Camera location")
+    area: Optional[str] = Field(None, description="Camera area")
+    building: Optional[str] = Field(None, description="Camera building")
+    floor_level: Optional[str] = Field(None, description="Camera floor level")
+    zone: Optional[str] = Field(None, description="Camera zone")
+    latitude: Optional[float] = Field(None, description="Camera latitude")
+    longitude: Optional[float] = Field(None, description="Camera longitude")
+    count_threshold_greater: Optional[int] = Field(None, description="Alert threshold for greater count")
+    count_threshold_less: Optional[int] = Field(None, description="Alert threshold for less count")
+    alert_enabled: bool = Field(default=False, description="Whether alerts are enabled")
+    created_at: datetime = Field(..., description="Camera creation timestamp")
+    updated_at: datetime = Field(..., description="Camera last update timestamp")
+    last_activity: datetime = Field(..., description="Camera last activity timestamp")
+    owner_username: str = Field(..., description="Camera owner username")
+
+class AlertSummaryResponse(BaseModel):
+    """Response model for alert summary."""
+    total_cameras: int = Field(..., ge=0, description="Total number of cameras")
+    alert_enabled_cameras: int = Field(..., ge=0, description="Number of cameras with alerts enabled")
+    cameras: List[Dict[str, Any]] = Field(default_factory=list, description="List of cameras with alert information")
+
+class CameraAlertUpdateResponse(BaseModel):
+    """Response model for camera alert update."""
+    message: str = Field(..., description="Success message")
+    camera_id: str = Field(..., description="Camera ID")
+    camera_name: str = Field(..., description="Camera name")
+    alert_settings: CameraAlertSettings = Field(..., description="Updated alert settings")
+
+
+# === ADDITIONAL RESPONSE MODELS FOR THE NEW ENDPOINTS ===
+# Add these to your schemas_models.py file:
+
+class LocationItem(BaseModel):
+    location: str
+    camera_count: int
+
+class LocationListResponse(BaseModel):
+    locations: List[LocationItem]
+    total_count: int
+
+class AreaItem(BaseModel):
+    area: str
+    location: Optional[str] = None
+    camera_count: int
+
+class AreaListResponse(BaseModel):
+    areas: List[AreaItem]
+    total_count: int
+    filtered_by_locations: Optional[Union[str, List[str]]] = None
+
+class BuildingItem(BaseModel):
+    building: str
+    area: Optional[str] = None
+    location: Optional[str] = None
+    camera_count: int
+
+class BuildingListResponse(BaseModel):
+    buildings: List[BuildingItem]
+    total_count: int
+    filtered_by_areas: Optional[Union[str, List[str]]] = None
+
+class FloorLevelItem(BaseModel):
+    floor_level: str
+    building: Optional[str] = None
+    area: Optional[str] = None
+    location: Optional[str] = None
+    camera_count: int
+
+class FloorLevelListResponse(BaseModel):
+    floor_levels: List[FloorLevelItem]
+    total_count: int
+    filtered_by_buildings: Optional[Union[str, List[str]]] = None
+
+class ZoneItem(BaseModel):
+    zone: str
+    floor_level: Optional[str] = None
+    building: Optional[str] = None
+    area: Optional[str] = None
+    location: Optional[str] = None
+    camera_count: int
+
+class ZoneListResponse(BaseModel):
+    zones: List[ZoneItem]
+    total_count: int
+    filtered_by_floor_levels: Optional[Union[str, List[str]]] = None
+
+
+# === RESPONSE MODELS FOR QDRANT ENDPOINTS ===
+# Add these to your schemas_models.py file if not already present:
+
+class QdrantLocationItem(BaseModel):
+    location: str
+    camera_count: int
+    camera_ids: List[str]
+
+class QdrantLocationListResponse(BaseModel):
+    locations: List[QdrantLocationItem]
+    total_count: int
+    workspace_id: str
+
+class QdrantAreaItem(BaseModel):
+    area: str
+    location: Optional[str] = None
+    camera_count: int
+    camera_ids: List[str]
+
+class QdrantAreaListResponse(BaseModel):
+    areas: List[QdrantAreaItem]
+    total_count: int
+    filtered_by_locations: Optional[Union[str, List[str]]] = None
+    workspace_id: str
+
+class QdrantBuildingItem(BaseModel):
+    building: str
+    area: Optional[str] = None
+    location: Optional[str] = None
+    camera_count: int
+    camera_ids: List[str]
+
+class QdrantBuildingListResponse(BaseModel):
+    buildings: List[QdrantBuildingItem]
+    total_count: int
+    filtered_by_areas: Optional[Union[str, List[str]]] = None
+    workspace_id: str
+
+class QdrantFloorLevelItem(BaseModel):
+    floor_level: str
+    building: Optional[str] = None
+    area: Optional[str] = None
+    location: Optional[str] = None
+    camera_count: int
+    camera_ids: List[str]
+
+class QdrantFloorLevelListResponse(BaseModel):
+    floor_levels: List[QdrantFloorLevelItem]
+    total_count: int
+    filtered_by_buildings: Optional[Union[str, List[str]]] = None
+    workspace_id: str
+
+class QdrantZoneItem(BaseModel):
+    zone: str
+    floor_level: Optional[str] = None
+    building: Optional[str] = None
+    area: Optional[str] = None
+    location: Optional[str] = None
+    camera_count: int
+    camera_ids: List[str]
+
+class QdrantZoneListResponse(BaseModel):
+    zones: List[QdrantZoneItem]
+    total_count: int
+    filtered_by_floor_levels: Optional[Union[str, List[str]]] = None
+    workspace_id: str
+
+class TimeRange(BaseModel):
+    earliest: Optional[str] = None
+    latest: Optional[str] = None
+
+class QdrantLocationAnalyticsItem(BaseModel):
+    location: Optional[str] = None
+    area: Optional[str] = None
+    building: Optional[str] = None
+    floor_level: Optional[str] = None
+    zone: Optional[str] = None
+    data_points: int
+    total_person_count: int
+    average_person_count: float
+    unique_cameras: int
+    camera_ids: List[str]
+    time_range: TimeRange
+
+class QdrantLocationAnalyticsResponse(BaseModel):
+    analytics: List[QdrantLocationAnalyticsItem]
+    total_groups: int
+    group_by: str
+    filters_applied: Dict[str, Any]
+    workspace_id: str
+
+
+# === VALIDATION FUNCTIONS ===
+def validate_camera_alert_thresholds(greater_threshold: Optional[int], less_threshold: Optional[int]) -> bool:
+    """Validate that alert thresholds are logically consistent."""
+    if greater_threshold is not None and less_threshold is not None:
+        if less_threshold >= greater_threshold:
+            return False
+    return True
+
+def sanitize_camera_data_with_alerts(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize camera data including alert fields."""
+    sanitized = {}
+    
+    # Basic fields
+    sanitized['name'] = str(data.get('name', '')).strip()
+    sanitized['path'] = str(data.get('path', '')).strip()
+    sanitized['type'] = str(data.get('type', 'local')).strip().lower()
+    sanitized['status'] = str(data.get('status', 'inactive')).strip().lower()
+    
+    # Boolean fields
+    sanitized['is_streaming'] = str(data.get('is_streaming', 'false')).lower() in ['true', '1', 'yes', 'on']
+    sanitized['alert_enabled'] = str(data.get('alert_enabled', 'false')).lower() in ['true', '1', 'yes', 'on']
+    
+    # Location fields
+    location_fields = ['location', 'area', 'building', 'floor_level', 'zone']
+    for field in location_fields:
+        value = data.get(field)
+        sanitized[field] = str(value).strip() if value and str(value).strip() else None
+    
+    # Coordinate fields
+    for coord_field in ['latitude', 'longitude']:
+        value = data.get(coord_field)
+        if value and str(value).strip():
+            try:
+                sanitized[coord_field] = float(value)
+            except (ValueError, TypeError):
+                sanitized[coord_field] = None
+        else:
+            sanitized[coord_field] = None
+    
+    # Alert threshold fields
+    for threshold_field in ['count_threshold_greater', 'count_threshold_less']:
+        value = data.get(threshold_field)
+        if value and str(value).strip():
+            try:
+                sanitized[threshold_field] = int(value)
+            except (ValueError, TypeError):
+                sanitized[threshold_field] = None
+        else:
+            sanitized[threshold_field] = None
+    
+    return sanitized

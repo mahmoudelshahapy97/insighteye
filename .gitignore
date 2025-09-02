@@ -9,6 +9,7 @@ denoise/
 input/
 model_cache/
 models/
+models/*
 nemo_msdd_configs/
 uploads/
 videos/
@@ -17,8 +18,11 @@ chromadb/
 .pytest_cache/
 htmlcov/
 logs/
+logs/*
 qdrant_storage/
+qdrant_storage/*
 postgres_data/
+postgres_data/*
 insighteye/
 
 # Ignore system files
@@ -79,5 +83,5 @@ coverage/
 *.pyc
 *.pyo
 
-
+*.pt
 ###############
