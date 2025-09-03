@@ -105,6 +105,122 @@ async def ensure_workspace_qdrant_collection_exists(client: QdrantClient, worksp
         logger.error(f"Error ensuring Qdrant collection '{collection_name}' exists for workspace {str(workspace_id)}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to initialize Qdrant workspace collection: {collection_name}")
 
+
+
+def parse_string_or_list_v0(value: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
+    """
+    Parse a parameter that can be either a string or list of strings.
+    If it's a string containing commas, split it into a list.
+    If it's already a list, return as-is.
+    If it's None or empty, return None.
+    
+    Args:
+        value: The input value (string, list of strings, or None)
+        
+    Returns:
+        List of strings or None
+        
+    Examples:
+        parse_string_or_list("area1,area2,area3") -> ["area1", "area2", "area3"]
+        parse_string_or_list(["area1", "area2"]) -> ["area1", "area2"]
+        parse_string_or_list("single_area") -> ["single_area"]
+        parse_string_or_list(None) -> None
+        parse_string_or_list("") -> None
+        parse_string_or_list("area1, area2 , area3") -> ["area1", "area2", "area3"]
+    """
+    if value is None:
+        return None
+    
+    if isinstance(value, list):
+        # Filter out empty strings and strip whitespace
+        filtered_list = [item.strip() for item in value if item and item.strip()]
+        return filtered_list if filtered_list else None
+    
+    if isinstance(value, str):
+        # Handle empty string
+        if not value.strip():
+            return None
+        
+        # Check if string contains commas (indicating multiple values)
+        if ',' in value:
+            # Split by comma and strip whitespace from each item
+            items = [item.strip() for item in value.split(',') if item.strip()]
+            return items if items else None
+        else:
+            # Single string value
+            return [value.strip()]
+    
+    return None
+
+
+def parse_string_or_list(value: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
+    """
+    Parse a parameter that can be either a string or list of strings.
+    If it's a string containing commas, split it into a list.
+    If it's a list, check each item for commas and split if needed.
+    If it's None or empty, return None.
+    
+    Args:
+        value: The input value (string, list of strings, or None)
+        
+    Returns:
+        List of strings or None
+        
+    Examples:
+        parse_string_or_list("area1,area2,area3") -> ["area1", "area2", "area3"]
+        parse_string_or_list(["area1", "area2"]) -> ["area1", "area2"]
+        parse_string_or_list(["area1,area2", "area3"]) -> ["area1", "area2", "area3"]
+        parse_string_or_list("single_area") -> ["single_area"]
+        parse_string_or_list(None) -> None
+        parse_string_or_list("") -> None
+        parse_string_or_list("area1, area2 , area3") -> ["area1", "area2", "area3"]
+    """
+    if value is None:
+        return None
+    
+    if isinstance(value, list):
+        # Process each item in the list, splitting by commas if needed
+        all_items = []
+        for item in value:
+            if item and isinstance(item, str) and item.strip():
+                if ',' in item:
+                    # Split comma-separated values within list items
+                    split_items = [sub_item.strip() for sub_item in item.split(',') if sub_item.strip()]
+                    all_items.extend(split_items)
+                else:
+                    all_items.append(item.strip())
+        
+        return all_items if all_items else None
+    
+    if isinstance(value, str):
+        # Handle empty string
+        if not value.strip():
+            return None
+        
+        # Check if string contains commas (indicating multiple values)
+        if ',' in value:
+            # Split by comma and strip whitespace from each item
+            items = [item.strip() for item in value.split(',') if item.strip()]
+            return items if items else None
+        else:
+            # Single string value
+            return [value.strip()]
+    
+    return None
+
+
+encoded_string = ""
+try:
+    image_path = os.path.join(os.path.dirname(__file__), "images", "base64_1.jpg")
+    if os.path.exists(image_path):
+        with open(image_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+    else:
+        logger.warning(f"Default image '{image_path}' not found. Static base64 image will be empty.")
+except Exception as e:
+    logger.error(f"Error loading default image: {e}", exc_info=True)
+
+
 def handle_exceptions(func): 
     async def wrapper(*args, **kwargs):
         try:

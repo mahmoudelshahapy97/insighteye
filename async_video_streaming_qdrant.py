@@ -21,6 +21,7 @@ from async_utils import (
     parse_camera_ids, make_prediction, parse_date_format, parse_time_string,
     get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists
 )
+from async_utils import parse_string_or_list
 
 logger = logging.getLogger(__name__)
 BASE_QDRANT_COLLECTION_NAME = config.get("qdrant_collection_name", "person_counts")
@@ -2008,6 +2009,8 @@ async def get_qdrant_areas(
 ):
     """Get all unique areas from Qdrant data, optionally filtered by location(s)."""
     try:
+        locations = parse_string_or_list(locations)
+
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
@@ -2080,6 +2083,8 @@ async def get_qdrant_buildings(
 ):
     """Get all unique buildings from Qdrant data, optionally filtered by area(s)."""
     try:
+        areas = parse_string_or_list(areas)
+
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
@@ -2153,6 +2158,8 @@ async def get_qdrant_floor_levels(
 ):
     """Get all unique floor levels from Qdrant data, optionally filtered by building(s)."""
     try:
+        buildings = parse_string_or_list(buildings)
+
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
@@ -2227,6 +2234,8 @@ async def get_qdrant_zones(
 ):
     """Get all unique zones from Qdrant data, optionally filtered by floor level(s)."""
     try:
+        floor_levels = parse_string_or_list(floor_levels)
+        
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         

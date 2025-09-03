@@ -37,6 +37,7 @@ from async_video_streaming_qdrant import get_timestamp_range_, get_qdrant_client
 from qdrant_client.http import models as qdrant_models # For Qdrant integration
 from async_workspaces import get_user_and_workspace, check_workspace_membership_and_get_role 
 from datetime import datetime, timezone
+from async_utils import parse_string_or_list, encoded_string
 
 logger = logging.getLogger(__name__)
 
@@ -45,17 +46,6 @@ router = APIRouter(tags=["camera"])
 db_manager = DatabaseManager() 
 session_manager = SessionManager() 
 user_manager = UserManager() 
-
-encoded_string = ""
-try:
-    image_path = os.path.join(os.path.dirname(__file__), "images", "base64_1.jpg")
-    if os.path.exists(image_path):
-        with open(image_path, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-    else:
-        logger.warning(f"Default image '{image_path}' not found. Static base64 image will be empty.")
-except Exception as e:
-    logger.error(f"Error loading default image: {e}", exc_info=True)
 
 def ensure_uuid_str(id_value: Any) -> Optional[str]:
     if id_value is None: return None
@@ -1568,13 +1558,12 @@ async def download_camera_csv_template_with_location(
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Download a CSV template for bulk camera upload with location data and alert settings."""
-    template_content = """
-    name,path,type,status,is_streaming,location,area,building,floor_level,zone,latitude,longitude,count_threshold_greater,count_threshold_less,alert_enabled
-    Main Entrance Camera,rtsp://192.168.1.100/stream,rtsp,active,true,Main Entrance,Lobby,Building A,Ground Floor,Security Zone,40.7128,-74.0060,10,2,true
-    Parking Camera 1,rtsp://192.168.1.101/stream,rtsp,active,false,Parking Lot,Exterior,Building A,Ground Floor,Parking Zone,40.7130,-74.0065,5,1,true
-    Office Camera 1,/path/to/office1.mp4,video file,inactive,false,Office 101,East Wing,Building A,First Floor,Office Zone,,,,,false
-    Cafeteria Camera,http://192.168.1.102/stream,http,active,true,Cafeteria,Central Area,Building A,Ground Floor,Common Zone,,,15,3,true
-    Server Room Camera,rtsp://192.168.1.103/stream,rtsp,active,true,Server Room,IT Wing,Building B,Basement,Restricted Zone,40.7125,-74.0055,1,,true
+    template_content = """name,path,type,status,is_streaming,location,area,building,floor_level,zone,latitude,longitude,count_threshold_greater,count_threshold_less,alert_enabled
+Main Entrance Camera,rtsp://192.168.1.100/stream,rtsp,active,true,Main Entrance,Lobby,Building A,Ground Floor,Security Zone,40.7128,-74.0060,10,2,true
+Parking Camera 1,rtsp://192.168.1.101/stream,rtsp,active,false,Parking Lot,Exterior,Building A,Ground Floor,Parking Zone,40.7130,-74.0065,5,1,true
+Office Camera 1,/path/to/office1.mp4,video file,inactive,false,Office 101,East Wing,Building A,First Floor,Office Zone,,,,,false
+Cafeteria Camera,http://192.168.1.102/stream,http,active,true,Cafeteria,Central Area,Building A,Ground Floor,Common Zone,,,15,3,true
+Server Room Camera,rtsp://192.168.1.103/stream,rtsp,active,true,Server Room,IT Wing,Building B,Basement,Restricted Zone,40.7125,-74.0055,1,,true
 """
     
     return Response(
@@ -2534,6 +2523,9 @@ async def get_areas(
 ):
     """Get all unique areas for the current user, optionally filtered by location(s)."""
     try:
+
+        locations = parse_string_or_list(locations)
+
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
@@ -2605,6 +2597,8 @@ async def get_buildings(
 ):
     """Get all unique buildings for the current user, optionally filtered by area(s)."""
     try:
+        areas = parse_string_or_list(areas)
+
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
@@ -2677,6 +2671,8 @@ async def get_floor_levels(
 ):
     """Get all unique floor levels for the current user, optionally filtered by building(s)."""
     try:
+        buildings = parse_string_or_list(buildings)
+
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
@@ -2750,6 +2746,8 @@ async def get_zones(
 ):
     """Get all unique zones for the current user, optionally filtered by floor level(s)."""
     try:
+        floor_levels = parse_string_or_list(floor_levels)
+
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         

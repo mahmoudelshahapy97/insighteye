@@ -1030,6 +1030,17 @@ class CameraCSVRecordWithLocationAndAlerts(BaseModel):
                 raise ValueError('count_threshold_less must be less than count_threshold_greater')
         return v
 
+    # @validator('count_threshold_less')
+    # def validate_threshold_logic(cls, v, values):
+    #     # Only validate if both thresholds are provided and not None
+    #     if (v is not None and v != "" and 
+    #         'count_threshold_greater' in values and 
+    #         values['count_threshold_greater'] is not None and 
+    #         values['count_threshold_greater'] != ""):
+    #         if v >= values['count_threshold_greater']:
+    #             raise ValueError('count_threshold_less must be less than count_threshold_greater')
+    #     return v
+
 class BulkLocationAssignmentWithAlerts(BaseModel):
     """Model for bulk location assignment with alert settings."""
     camera_ids: List[str] = Field(..., min_items=1, description="List of camera IDs to update")

@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Any, Union
 from ultralytics import YOLO
-from async_utils import frame_to_base64, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists # ensure_... is async
+from async_utils import frame_to_base64, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists, parse_string_or_list, encoded_string # ensure_... is async
 from async_database import DatabaseManager
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
@@ -5196,25 +5196,27 @@ async def get_location_hierarchy_for_streams(
             "message": "Internal server error"
         })
 
-encoded_string = ""
-try:
-    image_path = os.path.join(os.path.dirname(__file__), "images", "base64_1.jpg")
-    if os.path.exists(image_path):
-        with open(image_path, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-    else:
-        logger.warning(f"Default image '{image_path}' not found. Static base64 image will be empty.")
-except Exception as e:
-    logger.error(f"Error loading default image: {e}", exc_info=True)
-
 @router.get("/streams/locations/search")
 async def search_streams_by_location_filters(
     q: Optional[str] = Query(None, description="Search query for location names"),
-    location_type: Optional[str] = Query(None, description="Filter by location type: building, floor_level, zone, area, location"),
+    location_type: Optional[Union[str, List[str]]] = Query(None, description="Filter by location type(s): building, floor_level, zone, area, location"),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific zone(s)"),
     workspace_id: Optional[str] = Query(None),
     current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
 ):
     """Search for streams using location-based filters and text search."""
+    
+    # Parse all the filter parameters
+    location_type = parse_string_or_list(location_type)
+    locations = parse_string_or_list(locations)
+    areas = parse_string_or_list(areas)
+    buildings = parse_string_or_list(buildings)
+    floor_levels = parse_string_or_list(floor_levels)
+    zones = parse_string_or_list(zones)
     
     user_id_str = str(current_user_data["user_id"])
     username = current_user_data.get("username", "unknown")
@@ -5242,37 +5244,121 @@ async def search_streams_by_location_filters(
             base_query += f" AND vs.workspace_id = ${param_count}"
             params.append(UUID(workspace_id))
         
-        # Add text search
+        # Add text search with special handling for location_type + q combination
         if q:
-            param_count += 1
-            search_condition = f"""
-                AND (
-                    vs.name ILIKE ${param_count} OR 
-                    vs.building ILIKE ${param_count} OR 
-                    vs.floor_level ILIKE ${param_count} OR 
-                    vs.zone ILIKE ${param_count} OR 
-                    vs.area ILIKE ${param_count} OR 
-                    vs.location ILIKE ${param_count}
-                )
-            """
-            base_query += search_condition
-            params.append(f"%{q}%")
+            # Check if q contains comma-separated values and we have a specific location_type
+            q_values = parse_string_or_list(q)
+            
+            if location_type and len(location_type) == 1 and q_values and len(q_values) > 1:
+                # Handle specific case: location_type=areas&q=Area 1,Area 2
+                location_field_map = {
+                    "area": "vs.area",
+                    "areas": "vs.area", 
+                    "building": "vs.building",
+                    "buildings": "vs.building",
+                    "floor_level": "vs.floor_level",
+                    "floor_levels": "vs.floor_level",
+                    "zone": "vs.zone",
+                    "zones": "vs.zone",
+                    "location": "vs.location",
+                    "locations": "vs.location"
+                }
+                
+                field_name = location_field_map.get(location_type[0])
+                if field_name:
+                    # Use exact match for specific values
+                    param_count += 1
+                    q_placeholders = ", ".join([f"${param_count + i}" for i in range(len(q_values))])
+                    base_query += f" AND {field_name} IN ({q_placeholders})"
+                    params.extend(q_values)
+                    param_count += len(q_values) - 1
+                else:
+                    # Fallback to general text search
+                    param_count += 1
+                    search_condition = f"""
+                        AND (
+                            vs.name ILIKE ${param_count} OR 
+                            vs.building ILIKE ${param_count} OR 
+                            vs.floor_level ILIKE ${param_count} OR 
+                            vs.zone ILIKE ${param_count} OR 
+                            vs.area ILIKE ${param_count} OR 
+                            vs.location ILIKE ${param_count}
+                        )
+                    """
+                    base_query += search_condition
+                    params.append(f"%{q}%")
+            else:
+                # Regular text search
+                param_count += 1
+                search_condition = f"""
+                    AND (
+                        vs.name ILIKE ${param_count} OR 
+                        vs.building ILIKE ${param_count} OR 
+                        vs.floor_level ILIKE ${param_count} OR 
+                        vs.zone ILIKE ${param_count} OR 
+                        vs.area ILIKE ${param_count} OR 
+                        vs.location ILIKE ${param_count}
+                    )
+                """
+                base_query += search_condition
+                params.append(f"%{q}%")
         
-        # Add location type filter
+        # Add location type filter (now supports multiple types)
         if location_type:
-            if location_type == "building":
-                base_query += " AND vs.building IS NOT NULL AND vs.building != ''"
-            elif location_type == "floor_level":
-                base_query += " AND vs.floor_level IS NOT NULL AND vs.floor_level != ''"
-            elif location_type == "zone":
-                base_query += " AND vs.zone IS NOT NULL AND vs.zone != ''"
-            elif location_type == "area":
-                base_query += " AND vs.area IS NOT NULL AND vs.area != ''"
-            elif location_type == "location":
-                base_query += " AND vs.location IS NOT NULL AND vs.location != ''"
+            type_conditions = []
+            for loc_type in location_type:
+                if loc_type == "building":
+                    type_conditions.append("(vs.building IS NOT NULL AND vs.building != '')")
+                elif loc_type == "floor_level":
+                    type_conditions.append("(vs.floor_level IS NOT NULL AND vs.floor_level != '')")
+                elif loc_type == "zone":
+                    type_conditions.append("(vs.zone IS NOT NULL AND vs.zone != '')")
+                elif loc_type == "area":
+                    type_conditions.append("(vs.area IS NOT NULL AND vs.area != '')")
+                elif loc_type == "location":
+                    type_conditions.append("(vs.location IS NOT NULL AND vs.location != '')")
+            
+            if type_conditions:
+                base_query += f" AND ({' OR '.join(type_conditions)})"
+        
+        # Add specific location filters
+        if locations:
+            param_count += 1
+            location_placeholders = ", ".join([f"${param_count + i}" for i in range(len(locations))])
+            base_query += f" AND vs.location IN ({location_placeholders})"
+            params.extend(locations)
+            param_count += len(locations) - 1
+        
+        if areas:
+            param_count += 1
+            area_placeholders = ", ".join([f"${param_count + i}" for i in range(len(areas))])
+            base_query += f" AND vs.area IN ({area_placeholders})"
+            params.extend(areas)
+            param_count += len(areas) - 1
+        
+        if buildings:
+            param_count += 1
+            building_placeholders = ", ".join([f"${param_count + i}" for i in range(len(buildings))])
+            base_query += f" AND vs.building IN ({building_placeholders})"
+            params.extend(buildings)
+            param_count += len(buildings) - 1
+        
+        if floor_levels:
+            param_count += 1
+            floor_placeholders = ", ".join([f"${param_count + i}" for i in range(len(floor_levels))])
+            base_query += f" AND vs.floor_level IN ({floor_placeholders})"
+            params.extend(floor_levels)
+            param_count += len(floor_levels) - 1
+        
+        if zones:
+            param_count += 1
+            zone_placeholders = ", ".join([f"${param_count + i}" for i in range(len(zones))])
+            base_query += f" AND vs.zone IN ({zone_placeholders})"
+            params.extend(zones)
         
         base_query += " ORDER BY u.username, vs.created_at DESC"
         
+        # Rest of the function remains the same...
         results = await db_manager_global.execute_query(base_query, tuple(params), fetch_all=True)
         results = results or []
         
@@ -5313,7 +5399,8 @@ async def search_streams_by_location_filters(
     except Exception as e:
         logger.error(f"Error searching streams by location for user {username}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred while searching streams.")
-    
+
+
 @router.post("/start_streams_bulk")
 async def start_streams_bulk_endpoint(
     stream_ids: List[str] = Query(..., description="List of stream IDs to start"),
