@@ -16,7 +16,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.5'  # Limit to 2 CPUs
+          cpus: '2'  # Limit to 2 CPUs
           memory: 4G # Limit to 4GB RAM
 
   qdrant:
@@ -35,10 +35,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'  # Allocate 4 CPU cores
+          cpus: '6'  # Allocate 4 CPU cores
           memory: 12G  # Allocate 8GB RAM
         reservations:
-          cpus: '2'  # Ensure at least 2 CPU cores
+          cpus: '4'  # Ensure at least 2 CPU cores
 
 volumes:
   postgres_data:
