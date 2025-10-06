@@ -19,6 +19,7 @@ from async_users import router as users_router
 from async_otp import router as otp_router
 from async_login_user import router as login_router
 from async_text_chat import router as chat_router
+from async_stream_two import router as stream_two_router
 from async_stream_one import router as stream_one_router, stream_manager, initialize_stream_manager
 from async_qdrant_chat import router as qdrant_chat_router
 from async_workspaces import router as workspace_router
@@ -228,6 +229,7 @@ app.include_router(login_router)
 app.include_router(otp_router)
 app.include_router(camera_router)
 app.include_router(chat_router)
+app.include_router(stream_two_router)
 app.include_router(stream_one_router)
 app.include_router(qdrant_chat_router)
 app.include_router(workspace_router)

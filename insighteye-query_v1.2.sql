@@ -212,6 +212,34 @@ CREATE TABLE IF NOT EXISTS otps (
     CONSTRAINT otps_email_purpose_unique UNIQUE (email, purpose)
 ) WITH (fillfactor=90);
 
+CREATE TABLE IF NOT EXISTS fire_detection_state (
+    id SERIAL PRIMARY KEY,
+    stream_id UUID NOT NULL REFERENCES video_stream(stream_id) ON DELETE CASCADE,
+    fire_status VARCHAR(20) NOT NULL DEFAULT 'no detection',
+    last_detection_time TIMESTAMPTZ,
+    last_notification_time TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(stream_id)
+);
+
+CREATE TABLE IF NOT EXISTS people_count_alert_state (
+    id SERIAL PRIMARY KEY,
+    stream_id UUID NOT NULL REFERENCES video_stream(stream_id) ON DELETE CASCADE,
+    last_notification_time TIMESTAMPTZ,
+    last_count INTEGER,
+    last_threshold_type VARCHAR(20), -- 'greater' or 'less'
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(stream_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fire_detection_stream_id ON fire_detection_state(stream_id);
+CREATE INDEX IF NOT EXISTS idx_fire_detection_last_notification ON fire_detection_state(last_notification_time);
+
+CREATE INDEX IF NOT EXISTS idx_people_count_stream_id ON people_count_alert_state(stream_id);
+CREATE INDEX IF NOT EXISTS idx_people_count_last_notification ON people_count_alert_state(last_notification_time);
+
 -- Create triggers for automatic timestamp updates
 DROP TRIGGER IF EXISTS update_workspaces_timestamp ON workspaces;
 CREATE TRIGGER update_workspaces_timestamp

@@ -177,3 +177,6 @@ stream_db_activity_update_interval_seconds: 5.0  # More frequent DB updates
 video_loop_enabled: true
 video_restart_on_end: true
 short_video_optimization: true
+
+people_count_cooldown_duration_seconds: 300
+enable_people_count_email_alerts: true

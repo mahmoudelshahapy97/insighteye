@@ -3,7 +3,7 @@ import secrets
 import logging
 from typing import Dict, Tuple, Optional
 from async_config import config
-from async_utils import send_email  # Assuming send_email is async: `async def send_email(...)`
+from async_utils import send_email  
 from async_database import DatabaseManager
 import hashlib
 from datetime import datetime, timedelta, timezone

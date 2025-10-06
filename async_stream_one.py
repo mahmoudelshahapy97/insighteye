@@ -4,8 +4,6 @@ from fastapi.responses import JSONResponse
 import time
 import logging
 import asyncio
-import queue
-import random
 from collections import defaultdict
 import cv2
 import numpy as np
@@ -13,488 +11,31 @@ import base64
 import threading 
 import uuid 
 from uuid import UUID, uuid4
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Set, Any, Union
 from ultralytics import YOLO
-from async_utils import frame_to_base64, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists, parse_string_or_list, encoded_string # ensure_... is async
+from async_utils import send_people_count_alert_email, send_fire_alert_email, frame_to_base64, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists
 from async_database import DatabaseManager
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
 from async_config import config
 from async_session_manager import SessionManager 
 from async_user_manager import UserManager
+from shared_stream import VideoFileManager
 import concurrent.futures
 import os
 from starlette.websockets import WebSocketState
 from async_workspaces import check_workspace_membership_and_get_role
-from schemas_models import ThresholdSettings
 
 session_manager_global = SessionManager()
 user_manager_global = UserManager()
 db_manager_global = DatabaseManager()
 
-logger = logging.getLogger(__name__) # Ensure logger is defined if used standalone
+logger = logging.getLogger(__name__) 
 router = APIRouter(tags=["stream"]) 
 
 # ThreadPoolExecutor for CPU-bound tasks like YOLO and cv2
 thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 2 + 4))
-
-class SharedVideoStream:
-    """Shared video stream to avoid multiple file handles for the same source"""
-    
-    def __init__(self, source: str, max_subscribers: int = 10):
-        self.source = source
-        self.subscribers: Dict[str, Dict[str, Any]] = {}
-        self.cap: Optional[cv2.VideoCapture] = None
-        self.latest_frame: Optional[np.ndarray] = None
-        self.is_running = False
-        self.lock = threading.RLock()
-        self.frame_available = threading.Event()
-        self.max_subscribers = max_subscribers
-        self.capture_thread: Optional[threading.Thread] = None
-        self.stop_capture = threading.Event()
-        self.frame_queue = queue.Queue(maxsize=3)
-        self.last_frame_time = time.time()
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 5
-        
-        # Enhanced error tracking
-        self.frame_count = 0
-        self.last_error = None
-        self.error_count = 0
-        self.consecutive_failures = 0
-        self.last_successful_read = time.time()
-        
-        # File validation
-        self.is_file_source = self._is_file_source(source)
-        self.file_exists = self._validate_file_source(source) if self.is_file_source else True
-        
-        logging.info(f"Created SharedVideoStream for source: {source} (file: {self.is_file_source}, exists: {self.file_exists})")
-    
-    def add_subscriber(self, stream_id: str, callback_info: Dict[str, Any] = None) -> bool:
-        """Add a subscriber to this shared stream"""
-        with self.lock:
-            if len(self.subscribers) >= self.max_subscribers:
-                logging.warning(f"Max subscribers ({self.max_subscribers}) reached for {self.source}")
-                return False
-                
-            self.subscribers[stream_id] = {
-                'added_at': time.time(),
-                'frames_received': 0,
-                'last_frame_time': None,
-                'callback_info': callback_info or {}
-            }
-            
-            logging.info(f"Added subscriber {stream_id} to {self.source}. Total subscribers: {len(self.subscribers)}")
-            
-            # Start capture if this is the first subscriber
-            if len(self.subscribers) == 1 and not self.is_running:
-                self._start_capture()
-            
-            return True
-    
-    def remove_subscriber(self, stream_id: str):
-        """Remove a subscriber from this shared stream"""
-        with self.lock:
-            if stream_id in self.subscribers:
-                subscriber_info = self.subscribers.pop(stream_id)
-                logging.info(f"Removed subscriber {stream_id} from {self.source}. "
-                           f"Frames received: {subscriber_info.get('frames_received', 0)}")
-            
-            # Stop capture if no more subscribers
-            if not self.subscribers and self.is_running:
-                self._stop_capture()
-    
-    def get_latest_frame(self, stream_id: str) -> Optional[np.ndarray]:
-        """Get the latest frame for a specific subscriber"""
-        with self.lock:
-            if stream_id not in self.subscribers:
-                return None
-                
-            if self.latest_frame is not None:
-                self.subscribers[stream_id]['frames_received'] += 1
-                self.subscribers[stream_id]['last_frame_time'] = time.time()
-                return self.latest_frame.copy()
-            
-            return None
-    
-    def wait_for_frame(self, timeout: float = 1.0) -> bool:
-        """Wait for a new frame to be available"""
-        return self.frame_available.wait(timeout)
-    
-    def _start_capture(self):
-        """Start the video capture thread"""
-        if self.is_running:
-            return
-            
-        self.is_running = True
-        self.stop_capture.clear()
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.capture_thread.start()
-        logging.info(f"Started capture thread for {self.source}")
-    
-    def _stop_capture(self):
-        """Stop the video capture thread"""
-        if not self.is_running:
-            return
-            
-        logging.info(f"Stopping capture for {self.source}")
-        self.is_running = False
-        self.stop_capture.set()
-        
-        if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=5.0)
-            if self.capture_thread.is_alive():
-                logging.warning(f"Capture thread for {self.source} did not stop within timeout")
-        
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-        
-        self.capture_thread = None
-        logging.info(f"Stopped capture for {self.source}")
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get statistics for this shared stream"""
-        with self.lock:
-            return {
-                'source': self.source,
-                'subscriber_count': len(self.subscribers),
-                'is_running': self.is_running,
-                'frame_count': self.frame_count,
-                'last_frame_time': self.last_frame_time,
-                'reconnect_attempts': self.reconnect_attempts,
-                'last_error': self.last_error,
-                'error_count': self.error_count,
-                'subscribers': {
-                    stream_id: {
-                        'frames_received': info['frames_received'],
-                        'last_frame_time': info['last_frame_time']
-                    }
-                    for stream_id, info in self.subscribers.items()
-                }
-            }
-
-    def _is_file_source(self, source: str) -> bool:
-        """Check if source is a file path vs stream URL"""
-        return (not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and 
-                not source.isdigit())  # Not a camera index
-    
-    def _validate_file_source(self, source: str) -> bool:
-        """Validate that file source exists and is readable"""
-        try:
-            import os
-            if not os.path.exists(source):
-                logging.error(f"Video file does not exist: {source}")
-                return False
-            
-            if not os.access(source, os.R_OK):
-                logging.error(f"Video file is not readable: {source}")
-                return False
-            
-            # Check file size
-            file_size = os.path.getsize(source)
-            if file_size == 0:
-                logging.error(f"Video file is empty: {source}")
-                return False
-            
-            logging.info(f"Video file validated: {source} ({file_size} bytes)")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error validating video file {source}: {e}")
-            return False
-
-    def _handle_read_failure(self):
-        """Enhanced read failure handling with proper video looping"""
-        self.consecutive_failures += 1
-        
-        # Special handling for file sources (like your fire1.mp4)
-        if self._is_file_source(self.source) and self.cap and self.cap.isOpened():
-            try:
-                current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-                total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                
-                logging.debug(f"Video position for {self.source}: {current_pos}/{total_frames}")
-                
-                # Check if we've reached the end of the video
-                if total_frames > 0 and (current_pos >= total_frames - 1 or current_pos >= total_frames):
-                    logging.info(f"End of video file reached for {self.source} ({current_pos}/{total_frames}), looping to start")
-                    
-                    # Reset to beginning
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    
-                    # Test if reset worked
-                    ret, test_frame = self.cap.read()
-                    if ret and test_frame is not None:
-                        logging.info(f"Successfully looped video {self.source} back to start")
-                        # Reset the frame position again for next read
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        # Reset failure counters
-                        self.consecutive_failures = 0
-                        self.reconnect_attempts = 0
-                        return
-                    else:
-                        logging.warning(f"Failed to read after loop reset for {self.source}")
-                
-                # If position is valid but read failed, might be a temporary issue
-                elif current_pos < total_frames - 5:  # Not near the end
-                    logging.warning(f"Read failed mid-video for {self.source} at position {current_pos}")
-                    # Don't increment reconnect_attempts for mid-video failures
-                    if self.consecutive_failures < 5:
-                        return  # Give it another chance without reconnecting
-                        
-            except Exception as e:
-                logging.warning(f"Error checking video position for {self.source}: {e}")
-        
-        # If we get here, either it's not a file or the loop didn't work
-        self.reconnect_attempts += 1
-        
-        if self.reconnect_attempts >= self.max_reconnect_attempts:
-            logging.error(f"Max reconnect attempts ({self.max_reconnect_attempts}) reached for {self.source}")
-            self.is_running = False
-            return
-        
-        # For short videos, use shorter delays to restart quickly
-        if self._is_file_source(self.source):
-            base_delay = 1.0  # Shorter delay for files
-            max_delay = 5.0   # Max 5 seconds for files
-        else:
-            base_delay = 2.0  # Longer delay for streams
-            max_delay = 30.0
-        
-        delay = min(max_delay, base_delay * (1.5 ** (self.reconnect_attempts - 1)))
-        jitter = random.uniform(0.1, 0.5)
-        total_delay = delay + jitter
-        
-        logging.warning(f"Read failure for {self.source}, attempt {self.reconnect_attempts}/{self.max_reconnect_attempts}. "
-                    f"Retrying in {total_delay:.1f}s")
-        
-        time.sleep(total_delay)
-        
-        # Force re-open the video source
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-
-    def _capture_loop(self):
-        """Enhanced capture loop for short video files"""
-        logging.info(f"Capture loop started for {self.source}")
-        
-        # For file sources, get video info
-        video_duration = None
-        video_fps = None
-        total_frames = None
-        
-        if self._is_file_source(self.source):
-            try:
-                test_cap = cv2.VideoCapture(self.source)
-                if test_cap.isOpened():
-                    video_fps = test_cap.get(cv2.CAP_PROP_FPS)
-                    total_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    video_duration = total_frames / video_fps if video_fps > 0 else None
-                    logging.info(f"Video info for {self.source}: {total_frames} frames, {video_fps:.1f} FPS, {video_duration:.1f}s duration")
-                test_cap.release()
-            except Exception as e:
-                logging.warning(f"Could not get video info for {self.source}: {e}")
-        
-        try:
-            while not self.stop_capture.is_set() and self.is_running:
-                try:
-                    # Open video source if needed
-                    if self.cap is None or not self.cap.isOpened():
-                        if not self._open_video_source():
-                            delay = min(10.0, 2.0 * (2 ** min(self.reconnect_attempts, 3)))
-                            logging.warning(f"Failed to open {self.source}, retrying in {delay:.1f}s")
-                            time.sleep(delay)
-                            self.reconnect_attempts += 1
-                            continue
-                    
-                    # Read frame
-                    ret, frame = self.cap.read()
-                    
-                    if not ret or frame is None:
-                        self._handle_read_failure()
-                        continue
-                    
-                    # Validate frame quality
-                    if frame.size == 0 or len(frame.shape) != 3:
-                        logging.warning(f"Invalid frame received from {self.source}")
-                        self._handle_read_failure()
-                        continue
-                    
-                    # Successfully read frame
-                    self.reconnect_attempts = 0
-                    self.error_count = 0
-                    self.consecutive_failures = 0
-                    self.frame_count += 1
-                    self.last_frame_time = time.time()
-                    self.last_successful_read = time.time()
-                    
-                    # Update latest frame
-                    with self.lock:
-                        self.latest_frame = frame.copy()
-                        self.frame_available.set()
-                        self.frame_available.clear()
-                    
-                    # Frame rate control based on video type
-                    if self._is_file_source(self.source) and video_fps and video_fps > 0:
-                        # For files, respect the original FPS but cap at 30
-                        target_fps = min(video_fps, 30.0)
-                        sleep_time = 1.0 / target_fps
-                    else:
-                        # For streams or unknown FPS, use default
-                        sleep_time = 0.033  # ~30 FPS
-                    
-                    time.sleep(sleep_time)
-                    
-                except Exception as e:
-                    self.last_error = str(e)
-                    self.error_count += 1
-                    self.consecutive_failures += 1
-                    logging.error(f"Error in capture loop for {self.source}: {e}")
-                    
-                    if self.consecutive_failures > 20:  # Reduced threshold
-                        logging.error(f"Too many consecutive failures for {self.source}, stopping")
-                        break
-                    
-                    time.sleep(1.0)
-        
-        except Exception as e:
-            logging.error(f"Fatal error in capture loop for {self.source}: {e}", exc_info=True)
-        
-        finally:
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-            self.is_running = False
-            logging.info(f"Capture loop ended for {self.source}")
-
-    def _open_video_source(self) -> bool:
-        """Enhanced video source opening with multiple backend attempts"""
-        try:
-            if self.cap:
-                self.cap.release()
-                time.sleep(0.2)  # Brief pause for cleanup
-            
-            # Validate file if it's a local file
-            if self._is_file_source(self.source):
-                if not self._validate_file_source(self.source):
-                    return False
-            
-            # Try different backends in order of preference
-            backends_to_try = []
-            
-            if self._is_file_source(self.source):
-                # For file sources - your system supports both CAP_FFMPEG and CAP_ANY
-                backends_to_try = [
-                    cv2.CAP_FFMPEG,  # Best for video files
-                    cv2.CAP_ANY      # Fallback that works
-                ]
-            else:
-                # For stream sources (RTSP, HTTP, etc.)
-                backends_to_try = [
-                    cv2.CAP_FFMPEG,  # Best for most streaming protocols
-                    cv2.CAP_ANY      # Fallback
-                ]
-            
-            for i, backend in enumerate(backends_to_try):
-                try:
-                    logging.info(f"Attempting to open {self.source} with backend {backend} (attempt {i+1}/{len(backends_to_try)})")
-                    
-                    self.cap = cv2.VideoCapture(self.source, backend)
-                    
-                    if not self.cap or not self.cap.isOpened():
-                        if self.cap:
-                            self.cap.release()
-                        continue
-                    
-                    # Configure buffer size
-                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    
-                    # Test read to ensure it works
-                    ret, test_frame = self.cap.read()
-                    if not ret or test_frame is None or test_frame.size == 0:
-                        logging.warning(f"Backend {backend} opened but cannot read frames")
-                        self.cap.release()
-                        self.cap = None
-                        continue
-                    
-                    # Reset to beginning for file sources
-                    if self._is_file_source(self.source):
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        
-                        # Log video properties
-                        total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        fps = self.cap.get(cv2.CAP_PROP_FPS)
-                        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        
-                        logging.info(f"Video opened successfully: {width}x{height}, {total_frames} frames, {fps:.2f} FPS")
-                    
-                    logging.info(f"Successfully opened {self.source} with backend {backend}")
-                    return True
-                    
-                except Exception as e:
-                    logging.warning(f"Backend {backend} failed for {self.source}: {e}")
-                    if self.cap:
-                        self.cap.release()
-                        self.cap = None
-                    continue
-            
-            logging.error(f"All backends failed to open {self.source}")
-            return False
-            
-        except Exception as e:
-            logging.error(f"Critical error opening {self.source}: {e}", exc_info=True)
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-            return False
-
-class VideoFileManager:
-    """Manages shared video streams to prevent file conflicts"""
-    
-    def __init__(self):
-        self.shared_streams: Dict[str, SharedVideoStream] = {}
-        self.lock = threading.RLock()
-    
-    def get_shared_stream(self, source: str, max_subscribers: int = 10) -> SharedVideoStream:
-        """Get or create a shared stream for a source"""
-        with self.lock:
-            if source not in self.shared_streams:
-                self.shared_streams[source] = SharedVideoStream(source, max_subscribers)
-            return self.shared_streams[source]
-    
-    def remove_shared_stream(self, source: str):
-        """Remove a shared stream"""
-        with self.lock:
-            if source in self.shared_streams:
-                shared_stream = self.shared_streams[source]
-                # Stop the stream if it's running
-                if shared_stream.is_running:
-                    shared_stream._stop_capture()
-                del self.shared_streams[source]
-                logging.info(f"Removed shared stream for {source}")
-    
-    def cleanup_empty_streams(self):
-        """Clean up streams with no subscribers"""
-        with self.lock:
-            empty_sources = []
-            for source, stream in self.shared_streams.items():
-                if not stream.subscribers:
-                    empty_sources.append(source)
-            
-            for source in empty_sources:
-                self.remove_shared_stream(source)
-    
-    def get_all_stats(self) -> Dict[str, Any]:
-        """Get statistics for all shared streams"""
-        with self.lock:
-            return {
-                source: stream.get_stats()
-                for source, stream in self.shared_streams.items()
-            }
 
 class StreamManager:
 
@@ -510,8 +51,13 @@ class StreamManager:
         self.notifications: List[Dict[str, Any]] = [] # In-memory cache, primary is DB
         self.notification_subscribers: Dict[str, Set[WebSocket]] = defaultdict(set)
         self.max_notifications = config.get("stream_max_in_memory_notifications", 100)
+        self.people_count_notification_cooldowns: Dict[str, float] = {}
+        self.people_count_cooldown_duration = 300.0  # 5 minutes in seconds
         self.fire_notification_cooldowns: Dict[str, float] = {}
-        self.fire_cooldown_duration = 600.0  # 10 minutes in seconds
+        self.fire_cooldown_duration = 300.0  # 5 minutes in seconds
+        self.fire_detection_states: Dict[str, str] = {}  # Track current fire status per stream
+        self.fire_detection_frame_counts: Dict[str, int] = {}  # Track frame counts per stream
+        self.global_fire_states: Dict[str, Dict[str, Any]] = {}
         self.frame_buffer_size = config.get("cv_frame_buffer_size", 3)
         self.last_healthcheck = datetime.now(timezone.utc)
         self.healthcheck_interval = config.get("stream_healthcheck_interval_seconds", 60)
@@ -523,11 +69,10 @@ class StreamManager:
             timeout=config.get("qdrant_timeout", 30.0)
         )
         self.people_model, self.gender_model, self.fire_model = self._initialize_model() # Sync init is fine
-        
         self.video_file_manager = VideoFileManager()
-
         self.background_task: Optional[asyncio.Task] = None
         self.cleanup_task: Optional[asyncio.Task] = None
+
         logging.info("StreamManager initialized - waiting for start_background_tasks()")
 
     async def start_background_tasks(self):
@@ -573,7 +118,7 @@ class StreamManager:
         self.background_task = None
         self.cleanup_task = None
 
-    def _handle_task_done(self, task: asyncio.Task): # This callback must be sync
+    def _handle_task_done(self, task: asyncio.Task):
         try:
             task_name = task.get_name()
             exception = task.exception()
@@ -664,9 +209,25 @@ class StreamManager:
                 for key in expired_cooldown_keys:
                     self.fire_notification_cooldowns.pop(key, None)
                     
+                await self.cleanup_old_fire_states()
+
                 if expired_cooldown_keys:
                     logging.debug(f"Cleaned up {len(expired_cooldown_keys)} expired fire notification cooldowns")
-                
+
+                # Clean up expired people count notification cooldowns
+                expired_people_cooldown_keys = []
+                for stream_id_str, last_notification_time in self.people_count_notification_cooldowns.items():
+                    # Remove entries older than 24 hours that are no longer active
+                    if ((current_time - last_notification_time) > 86400 and  # 24 hours
+                        stream_id_str not in self.active_streams):
+                        expired_people_cooldown_keys.append(stream_id_str)
+
+                for key in expired_people_cooldown_keys:
+                    self.people_count_notification_cooldowns.pop(key, None)
+
+                if expired_people_cooldown_keys:
+                    logging.debug(f"Cleaned up {len(expired_people_cooldown_keys)} expired people count notification cooldowns")
+
             except asyncio.CancelledError:
                 logging.info("Periodic cleanup task cancelled.")
                 break
@@ -790,84 +351,6 @@ class StreamManager:
         
         logging.info("StreamManager shutdown complete.")
 
-    async def manage_streams(self):
-        while True:
-            try:
-                # UPDATED QUERY: Include location fields in the stream data query
-                streams_to_run_query = """
-                    SELECT vs.stream_id, vs.name, vs.path, vs.user_id, vs.workspace_id, u.username,
-                           vs.location, vs.area, vs.building, vs.zone, vs.floor_level, 
-                           vs.latitude, vs.longitude
-                    FROM video_stream vs JOIN users u ON vs.user_id = u.user_id
-                    WHERE vs.is_streaming = TRUE AND u.is_active = TRUE 
-                          AND (u.is_subscribed = TRUE OR u.role = 'admin')
-                """
-                potential_streams_db = await self.db_manager.execute_query(streams_to_run_query, fetch_all=True)
-                potential_streams_db = potential_streams_db or []
-
-                async with self._lock: 
-                    current_running_ids_mem = set(self.active_streams.keys())
-                
-                db_should_run_ids = {str(s['stream_id']) for s in potential_streams_db}
-
-                for stream_data in potential_streams_db:
-                    # UPDATED: Extract location data from stream_data
-                    stream_id_obj, cam_name, source, owner_id_obj, workspace_id_obj, owner_username = \
-                        stream_data['stream_id'], stream_data['name'], stream_data['path'], \
-                        stream_data['user_id'], stream_data['workspace_id'], stream_data['username']
-                    
-                    # NEW: Extract location information
-                    location_info = {
-                        'location': stream_data.get('location'),
-                        'area': stream_data.get('area'),
-                        'building': stream_data.get('building'),
-                        'zone': stream_data.get('zone'),
-                        'floor_level': stream_data.get('floor_level'),
-                        'latitude': stream_data.get('latitude'),
-                        'longitude': stream_data.get('longitude')
-                    }
-                    
-                    stream_id_str, owner_id_str = str(stream_id_obj), str(owner_id_obj)
-
-                    if stream_id_str in current_running_ids_mem: continue
-
-                    owner_info = await self.db_manager.execute_query("SELECT count_of_camera, role FROM users WHERE user_id = $1", (owner_id_obj,), fetch_one=True)
-                    owner_camera_limit = owner_info["count_of_camera"] if owner_info else 5 # Default based on stream_one
-                    owner_role = owner_info["role"] if owner_info else "user"
-                    
-                    active_owner_streams_q = "SELECT COUNT(*) as count FROM video_stream WHERE user_id = $1 AND workspace_id = $2 AND is_streaming = TRUE" # Count all flagged as streaming
-                    active_count_res = await self.db_manager.execute_query(active_owner_streams_q, (owner_id_obj, workspace_id_obj), fetch_one=True)
-                    current_owner_ws_active_count = active_count_res['count'] if active_count_res else 0
-
-                    if owner_role == 'admin' or current_owner_ws_active_count < owner_camera_limit:
-                        logging.info(f"ManageStreams: Starting stream {stream_id_str} for {owner_username} (ws: {workspace_id_obj}). Limit ok.")
-                        # UPDATED: Pass location info to start_stream_background
-                        asyncio.create_task(
-                            self.start_stream_background(
-                                stream_id_obj, owner_id_obj, owner_username, 
-                                cam_name, source, workspace_id_obj, location_info
-                            )
-                        )
-                    else:
-                        logging.warning(f"Owner {owner_username} at camera limit ({owner_camera_limit}) in ws {workspace_id_obj}. Stream {stream_id_str} will be marked inactive.")
-                        await self.db_manager.execute_query("UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', updated_at = NOW() WHERE stream_id = $1", (stream_id_obj,))
-
-                streams_to_stop_ids = current_running_ids_mem - db_should_run_ids
-                for stream_id_to_stop_str in streams_to_stop_ids:
-                    logging.info(f"ManageStreams: Stopping stream {stream_id_to_stop_str} (no longer marked to run in DB or owner/sub issue).")
-                    await self._stop_stream(stream_id_to_stop_str, for_restart=False)
-
-                if (datetime.now(timezone.utc) - self.last_healthcheck).total_seconds() > self.healthcheck_interval:
-                    await self._check_stream_health()
-            
-            except asyncio.CancelledError:
-                logging.info("Manage streams task cancelled.")
-                break
-            except Exception as e:
-                logging.error(f"Error in manage_streams loop: {e}", exc_info=True)
-            
-            await asyncio.sleep(config.get("stream_manager_poll_interval_seconds", 5.0)) # Ensure float
-
     async def get_stream_parameters(self, workspace_id: Union[str, UUID]) -> Dict[str, Any]:
         workspace_id_str = str(workspace_id)
         cache_key = f"params_workspace_{workspace_id_str}"
@@ -938,7 +421,7 @@ class StreamManager:
             "longitude": float(stream_res["longitude"]) if stream_res["longitude"] else None,
         }
 
-    async def add_notification(self, user_id: str, workspace_id: str, stream_id: str, camera_name: str, status: str, message: str):
+    async def add_notification1(self, user_id: str, workspace_id: str, stream_id: str, camera_name: str, status: str, message: str):
         now_dt = datetime.now(timezone.utc)
         notif_id = uuid4()
         # Timestamp as float for JSON, datetime object for DB
@@ -967,7 +450,51 @@ class StreamManager:
             logging.error(f"Failed to persist notification {str(notif_id)} to DB: {e_db}", exc_info=True)
         return notification_data_json # Return the JSON version
 
-    async def deliver_notification_to_subscribers(self, user_id: str, notification: Dict[str, Any]):
+    async def add_notification(self, user_id: str, workspace_id: str, stream_id: str, camera_name: str, status: str, message: str):
+        now_dt = datetime.now(timezone.utc)
+        notif_id = uuid4()
+        
+        # Timestamp as float for JSON, datetime object for DB
+        notification_data_json = { 
+            "id": str(notif_id), 
+            "user_id": user_id, 
+            "workspace_id": workspace_id, 
+            "stream_id": stream_id, 
+            "camera_name": camera_name, 
+            "status": status, 
+            "message": message, 
+            "timestamp": now_dt.timestamp(), 
+            "read": False
+        }
+        
+        async with self._notification_lock: # In-memory cache update
+            self.notifications.append(notification_data_json) 
+            self.notifications = self.notifications[-self.max_notifications:]
+        
+        logging.info(f"Notification for user {user_id}, ws {workspace_id}: {message}")
+        
+        # For fire alerts, send both regular notification AND immediate alert
+        if status == "fire_alert":
+            # Send regular notification
+            asyncio.create_task(self.deliver_notification_to_subscribers(user_id, notification_data_json))
+        else:
+            # Send regular notification for non-fire alerts
+            asyncio.create_task(self.deliver_notification_to_subscribers(user_id, notification_data_json))
+        
+        try: 
+            await self.db_manager.execute_query(
+                """INSERT INTO notifications 
+                (notification_id, user_id, workspace_id, stream_id, camera_name, status, message, timestamp, is_read, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
+                (notif_id, UUID(user_id), UUID(workspace_id), UUID(stream_id) if stream_id else None,
+                camera_name, status, message, now_dt, False, now_dt, now_dt)
+            )
+        except Exception as e_db:
+            logging.error(f"Failed to persist notification {str(notif_id)} to DB: {e_db}", exc_info=True)
+        
+        return notification_data_json 
+
+    async def deliver_notification_to_subscribers1(self, user_id: str, notification: Dict[str, Any]):
         subscribers_for_user_copy: List[WebSocket] = []
         async with self._notification_lock:
             subscribers_for_user_copy = list(self.notification_subscribers.get(user_id, set()))
@@ -992,6 +519,150 @@ class StreamManager:
                 logging.warning(f"Failed to send notification to WS for user {user_id} (client: {ws_failed.client}): {result}")
                 asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws_failed))
 
+    async def deliver_notification_to_subscribers2(self, user_id: str, notification: Dict[str, Any]):
+        subscribers_for_user_copy: List[WebSocket] = []
+        async with self._notification_lock:
+            subscribers_for_user_copy = list(self.notification_subscribers.get(user_id, set()))
+
+        if not subscribers_for_user_copy: 
+            return
+        
+        # Create base notification payload
+        base_payload = {
+            "type": "notification", 
+            "notification": notification, 
+            "server_time": datetime.now(timezone.utc).timestamp()
+        }
+        
+        # For fire alerts, send additional emergency data that your frontend expects
+        if notification.get("status") == "fire_alert":
+            # Send both the regular notification AND a fire emergency alert
+            fire_emergency_payload = {
+                "type": "fire_emergency",
+                "message": notification.get("message"),
+                "camera_name": notification.get("camera_name"),
+                "stream_id": notification.get("stream_id"),
+                "timestamp": notification.get("timestamp"),
+                "alert_type": "fire_alert",
+                "severity": "high",
+                "id": notification.get("id")
+            }
+            
+            # Send fire emergency first (for immediate popup)
+            fire_tasks = []
+            valid_subscribers_fire = []
+            for ws in subscribers_for_user_copy:
+                if ws.client_state == WebSocketState.CONNECTED:
+                    fire_tasks.append(ws.send_json(fire_emergency_payload))
+                    valid_subscribers_fire.append(ws)
+                else: 
+                    asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws))
+
+            # Send fire emergency alerts
+            if fire_tasks:
+                fire_results = await asyncio.gather(*fire_tasks, return_exceptions=True)
+                for i, result in enumerate(fire_results):
+                    if isinstance(result, Exception):
+                        ws_failed = valid_subscribers_fire[i]
+                        logging.warning(f"Failed to send fire emergency to WS for user {user_id}: {result}")
+                        asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws_failed))
+            
+            # Small delay to ensure fire alert is processed first
+            await asyncio.sleep(0.1)
+        
+        # Send regular notification (this will appear in the notification list)
+        tasks = []
+        valid_subscribers_for_gather = []
+        for ws in subscribers_for_user_copy:
+            if ws.client_state == WebSocketState.CONNECTED:
+                tasks.append(ws.send_json(base_payload))
+                valid_subscribers_for_gather.append(ws)
+            else: 
+                asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    ws_failed = valid_subscribers_for_gather[i]
+                    logging.warning(f"Failed to send notification to WS for user {user_id}: {result}")
+                    asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws_failed))
+
+    async def deliver_notification_to_subscribers(self, user_id: str, notification: Dict[str, Any]):
+        subscribers_for_user_copy: List[WebSocket] = []
+        async with self._notification_lock:
+            subscribers_for_user_copy = list(self.notification_subscribers.get(user_id, set()))
+
+        if not subscribers_for_user_copy: 
+            return
+        
+        # Create base notification payload
+        base_payload = {
+            "type": "notification", 
+            "notification": notification, 
+            "server_time": datetime.now(timezone.utc).timestamp()
+        }
+        
+        # For fire alerts, send additional emergency data
+        if notification.get("status") == "fire_alert":
+            # Send fire emergency alert first (for immediate popup)
+            fire_emergency_payload = {
+                "type": "fire_emergency",
+                "alert_type": "fire_alert",
+                "id": notification.get("id"),
+                "message": notification.get("message"),
+                "camera_name": notification.get("camera_name"),
+                "stream_id": notification.get("stream_id"),
+                "timestamp": notification.get("timestamp"),
+                "severity": "high",
+                "location_info": {
+                    "location": None,  # Add location data if available
+                    "area": None,
+                    "building": None,
+                    "zone": None
+                }
+            }
+            
+            # Send fire emergency first (for immediate popup)
+            fire_tasks = []
+            valid_subscribers_fire = []
+            for ws in subscribers_for_user_copy:
+                if ws.client_state == WebSocketState.CONNECTED:
+                    fire_tasks.append(ws.send_json(fire_emergency_payload))
+                    valid_subscribers_fire.append(ws)
+                else: 
+                    asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws))
+
+            # Send fire emergency alerts
+            if fire_tasks:
+                fire_results = await asyncio.gather(*fire_tasks, return_exceptions=True)
+                for i, result in enumerate(fire_results):
+                    if isinstance(result, Exception):
+                        ws_failed = valid_subscribers_fire[i]
+                        logging.warning(f"Failed to send fire emergency to WS for user {user_id}: {result}")
+                        asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws_failed))
+            
+            # Small delay to ensure fire alert is processed first
+            await asyncio.sleep(0.1)
+        
+        # Send regular notification (this will appear in the notification list)
+        tasks = []
+        valid_subscribers_for_gather = []
+        for ws in subscribers_for_user_copy:
+            if ws.client_state == WebSocketState.CONNECTED:
+                tasks.append(ws.send_json(base_payload))
+                valid_subscribers_for_gather.append(ws)
+            else: 
+                asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    ws_failed = valid_subscribers_for_gather[i]
+                    logging.warning(f"Failed to send notification to WS for user {user_id}: {result}")
+                    asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws_failed))
+                                        
     async def get_notifications(self, user_id_str: str, workspace_id_filter: Optional[str] = None, since_timestamp: Optional[float] = None, limit: int = 50, include_read: bool = True) -> List[Dict[str, Any]]:
         query = """
             SELECT notification_id, user_id, workspace_id, stream_id, camera_name, status, message, timestamp, is_read
@@ -1061,7 +732,11 @@ class StreamManager:
         task_obj: Optional[asyncio.Task] = stream_info.get('task')
 
         # NEW: Clean up fire notification cooldown tracking
-        self.fire_notification_cooldowns.pop(stream_id_str, None)
+        # self.fire_notification_cooldowns.pop(stream_id_str, None)
+        # Only clean up in-memory state
+        self.fire_detection_states.pop(stream_id_str, None)
+        self.fire_detection_frame_counts.pop(stream_id_str, None)
+        self.people_count_notification_cooldowns.pop(stream_id_str, None)
 
         try:
             if stop_event_obj: stop_event_obj.set()
@@ -1155,168 +830,7 @@ class StreamManager:
             await ensure_workspace_qdrant_collection_exists(self.qdrant_client, workspace_id)
         except Exception as e:
             logger.error(f"Failed to ensure Qdrant collection for workspace {workspace_id}: {e}", exc_info=True)
-            
-    async def _process_stream(self, stream_id: UUID, camera_name: str, source: str, owner_username: str, 
-                             owner_id: UUID, workspace_id: UUID, stop_event: threading.Event,
-                             location_info: Optional[Dict[str, Any]] = None):
-        cap = None
-        reconnect_attempts = 0
-        max_reconnect_attempts = config.get("stream_max_reconnect_attempts", 5)
-        frame_count = 0
-        last_db_update_activity = datetime.now(timezone.utc)
-        stream_id_str = str(stream_id)
-        loop = asyncio.get_event_loop()
-        
-        # NEW: Get threshold settings for this camera
-        threshold_settings = await self.get_camera_threshold_settings(stream_id)
-        
-        try:
-            params = await self.get_stream_parameters(workspace_id)
-            frame_skip = params.get("frame_skip", 300)
-            frame_delay_target = params.get("frame_delay", 0.0)
-            conf_threshold = params.get("conf_threshold", 0.4)
-
-            cap = await loop.run_in_executor(thread_pool, cv2.VideoCapture, source, cv2.CAP_FFMPEG)
-
-            is_opened_in_executor = await loop.run_in_executor(thread_pool, getattr, cap, 'isOpened') if cap else False
-            if not cap or not is_opened_in_executor:
-                for i in range(max_reconnect_attempts):
-                    logging.warning(f"Retrying connection to {source} (stream {stream_id_str}), attempt {i+1}")
-                    await asyncio.sleep(config.get("stream_reconnect_delay_base_seconds", 2.0) * (i + 1))
-                    if cap: await loop.run_in_executor(thread_pool, cap.release)
-                    cap = await loop.run_in_executor(thread_pool, cv2.VideoCapture, source, cv2.CAP_FFMPEG)
-                    is_opened_in_executor = await loop.run_in_executor(thread_pool, getattr, cap, 'isOpened') if cap else False
-                    if cap and is_opened_in_executor: break
-                if not cap or not is_opened_in_executor:
-                    raise RuntimeError(f"Could not open video source: {source} after retries")
-
-            await loop.run_in_executor(thread_pool, cap.set, cv2.CAP_PROP_BUFFERSIZE, self.frame_buffer_size)
-            await self.db_manager.execute_query("UPDATE video_stream SET status = 'active', updated_at = NOW() WHERE stream_id = $1", (stream_id,))
-            await self.add_notification(str(owner_id), str(workspace_id), stream_id_str, camera_name, "active", f"Camera '{camera_name}' started streaming.")
-            async with self._lock:
-                if stream_id_str in self.active_streams: self.active_streams[stream_id_str]['status'] = 'active'
-            
-            while not stop_event.is_set():
-                ret, frame = await loop.run_in_executor(thread_pool, cap.read)
-                
-                if not ret:
-                    reconnect_attempts += 1
-                    logging.warning(f"Frame read fail from {source} (stream {stream_id_str}), attempt {reconnect_attempts}")
-                    if reconnect_attempts >= max_reconnect_attempts:
-                        raise RuntimeError(f"Max reconnect attempts reached for {source}")
-                    await asyncio.sleep(config.get("stream_reconnect_delay_frame_read_seconds", 5.0))
-                    if cap: await loop.run_in_executor(thread_pool, cap.release)
-                    cap = await loop.run_in_executor(thread_pool, cv2.VideoCapture, source, cv2.CAP_FFMPEG)
-                    is_opened_in_executor = await loop.run_in_executor(thread_pool, getattr, cap, 'isOpened') if cap else False
-                    if not cap or not is_opened_in_executor: 
-                        await asyncio.sleep(config.get("stream_reconnect_delay_frame_read_seconds", 5.0))
-                    continue 
-                
-                reconnect_attempts = 0
-                frame_count += 1
-                
-                if frame_skip > 0 and frame_count % (frame_skip + 1) != 0:
-                    await asyncio.sleep(0.001)
-                    continue
-
-                processing_start_time = datetime.now(timezone.utc)
-                # UPDATED: detect_objects now includes threshold checking
-                processed_frame, person_count, alert_triggered, male_count, female_count, fire_status = await loop.run_in_executor(
-                    thread_pool, self.detect_objects_with_threshold, frame, conf_threshold, threshold_settings
-                )
-                detection_duration = (datetime.now(timezone.utc) - processing_start_time).total_seconds()
-
-                async with self._lock: 
-                    stats = self.stream_processing_stats.get(stream_id_str)
-                    if stats:
-                        stats["frames_processed"] += 1
-                        if person_count > 0: stats["detection_count"] += 1
-                        stats["avg_processing_time"] = (stats.get("avg_processing_time", 0.0) * 0.95) + (detection_duration * 0.05)
-                        stats["last_updated"] = datetime.now(timezone.utc)
-                    
-                    stream_info_active = self.active_streams.get(stream_id_str)
-                    if stream_info_active: 
-                        stream_info_active['latest_frame'] = processed_frame
-                        stream_info_active['last_frame_time'] = datetime.now(timezone.utc)
-                
-                # NEW: Send alert notification if threshold exceeded
-                if alert_triggered:
-                    alert_message = self.generate_alert_message(person_count, threshold_settings)
-                    await self.add_notification(
-                        str(owner_id), str(workspace_id), stream_id_str, 
-                        camera_name, "alert", alert_message
-                    )
-
-                # if fire_status == "fire" or fire_status == "smoke":
-                #     await self.add_notification(
-                #         str(owner_id), str(workspace_id), stream_id_str, 
-                #         camera_name, "alert", f"there are a {fire_status} status"
-                #     )
-                
-                # UPDATED: Fire/smoke notification with cooldown
-                if fire_status in ["fire", "smoke"]:
-                    current_time = time.time()
-                    last_fire_notification_time = self.fire_notification_cooldowns.get(stream_id_str, 0)
-                    
-                    # Check if cooldown period has passed
-                    if (current_time - last_fire_notification_time) >= self.fire_cooldown_duration:
-                        await self.add_notification(
-                            str(owner_id), str(workspace_id), stream_id_str, 
-                            camera_name, "alert", f"Fire/smoke detected: {fire_status}"
-                        )
-                        
-                        # Update the last notification time
-                        self.fire_notification_cooldowns[stream_id_str] = current_time
-                        
-                        logging.info(f"Fire/smoke notification sent for stream {stream_id_str}: {fire_status}")
-                    else:
-                        # Calculate remaining cooldown time
-                        remaining_cooldown = self.fire_cooldown_duration - (current_time - last_fire_notification_time)
-                        logging.debug(f"Fire/smoke detected in stream {stream_id_str} but still in cooldown. "
-                                    f"Remaining: {remaining_cooldown:.1f} seconds")
-
-                if person_count > 0:
-                    await loop.run_in_executor(
-                        thread_pool, self.insert_detection_data_with_location, 
-                        owner_username, stream_id_str, camera_name, person_count, male_count, female_count, fire_status, 
-                        processed_frame, workspace_id, location_info
-                    )
-
-                now_utc_loop = datetime.now(timezone.utc)
-                if (now_utc_loop - last_db_update_activity).total_seconds() > config.get("stream_db_activity_update_interval_seconds", 10.0):
-                    await self.db_manager.execute_query("UPDATE video_stream SET last_activity = NOW() WHERE stream_id = $1", (stream_id,))
-                    last_db_update_activity = now_utc_loop
-                
-                current_iteration_duration = (datetime.now(timezone.utc) - processing_start_time).total_seconds()
-                sleep_duration = max(0, frame_delay_target - current_iteration_duration)
-                await asyncio.sleep(sleep_duration if sleep_duration > 0 else 0.001)
-        
-        except asyncio.CancelledError:
-            logging.info(f"Stream processing task for {stream_id_str} ({camera_name}) was cancelled.")
-        except RuntimeError as e:
-            logging.error(f"Unrecoverable stream error for {stream_id_str} ({camera_name}): {e}", exc_info=False) 
-            await self.db_manager.execute_query("UPDATE video_stream SET status = 'error', is_streaming = FALSE, last_activity = NOW(), updated_at = NOW() WHERE stream_id = $1", (stream_id,))
-            await self.add_notification(str(owner_id), str(workspace_id), stream_id_str, camera_name, "error", f"Stream error: {str(e)[:100]}")
-        except Exception as e:
-            logging.error(f"General error in _process_stream for {stream_id_str} ({camera_name}): {e}", exc_info=True)
-            await self.db_manager.execute_query("UPDATE video_stream SET status = 'error', is_streaming = FALSE, last_activity = NOW(), updated_at = NOW() WHERE stream_id = $1", (stream_id,))
-            await self.add_notification(str(owner_id), str(workspace_id), stream_id_str, camera_name, "error", "Unexpected stream error. Check logs.")
-        finally:
-            if cap: await loop.run_in_executor(thread_pool, cap.release)
-            logging.info(f"Stream processing ended for {stream_id_str} ({camera_name}). Cleaning up in-memory structures.")
-            
-            async with self._lock: self.active_streams.pop(stream_id_str, None)
-            self.stream_processing_stats.pop(stream_id_str, None)
-
-            if not stop_event.is_set() and not isinstance(loop.current_task().exception(), asyncio.CancelledError):
-                current_db_status = await self.db_manager.execute_query(
-                    "SELECT status, is_streaming FROM video_stream WHERE stream_id = $1", (stream_id,), fetch_one=True
-                )
-                if current_db_status and not (current_db_status.get('status') == 'error' and not current_db_status.get('is_streaming', True)):
-                     await self.db_manager.execute_query(
-                         "UPDATE video_stream SET status = 'inactive', is_streaming = FALSE, last_activity = NOW(), updated_at = NOW() WHERE stream_id = $1", (stream_id,)
-                     )
-
+ 
     async def get_camera_threshold_settings(self, stream_id: UUID) -> Dict[str, Any]:
         """Get threshold settings for a specific camera."""
         try:
@@ -1335,129 +849,6 @@ class StreamManager:
             logging.error(f"Error getting threshold settings for stream {stream_id}: {e}", exc_info=True)
             return {"greater_than": None, "less_than": None, "alert_enabled": False}
 
-    def detect_objects_with_threshold_not_parallel(self, frame: np.ndarray, conf_threshold: float = 0.4, 
-                                    threshold_settings: Dict[str, Any] = None) -> tuple[np.ndarray, int, bool, int, int, str]:
-        """Enhanced object detection with threshold checking and red color alerts."""
-        if frame is None or frame.size == 0: 
-            return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
-
-        # Frame counter for model scheduling
-        frame_count = getattr(self, '_frame_count', 0) + 1
-        setattr(self, '_frame_count', frame_count)
-        
-        # Cache previous results
-        if not hasattr(self, '_cached_results'):
-            self._cached_results = {
-                'male_count': 0,
-                'female_count': 0,
-                'fire_status': 'no detection',
-                'last_gender_frame': 0,
-                'last_fire_frame': 0
-            }
-
-        max_dim = config.get("yolo_max_input_dim", 640)
-        h, w = frame.shape[:2]
-        scale = 1.0
-        if h > max_dim or w > max_dim:
-            scale = max_dim / max(h, w)
-            new_w, new_h = int(w * scale), int(h * scale)
-            new_w = max(2, new_w - (new_w % 2))
-            new_h = max(2, new_h - (new_h % 2))
-            input_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            input_frame = frame
-
-        try:
-            people_results = self.people_model.predict(source=input_frame, conf=conf_threshold, classes=[0], verbose=False)
-
-            # --- Count people ---
-            # people_count = sum(1 for r in people_results[0].boxes if int(r.cls) == 0)  # assuming class 0 = person
-
-            person_count = 0
-            # Count detected persons
-            if people_results and people_results[0].boxes is not None:
-                person_count = len(people_results[0].boxes)
-
-                # for box in people_results[0].boxes:
-                #     if int(box.cls[0]) == 0: 
-                #         person_count += 1
-
-            if person_count > 0:# and frame_count % 3 == 0
-                gender_results = self.gender_model(source=input_frame, conf=0.3, verbose=False)
-
-                # --- Count gender ---
-                if gender_results and gender_results[0].boxes is not None:
-                    male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
-                    female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
-                    
-                    self._cached_results['male_count'] = male_count
-                    self._cached_results['female_count'] = female_count
-                    self._cached_results['last_gender_frame'] = frame_count
-
-            if frame_count % 10 == 0:
-                fire_results   = self.fire_model(source=input_frame, conf=0.3, verbose=False)
-
-                # --- Fire detection ---
-                # --- Fire/Smoke detection ---
-                fire_status = "no detection"
-                if fire_results and fire_results[0].boxes is not None:# len(fire_results[0].boxes) > 0
-                    classes = [int(box.cls) for box in fire_results[0].boxes]
-                    if 0 in classes:
-                        fire_status = "fire"
-                    if 1 in classes:
-                        fire_status = "smoke"
-
-                self._cached_results['fire_status'] = fire_status
-                self._cached_results['last_fire_frame'] = frame_count
-
-            # Use cached results
-            male_count = self._cached_results['male_count']
-            female_count = self._cached_results['female_count']
-            fire_status = self._cached_results['fire_status']
-
-            alert_triggered = False
-            
-            # Check thresholds if alerts are enabled
-            if threshold_settings and threshold_settings.get("alert_enabled", False):
-                greater_than = threshold_settings.get("greater_than")
-                less_than = threshold_settings.get("less_than")
-                
-                if greater_than is not None and person_count > greater_than:
-                    alert_triggered = True
-                elif less_than is not None and person_count < less_than:
-                    alert_triggered = True
-            
-            # Use YOLO's plot() method for annotations
-            annotated_frame = people_results[0].plot(img=input_frame.copy()) if people_results and people_results[0].boxes is not None else input_frame.copy()
-            
- 
-            # Add person count with appropriate color
-            count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)  # Red if alert, white otherwise
-            count_text = f"People: {person_count} | M: {male_count} | F: {female_count}"
-            cv2.putText(annotated_frame, count_text, (10, 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, count_color, 2, cv2.LINE_AA)
-            
-            if fire_status != "no detection":
-                cv2.putText(annotated_frame, f"FIRE: {fire_status.upper()}", 
-                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 0, 255), 2, cv2.LINE_AA)
-
-            # Alert styling
-            if alert_triggered:
-                red_overlay = annotated_frame.copy()
-                red_overlay[:] = (0, 0, 255)
-                annotated_frame = cv2.addWeighted(annotated_frame, 0.85, red_overlay, 0.15, 0)
-                
-            # Scale back if needed
-            if scale != 1.0:
-                annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
-                
-            return annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status
-            
-        except Exception as e:
-            logger.error(f"Object detection error: {e}", exc_info=True)
-            return frame.copy(), 0, False, 0, 0, "no detection"
-
     def generate_alert_message(self, person_count: int, threshold_settings: Dict[str, Any]) -> str:
         """Generate appropriate alert message based on threshold violation."""
         greater_than = threshold_settings.get("greater_than")
@@ -1469,12 +860,6 @@ class StreamManager:
             return f"LOW OCCUPANCY ALERT: {person_count} people detected (threshold: <{less_than})"
         else:
             return f"THRESHOLD ALERT: {person_count} people detected"
-
-    # Keep the original method for backwards compatibility
-    def detect_objects(self, frame: np.ndarray, conf_threshold: float = 0.4) -> tuple[np.ndarray, int]:
-        """Legacy method for backward compatibility - calls new method without threshold checking."""
-        annotated_frame, person_count, _, male_count, female_count, fire_status = self.detect_objects_with_threshold(frame, conf_threshold, None)
-        return annotated_frame, person_count
 
     def insert_detection_data_with_location(self, username: str, camera_id_str: str, camera_name: str, 
                                            count: int, male_count: int, female_count: int, fire_status: str, frame: np.ndarray, workspace_id: UUID, 
@@ -1521,11 +906,6 @@ class StreamManager:
             logging.debug(f"Inserted detection data with location info to {target_collection_name}: {point_id_str}")
         except Exception as e:
             logger.error(f"Error inserting detection data with location to Qdrant ({target_collection_name}): {e}", exc_info=True)
-
-    # Keep the original method for backwards compatibility
-    def insert_detection_data(self, username: str, camera_id_str: str, camera_name: str, count: int, male_count: int, female_count: int, fire_status: str, frame: np.ndarray, workspace_id: UUID):
-        """Legacy method for backward compatibility - calls new method with no location info."""
-        self.insert_detection_data_with_location(username, camera_id_str, camera_name, count, male_count, female_count, fire_status, frame, workspace_id, None)
 
     async def start_stream_in_workspace(self, stream_id_to_start_str: str, requester_user_id_str: str) -> Dict[str, Any]:
         stream_id_obj = UUID(stream_id_to_start_str)
@@ -1658,10 +1038,6 @@ class StreamManager:
                 """
                 potential_streams_db = await self.db_manager.execute_query(streams_to_run_query, fetch_all=True)
                 potential_streams_db = potential_streams_db or []
-
-                # # Pre-validate streams before processing
-                # valid_streams = await self.pre_validate_streams(potential_streams_db or [])
-                # potential_streams_db = valid_streams
 
                 async with self._lock: 
                     current_running_ids_mem = set(self.active_streams.keys())
@@ -1891,90 +1267,6 @@ class StreamManager:
         
         return await loop.run_in_executor(thread_pool, _check_source)
 
-    async def debug_all_streams(self) -> Dict[str, Any]:
-        """Get debug information for all streams"""
-        
-        # Get all streams from database
-        try:
-            db_streams = await self.db_manager.execute_query(
-                "SELECT stream_id, name, status, is_streaming FROM video_stream WHERE is_streaming = TRUE",
-                fetch_all=True
-            )
-            db_streams = db_streams or []
-        except Exception as e:
-            db_streams = []
-            logging.error(f"Failed to get streams from database: {e}")
-        
-        # Get memory streams
-        async with self._lock:
-            memory_stream_ids = list(self.active_streams.keys())
-        
-        # Get shared streams
-        shared_streams = {}
-        if hasattr(self, 'video_file_manager'):
-            shared_streams = self.video_file_manager.get_all_stats()
-        
-        all_stream_ids = set()
-        all_stream_ids.update(str(stream['stream_id']) for stream in db_streams)
-        all_stream_ids.update(memory_stream_ids)
-        
-        detailed_status = {}
-        for stream_id_str in all_stream_ids:
-            try:
-                detailed_status[stream_id_str] = await self.get_detailed_stream_status(stream_id_str)
-            except Exception as e:
-                detailed_status[stream_id_str] = {"error": f"Failed to get status: {e}"}
-        
-        return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "total_db_streams": len(db_streams),
-            "total_memory_streams": len(memory_stream_ids),
-            "total_shared_streams": len(shared_streams),
-            "db_stream_ids": [str(s['stream_id']) for s in db_streams],
-            "memory_stream_ids": memory_stream_ids,
-            "shared_stream_sources": list(shared_streams.keys()),
-            "detailed_status": detailed_status,
-            "shared_streams_detail": shared_streams
-        }
-
-    async def log_stream_manager_state(self):
-        """Log current state of stream manager for debugging"""
-        try:
-            debug_info = await self.debug_all_streams()
-            
-            logging.info("=== STREAM MANAGER STATE DEBUG ===")
-            logging.info(f"Database streams: {debug_info['total_db_streams']}")
-            logging.info(f"Memory streams: {debug_info['total_memory_streams']}")
-            logging.info(f"Shared streams: {debug_info['total_shared_streams']}")
-            
-            if debug_info['total_memory_streams'] > 0:
-                logging.info(f"Active memory stream IDs: {debug_info['memory_stream_ids']}")
-            
-            # Log any discrepancies
-            db_ids = set(debug_info['db_stream_ids'])
-            memory_ids = set(debug_info['memory_stream_ids'])
-            
-            only_in_db = db_ids - memory_ids
-            only_in_memory = memory_ids - db_ids
-            
-            if only_in_db:
-                logging.warning(f"Streams in DB but not in memory: {only_in_db}")
-            
-            if only_in_memory:
-                logging.warning(f"Streams in memory but not in DB: {only_in_memory}")
-            
-            # Log problematic streams
-            for stream_id, status in debug_info['detailed_status'].items():
-                if 'error' in status:
-                    logging.error(f"Stream {stream_id} has errors: {status}")
-                elif status.get('memory_status', {}).get('status') in ['starting', 'active_pending']:
-                    logging.warning(f"Stream {stream_id} stuck in {status.get('memory_status', {}).get('status')} state")
-            
-            logging.info("=== END STREAM MANAGER STATE DEBUG ===")
-            
-        except Exception as e:
-            logging.error(f"Error logging stream manager state: {e}", exc_info=True)
-
     async def start_stream_background_with_sharing(self, stream_id: UUID, owner_id: UUID, owner_username: str, 
                                     camera_name: str, source: str, workspace_id: UUID, 
                                     location_info: Optional[Dict[str, Any]] = None):
@@ -2008,6 +1300,9 @@ class StreamManager:
 
         try:
             logging.info(f"Updating database status to 'processing' for stream {stream_id_str}")
+
+            await self.load_fire_state_on_stream_start(stream_id)
+
             await self.db_manager.execute_query(
                 "UPDATE video_stream SET status = 'processing', last_activity = NOW(), updated_at = NOW() WHERE stream_id = $1", 
                 (stream_id,)
@@ -2070,18 +1365,287 @@ class StreamManager:
                 str(owner_id), str(workspace_id), stream_id_str, 
                 camera_name, "error", f"Failed to start stream: {str(e)[:100]}"
             )
+                
+    async def _cleanup_stream_state(self, stream_id_str: str, mark_db_inactive: bool = True):
+        """Comprehensive cleanup of stream state"""
+        async with self._lock:
+            stream_info = self.active_streams.pop(stream_id_str, None)
+        
+        if stream_info:
+            # Stop any running tasks
+            task = stream_info.get('task')
+            if task and not task.done():
+                task.cancel()
+            
+            # Clean up shared stream subscription
+            if 'source' in stream_info and hasattr(self, 'video_file_manager'):
+                shared_stream = self.video_file_manager.shared_streams.get(stream_info['source'])
+                if shared_stream:
+                    shared_stream.remove_subscriber(stream_id_str)
+        
+        # Clean up processing stats
+        self.stream_processing_stats.pop(stream_id_str, None)
+        
+        # Update database if requested
+        if mark_db_inactive:
+            await self.db_manager.execute_query(
+                "UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', updated_at = NOW() WHERE stream_id = $1",
+                (UUID(stream_id_str),)
+            )
+
+    def detect_objects_with_threshold(self, frame: np.ndarray, conf_threshold: float = 0.4, 
+                                    threshold_settings: Dict[str, Any] = None,
+                                    stream_id_str: str = None) -> tuple[np.ndarray, int, bool, int, int, str]:
+        """FIXED: Object detection with stream-specific fire detection tracking"""
+        if frame is None or frame.size == 0: 
+            return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
+
+        # CRITICAL FIX: Use stream-specific frame counting
+        if stream_id_str:
+            frame_count = self.fire_detection_frame_counts.get(stream_id_str, 0) + 1
+            self.fire_detection_frame_counts[stream_id_str] = frame_count
+        else:
+            # Fallback to global counter (shouldn't happen)
+            frame_count = getattr(self, '_frame_count', 0) + 1
+            setattr(self, '_frame_count', frame_count)
+        
+        # Cache previous results (stream-specific)
+        cache_key = f"cache_{stream_id_str}" if stream_id_str else "cache_global"
+        if not hasattr(self, '_cached_results'):
+            self._cached_results = {}
+        
+        if cache_key not in self._cached_results:
+            self._cached_results[cache_key] = {
+                'male_count': 0,
+                'female_count': 0,
+                'fire_status': 'no detection',
+                'last_gender_frame': 0,
+                'last_fire_frame': 0
+            }
+
+        cache = self._cached_results[cache_key]
+
+        # Resize frame if too large
+        max_dim = config.get("yolo_max_input_dim", 640)
+        h, w = frame.shape[:2]
+        scale = 1.0
+        if h > max_dim or w > max_dim:
+            scale = max_dim / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            new_w = max(2, new_w - (new_w % 2))
+            new_h = max(2, new_h - (new_h % 2))
+            input_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            input_frame = frame
+
+        try:
+            # People detection
+            people_results = self.people_model.predict(source=input_frame, conf=conf_threshold, classes=[0], verbose=False)
+
+            person_count = 0
+            if people_results and people_results[0].boxes is not None:
+                person_count = len(people_results[0].boxes)
+
+            # Gender detection (every 3rd frame when people detected)
+            if person_count > 0 and frame_count % 3 == 0:
+                try:
+                    gender_results = self.gender_model(source=input_frame, conf=0.3, verbose=False)
+                    if gender_results and gender_results[0].boxes is not None:
+                        male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
+                        female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
+                        cache['male_count'] = male_count
+                        cache['female_count'] = female_count
+                        cache['last_gender_frame'] = frame_count
+                except Exception as e:
+                    logging.error(f"Gender detection error for stream {stream_id_str}: {e}")
+                    # Keep previous cached values
+
+            # CRITICAL FIX: Fire detection with proper state management
+            if frame_count % 10 == 0:  # Run fire detection every 10th frame
+                try:
+                    fire_results = self.fire_model(source=input_frame, conf=0.3, verbose=False)
+                    
+                    # Determine current fire status
+                    current_fire_status = "no detection"
+                    if fire_results and fire_results[0].boxes is not None:
+                        classes = [int(box.cls) for box in fire_results[0].boxes]
+                        if 0 in classes:
+                            current_fire_status = "fire"
+                        elif 1 in classes:
+                            current_fire_status = "smoke"
+
+                    # Get previous fire detection state for this stream
+                    previous_fire_status = cache['fire_status']
+                    
+                    # IMPORTANT: Update cache immediately when detection runs
+                    cache['fire_status'] = current_fire_status
+                    cache['last_fire_frame'] = frame_count
+                    
+                    # Only log significant changes and consider cooldown status
+                    if current_fire_status != previous_fire_status:
+                        # Check if we're in cooldown to determine log level
+                        current_time = time.time()
+                        last_notification_time = self.fire_notification_cooldowns.get(stream_id_str, 0)
+                        in_cooldown = (current_time - last_notification_time) < self.fire_cooldown_duration
+                        
+                        if current_fire_status in ["fire", "smoke"]:
+                            if previous_fire_status == "no detection":
+                                # New fire detection - always log as warning
+                                logging.warning(f"🔥 NEW FIRE DETECTION: {current_fire_status.upper()} detected in {stream_id_str} at frame {frame_count}")
+                            elif in_cooldown:
+                                # State change during cooldown - log as info to reduce noise
+                                logging.info(f"🔥 Fire state change during cooldown: {stream_id_str} changed from '{previous_fire_status}' to '{current_fire_status}' at frame {frame_count}")
+                            else:
+                                # State change outside cooldown - log as warning
+                                logging.warning(f"🔥 Fire state change: {stream_id_str} changed from '{previous_fire_status}' to '{current_fire_status}' at frame {frame_count}")
+                        else:
+                            # Fire cleared
+                            if previous_fire_status in ["fire", "smoke"]:
+                                logging.warning(f"🌊 FIRE CLEARED: {stream_id_str} changed from '{previous_fire_status}' to 'no detection' at frame {frame_count}")
+                    
+                    # Debug logging for fire detection results (optional, can be removed in production)
+                    if current_fire_status != "no detection" and frame_count % 100 == 0:  # Every 100 frames when fire detected
+                        logging.debug(f"Fire detection status for {stream_id_str}: {current_fire_status} (frame {frame_count})")
+                    
+                    
+                except Exception as e:
+                    logging.error(f"Fire detection error for stream {stream_id_str}: {e}")
+                    # Don't update cache if detection failed, use previous value
+
+            # Use cached results
+            male_count = cache['male_count']
+            female_count = cache['female_count']
+            fire_status = cache['fire_status']
+
+            # Threshold checking for people
+            alert_triggered = False
+            if threshold_settings and threshold_settings.get("alert_enabled", False):
+                greater_than = threshold_settings.get("greater_than")
+                less_than = threshold_settings.get("less_than")
+
+                # logging.info(f"THRESHOLD CHECK for {stream_id_str}: "
+                #     f"person_count={person_count}, "
+                #     f"greater_than={greater_than}, "
+                #     f"less_than={less_than}, "
+                #     f"alert_enabled={threshold_settings.get('alert_enabled')}")
+                
+                if greater_than is not None and person_count > greater_than:
+                    alert_triggered = True
+                    # logging.warning(f"THRESHOLD EXCEEDED: {person_count} > {greater_than} for {stream_id_str}")
+                if less_than is not None and person_count < less_than:
+                    alert_triggered = True
+                    # logging.warning(f"THRESHOLD BELOW: {person_count} < {less_than} for {stream_id_str}")
+
+            # Annotate frame
+            annotated_frame = people_results[0].plot(img=input_frame.copy()) if people_results and people_results[0].boxes is not None else input_frame.copy()
+            
+            # Add person count text
+            count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)
+            count_text = f"People: {person_count} | M: {male_count} | F: {female_count}"
+            cv2.putText(annotated_frame, count_text, (10, 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, count_color, 2, cv2.LINE_AA)
+            
+            # FIRE/SMOKE overlay
+            if fire_status != "no detection":
+                fire_color = (0, 0, 255)  # Red for fire/smoke
+                fire_text = f"ALERT: {fire_status.upper()}"
+                cv2.putText(annotated_frame, fire_text, 
+                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.7, fire_color, 2, cv2.LINE_AA)
+                
+                # Add blinking effect for fire/smoke
+                if frame_count % 20 < 10:  # Blink every 20 frames
+                    red_overlay = annotated_frame.copy()
+                    red_overlay[:] = (0, 0, 255)
+                    annotated_frame = cv2.addWeighted(annotated_frame, 0.9, red_overlay, 0.1, 0)
+
+            # Alert styling for people threshold
+            if alert_triggered:
+                red_overlay = annotated_frame.copy()
+                red_overlay[:] = (0, 0, 255)
+                annotated_frame = cv2.addWeighted(annotated_frame, 0.85, red_overlay, 0.15, 0)
+                
+            # Scale back if needed
+            if scale != 1.0:
+                annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
+                
+            return annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status
+            
+        except Exception as e:
+            logger.error(f"Object detection error for stream {stream_id_str}: {e}", exc_info=True)
+            return frame.copy(), 0, False, 0, 0, "no detection"
+
+    async def send_fire_alert_as_array(self, user_id: str, workspace_id: str, stream_id: str, camera_name: str, message: str):
+        """Send fire alert in array format that triggers frontend popup"""
+        
+        now_dt = datetime.now(timezone.utc)
+        notif_id = uuid4()
+        
+        # Save to database first
+        try: 
+            await self.db_manager.execute_query(
+                """INSERT INTO notifications 
+                (notification_id, user_id, workspace_id, stream_id, camera_name, status, message, timestamp, is_read, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
+                (notif_id, UUID(user_id), UUID(workspace_id), UUID(stream_id),
+                camera_name, "fire_alert", message, now_dt, False, now_dt, now_dt)
+            )
+        except Exception as e_db:
+            logging.error(f"Failed to persist fire notification to DB: {e_db}")
+        
+        # Get WebSocket subscribers
+        subscribers_for_user_copy: List[WebSocket] = []
+        async with self._notification_lock:
+            subscribers_for_user_copy = list(self.notification_subscribers.get(user_id, set()))
+
+        if not subscribers_for_user_copy:
+            logging.warning(f"No WebSocket subscribers for user {user_id} to receive fire alert")
+            return
+        
+        # Create array format that triggers your frontend popup
+        # Your frontend checks: if (Array.isArray(data)) and data[0].message.includes("fire")
+        fire_alert_array = [{
+            "id": str(notif_id),
+            "message": message,  # Contains "fire" keyword
+            "timestamp": now_dt.timestamp(),
+            "camera_name": camera_name,
+            "read": False
+        }]
+        
+        logging.info(f"Sending fire alert array to {len(subscribers_for_user_copy)} subscribers: {fire_alert_array}")
+        
+        # Send to all connected WebSockets
+        success_count = 0
+        for ws in subscribers_for_user_copy:
+            if ws.client_state == WebSocketState.CONNECTED:
+                try:
+                    await ws.send_json(fire_alert_array)  # Send as array
+                    success_count += 1
+                    logging.info(f"Fire alert sent successfully to WebSocket for user {user_id}")
+                except Exception as e:
+                    logging.warning(f"Failed to send fire alert to WebSocket: {e}")
+                    asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws))
+            else:
+                asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws))
+        
+        logging.info(f"Fire alert sent to {success_count}/{len(subscribers_for_user_copy)} WebSocket connections")
+        return True
 
     async def _process_stream_with_sharing(self, stream_id: UUID, camera_name: str, source: str, 
-                                                owner_username: str, owner_id: UUID, workspace_id: UUID, 
-                                                stop_event: threading.Event,
-                                                location_info: Optional[Dict[str, Any]] = None):
-        """Enhanced stream processing with better error handling and detailed logging"""
+                                        owner_username: str, owner_id: UUID, workspace_id: UUID, 
+                                        stop_event: threading.Event,
+                                        location_info: Optional[Dict[str, Any]] = None):
+        """Fixed stream processing with proper frame acquisition and fire notification logic"""
         
         frame_count = 0
         last_db_update_activity = datetime.now(timezone.utc)
         stream_id_str = str(stream_id)
         loop = asyncio.get_event_loop()
         shared_stream = None
+        
+        # Initialize fire detection state for this stream
+        self.fire_detection_states[stream_id_str] = "no detection"
+        self.fire_detection_frame_counts[stream_id_str] = 0
         
         logging.info(f"Starting _process_stream_with_sharing for {stream_id_str} ({camera_name}) with source: {source}")
         
@@ -2129,7 +1693,7 @@ class StreamManager:
             
             logging.info(f"Successfully subscribed to shared stream. Current subscribers: {len(shared_stream.subscribers)}")
 
-            # Wait for shared stream to initialize with detailed logging
+            # Wait for shared stream to initialize
             initialization_timeout = 30.0
             wait_start = time.time()
             
@@ -2140,14 +1704,11 @@ class StreamManager:
                 is_running = shared_stream.is_running
                 last_successful_read = getattr(shared_stream, 'last_successful_read', 0)
                 
-                logging.debug(f"Initialization check for {stream_id_str}: elapsed={elapsed:.1f}s, is_running={is_running}, last_successful_read={last_successful_read}")
-                
                 if is_running and last_successful_read > 0:
                     logging.info(f"Shared stream initialized successfully for {stream_id_str} after {elapsed:.1f}s")
                     break
                     
-                # Log more details about shared stream state
-                if elapsed > 10 and elapsed % 5 < 0.5:  # Log every 5 seconds after first 10
+                if elapsed > 10 and elapsed % 5 < 0.5:
                     stats = shared_stream.get_stats()
                     logging.warning(f"Still waiting for initialization of {source}: {stats}")
                 
@@ -2183,23 +1744,11 @@ class StreamManager:
             last_frame_received = time.time()
             frame_timeout = 30.0
             
-            # Log first few iterations for debugging
-            debug_iteration_count = 0
-            
             while not stop_event.is_set():
                 try:
-                    debug_iteration_count += 1
-                    
-                    # Enhanced logging for first few iterations
-                    if debug_iteration_count <= 10:
-                        logging.info(f"Processing iteration {debug_iteration_count} for stream {stream_id_str}")
-                    elif debug_iteration_count == 11:
-                        logging.info(f"Stream {stream_id_str} processing normally, reducing debug logs...")
-                    
                     # Check for frame timeout
                     if (time.time() - last_frame_received) > frame_timeout:
                         logging.warning(f"Frame timeout for stream {stream_id_str} - no frames for {frame_timeout}s")
-                        # Try to restart shared stream
                         if hasattr(self, 'video_file_manager'):
                             await self.force_restart_shared_stream(source)
                         await asyncio.sleep(5.0)
@@ -2210,9 +1759,6 @@ class StreamManager:
                     frame = await loop.run_in_executor(None, shared_stream.get_latest_frame, stream_id_str)
                     
                     if frame is None:
-                        if debug_iteration_count <= 10:
-                            logging.debug(f"No frame available for {stream_id_str}, waiting...")
-                        
                         # Wait for frame to be available
                         frame_available = await loop.run_in_executor(
                             None, shared_stream.wait_for_frame, 2.0
@@ -2223,7 +1769,6 @@ class StreamManager:
                             if consecutive_frame_failures >= max_consecutive_failures:
                                 raise RuntimeError(f"No frames received from shared stream for {source} after {max_consecutive_failures} attempts")
                             
-                            # Check if shared stream is still healthy
                             if not shared_stream.is_running:
                                 logging.warning(f"Shared stream not running for {source}, attempting restart")
                                 await asyncio.sleep(2.0)
@@ -2242,9 +1787,6 @@ class StreamManager:
                     last_frame_received = time.time()
                     frame_count += 1
                     
-                    if debug_iteration_count <= 5:
-                        logging.info(f"Frame {frame_count} received for stream {stream_id_str}, shape: {frame.shape}")
-                    
                     # Validate frame
                     if frame.size == 0 or len(frame.shape) != 3:
                         logging.warning(f"Invalid frame received for stream {stream_id_str}")
@@ -2259,12 +1801,9 @@ class StreamManager:
                     processing_start_time = datetime.now(timezone.utc)
                     
                     processed_frame, person_count, alert_triggered, male_count, female_count, fire_status = await loop.run_in_executor(
-                        thread_pool, self.detect_objects_with_threshold, frame, conf_threshold, threshold_settings
+                        thread_pool, self.detect_objects_with_threshold, frame, conf_threshold, threshold_settings, stream_id_str
                     )
                     detection_duration = (datetime.now(timezone.utc) - processing_start_time).total_seconds()
-                    
-                    if debug_iteration_count <= 5 or person_count > 0:
-                        logging.info(f"Detection result for {stream_id_str}: people={person_count}, alert={alert_triggered}, duration={detection_duration:.3f}s")
 
                     # Update processing stats
                     async with self._lock: 
@@ -2282,43 +1821,181 @@ class StreamManager:
                             stream_info_active['latest_frame'] = processed_frame
                             stream_info_active['last_frame_time'] = datetime.now(timezone.utc)
                     
-                    # Send notifications for alerts
+                                        # Send notifications for people threshold alerts with cooldown and email
                     if alert_triggered:
-                        alert_message = self.generate_alert_message(person_count, threshold_settings)
-                        await self.add_notification(
-                            str(owner_id), str(workspace_id), stream_id_str, 
-                            camera_name, "alert", alert_message
-                        )
-                        logging.info(f"Alert notification sent for stream {stream_id_str}: {alert_message}")
-
-                    # if fire_status in ["fire", "smoke"]:
-                    #     await self.add_notification(
-                    #         str(owner_id), str(workspace_id), stream_id_str, 
-                    #         camera_name, "alert", f"Fire/smoke detected: {fire_status}"
-                    #     )
-                    #     logging.info(f"Fire/smoke notification sent for stream {stream_id_str}: {fire_status}")
-
-                    # UPDATED: Fire/smoke notification with cooldown
-                    if fire_status in ["fire", "smoke"]:
                         current_time = time.time()
-                        last_fire_notification_time = self.fire_notification_cooldowns.get(stream_id_str, 0)
                         
-                        # Check if cooldown period has passed
-                        if (current_time - last_fire_notification_time) >= self.fire_cooldown_duration:
-                            await self.add_notification(
-                                str(owner_id), str(workspace_id), stream_id_str, 
-                                camera_name, "alert", self.generate_fire_alert_message(fire_status, stream_id_str)#f"Fire/smoke detected: {fire_status}"
-                            )
-                            
-                            # Update the last notification time
-                            self.fire_notification_cooldowns[stream_id_str] = current_time
-                            
-                            logging.info(f"Fire/smoke notification sent for stream {stream_id_str}: {fire_status}")
+                        # Check cooldown for people count notifications
+                        last_people_notification = self.people_count_notification_cooldowns.get(stream_id_str, 0)
+                        time_since_last_people_alert = current_time - last_people_notification
+                        people_cooldown_active = time_since_last_people_alert < self.people_count_cooldown_duration
+                        
+                        if not people_cooldown_active:
+                            try:
+                                alert_message = self.generate_alert_message(person_count, threshold_settings)
+                                
+                                logging.warning(f"SENDING PEOPLE COUNT NOTIFICATION: {alert_message} for stream {stream_id_str}")
+                                
+                                # Send notification
+                                await self.add_notification(
+                                    str(owner_id), str(workspace_id), stream_id_str, 
+                                    camera_name, "alert", alert_message
+                                )
+                                
+                                # Send email
+                                user_email = await self.get_user_email_for_stream(owner_id)
+                                if user_email:
+                                    await send_people_count_alert_email(
+                                        user_email, camera_name, person_count, threshold_settings, location_info
+                                    )
+                                
+                                # Update cooldown timestamp
+                                self.people_count_notification_cooldowns[stream_id_str] = current_time
+                                
+                                next_available = datetime.fromtimestamp(current_time + self.people_count_cooldown_duration)
+                                logging.warning(f"PEOPLE COUNT NOTIFICATION SENT for {stream_id_str}. "
+                                            f"Next available: {next_available}")
+                                
+                            except Exception as e:
+                                logging.error(f"Error sending people count notification for {stream_id_str}: {e}")
                         else:
-                            # Calculate remaining cooldown time
-                            remaining_cooldown = self.fire_cooldown_duration - (current_time - last_fire_notification_time)
-                            logging.debug(f"Fire/smoke detected in stream {stream_id_str} but still in cooldown. "
-                                        f"Remaining: {remaining_cooldown:.1f} seconds")
+                            remaining = self.people_count_cooldown_duration - time_since_last_people_alert
+                            logging.debug(f"People count notification BLOCKED for {stream_id_str}: "
+                                        f"cooldown active, {remaining/60:.1f} minutes remaining")
+                        
+                    # Fire notification with proper state management and cooldown
+                    current_time = time.time()
+                    
+                    # Get previous fire detection state for this stream
+                    previous_fire_status = self.fire_detection_states.get(stream_id_str, "no detection")
+                                        
+
+                    if fire_status in ["fire", "smoke"]:
+                        # CRITICAL: Get PERSISTENT fire state from database (source of truth)
+                        persistent_state = await self.get_persistent_fire_state(stream_id)
+                        db_fire_status = persistent_state['fire_status']
+                        db_last_notification = persistent_state['last_notification_time']
+                        
+                        # Check current cooldown status
+                        current_time = datetime.now(timezone.utc)
+                        cooldown_active = False
+                        time_since_last_notification = float('inf')
+                        
+                        if db_last_notification:
+                            time_since_last_notification = (current_time - db_last_notification).total_seconds()
+                            cooldown_active = time_since_last_notification < self.fire_cooldown_duration
+                        
+                        # DECISION: Only consider it "NEW" if database shows no recent fire AND no cooldown
+                        is_truly_new_fire = (db_fire_status == "no detection" and not cooldown_active)
+                        
+                        # # logging for debugging
+                        # logging.info(f"FIRE DETECTION CHECK for {stream_id_str}: "
+                        #             f"current={fire_status}, db_status={db_fire_status}, "
+                        #             f"cooldown_active={cooldown_active}, "
+                        #             f"time_since_last={time_since_last_notification:.1f}s, "
+                        #             f"is_new={is_truly_new_fire}")
+                        
+                        # Log state changes appropriately
+                        if is_truly_new_fire:
+                            logging.warning(f"🔥 NEW FIRE DETECTION: {fire_status.upper()} detected in {stream_id_str} at frame {frame_count}")
+                        elif cooldown_active:
+                            remaining = self.fire_cooldown_duration - time_since_last_notification
+                            logging.info(f"🔥 Fire detected during cooldown: {stream_id_str} status='{fire_status}' at frame {frame_count}. Cooldown: {remaining/60:.1f}min remaining")
+                        
+                        # DECISION: Send notification ONLY if truly new AND no cooldown
+                        should_send_notification = is_truly_new_fire
+                        
+                        if should_send_notification:
+                            try:
+                                # Create alert message
+                                alert_message = f"🔥 FIRE/SMOKE ALERT: {fire_status.upper()} detected in {camera_name}"
+                                
+                                logging.warning(f"SENDING FIRE NOTIFICATION: {alert_message} for stream {stream_id_str}")
+
+                                await self.send_fire_alert_as_array(str(owner_id), str(workspace_id), stream_id_str, camera_name, alert_message)
+                                
+                                # fire_notification = {
+                                #     "id": str(uuid4()),
+                                #     "user_id": str(owner_id),
+                                #     "workspace_id": str(workspace_id),
+                                #     "stream_id": stream_id_str,
+                                #     "camera_name": camera_name,
+                                #     "status": "fire_alert",
+                                #     "message": alert_message,
+                                #     "timestamp": current_time,
+                                #     "read": False
+                                # }
+                                
+                                # # Send the notification using the special fire alert method
+                                # await self.send_fire_alert_to_frontend(str(owner_id), fire_notification, location_info)
+                                
+                                # # Send notification
+                                # await self.add_notification(
+                                #     str(owner_id), str(workspace_id), stream_id_str,
+                                #     camera_name, "fire_alert", alert_message
+                                # )
+
+                                # await self.send_immediate_fire_alert(
+                                #     str(workspace_id), {
+                                #         "type": "fire_emergency",
+                                #         "alert_type": "fire_alert", 
+                                #         "message": alert_message,
+                                #         "camera_name": camera_name,
+                                #         "fire_status": fire_status,
+                                #         "stream_id": stream_id_str,
+                                #         "location_info": location_info,
+                                #         "timestamp": datetime.now(timezone.utc).timestamp(),
+                                #         "severity": "high"
+                                #     }
+                                # )
+                                
+                                # Send email
+                                user_email = await self.get_user_email_for_stream(owner_id)
+                                if user_email:
+                                    await send_fire_alert_email(user_email, camera_name, fire_status, location_info)
+                                
+                                # CRITICAL: Update database state with notification time
+                                await self.update_persistent_fire_state(
+                                    stream_id, fire_status, current_time, current_time
+                                )
+                                
+                                # Also update in-memory cooldown for immediate checks
+                                self.fire_notification_cooldowns[stream_id_str] = current_time.timestamp()
+                                
+                                next_available = current_time + timedelta(seconds=self.fire_cooldown_duration)
+                                logging.warning(f"🔥 FIRE NOTIFICATION SENT for {stream_id_str}. "
+                                            f"Next available: {next_available}")
+                                
+                            except Exception as e:
+                                logging.error(f"Error sending fire notification for {stream_id_str}: {e}")
+                        else:
+                            # Update detection state in database without notification
+                            await self.update_persistent_fire_state(stream_id, fire_status, current_time)
+                            
+                            if cooldown_active:
+                                remaining = self.fire_cooldown_duration - time_since_last_notification
+                                logging.debug(f"Fire notification BLOCKED for {stream_id_str}: "
+                                            f"cooldown active, {remaining/60:.1f} minutes remaining")
+
+                    else:
+                        # Fire cleared - update database state
+                        persistent_state = await self.get_persistent_fire_state(stream_id)
+                        if persistent_state['fire_status'] in ["fire", "smoke"]:
+                            logging.info(f"🌊 FIRE CLEARED: {stream_id_str} changed to 'no detection' at frame {frame_count}")
+                            
+                            # Send "cleared" notification but preserve cooldown
+                            await self.add_notification(
+                                str(owner_id), str(workspace_id), stream_id_str,
+                                camera_name, "info", f"Fire/smoke cleared in {camera_name}"
+                            )
+                        
+                        # Update state to 'no detection' but preserve notification cooldown in database
+                        await self.update_persistent_fire_state(stream_id, "no detection")
+
+
+                    # Always update in-memory fire state (for immediate reference)
+                    self.fire_detection_states[stream_id_str] = fire_status
+
 
                     # Insert detection data if people detected
                     if person_count > 0:
@@ -2328,18 +2005,12 @@ class StreamManager:
                             male_count, female_count, fire_status, processed_frame, 
                             workspace_id, location_info
                         )
-                        
-                        if debug_iteration_count <= 5:
-                            logging.info(f"Detection data inserted for stream {stream_id_str}")
 
                     # Periodic database activity update
                     now_utc_loop = datetime.now(timezone.utc)
-                    if (now_utc_loop - last_db_update_activity).total_seconds() > config.get("stream_db_activity_update_interval_seconds", 10.0):
+                    if (now_utc_loop - last_db_update_activity).total_seconds() > 10.0:
                         await self.db_manager.execute_query("UPDATE video_stream SET last_activity = NOW() WHERE stream_id = $1", (stream_id,))
                         last_db_update_activity = now_utc_loop
-                        
-                        if debug_iteration_count <= 10:
-                            logging.debug(f"Database activity updated for stream {stream_id_str}")
                     
                     # Frame rate control
                     current_iteration_duration = (datetime.now(timezone.utc) - processing_start_time).total_seconds()
@@ -2348,14 +2019,14 @@ class StreamManager:
                     
                 except Exception as e_loop:
                     consecutive_frame_failures += 1
-                    logging.error(f"Error in processing loop for stream {stream_id_str} (iteration {debug_iteration_count}): {e_loop}", exc_info=True)
+                    logging.error(f"Error in processing loop for stream {stream_id_str}: {e_loop}", exc_info=True)
                     
                     if consecutive_frame_failures >= max_consecutive_failures:
                         raise RuntimeError(f"Too many consecutive failures in processing loop: {e_loop}")
                     
                     await asyncio.sleep(2.0)
             
-            logging.info(f"Processing loop ended normally for stream {stream_id_str} (stop_event set)")
+            logging.info(f"Processing loop ended normally for stream {stream_id_str}")
                 
         except asyncio.CancelledError:
             logging.info(f"Stream processing task for {stream_id_str} ({camera_name}) was cancelled.")
@@ -2370,7 +2041,7 @@ class StreamManager:
                 camera_name, "error", f"Stream error: {str(e)[:100]}"
             )
         except Exception as e:
-            logging.error(f"General error in enhanced _process_stream_with_sharing for {stream_id_str}: {e}", exc_info=True)
+            logging.error(f"General error in _process_stream_with_sharing for {stream_id_str}: {e}", exc_info=True)
             await self.db_manager.execute_query(
                 "UPDATE video_stream SET status = 'error', is_streaming = FALSE, last_activity = NOW(), updated_at = NOW() WHERE stream_id = $1", 
                 (stream_id,)
@@ -2385,7 +2056,14 @@ class StreamManager:
                 shared_stream.remove_subscriber(stream_id_str)
                 logging.info(f"Stream {stream_id_str} unsubscribed from shared stream for {source}")
             
-            # Cleanup
+            # Cleanup fire detection state
+            # self.fire_detection_states.pop(stream_id_str, None)
+            # self.fire_notification_cooldowns.pop(stream_id_str, None)
+            # Only clean up in-memory state
+            # self.fire_detection_states.pop(stream_id_str, None)
+            self.fire_detection_frame_counts.pop(stream_id_str, None)
+            self.people_count_notification_cooldowns.pop(stream_id_str, None)
+            
             logging.info(f"Stream processing ended for {stream_id_str} ({camera_name})")
             
             async with self._lock: 
@@ -2404,729 +2082,18 @@ class StreamManager:
                         (stream_id,)
                     )
 
-    async def _cleanup_stream_state(self, stream_id_str: str, mark_db_inactive: bool = True):
-        """Comprehensive cleanup of stream state"""
-        async with self._lock:
-            stream_info = self.active_streams.pop(stream_id_str, None)
-        
-        if stream_info:
-            # Stop any running tasks
-            task = stream_info.get('task')
-            if task and not task.done():
-                task.cancel()
-            
-            # Clean up shared stream subscription
-            if 'source' in stream_info and hasattr(self, 'video_file_manager'):
-                shared_stream = self.video_file_manager.shared_streams.get(stream_info['source'])
-                if shared_stream:
-                    shared_stream.remove_subscriber(stream_id_str)
-        
-        # Clean up processing stats
-        self.stream_processing_stats.pop(stream_id_str, None)
-        
-        # Update database if requested
-        if mark_db_inactive:
-            await self.db_manager.execute_query(
-                "UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', updated_at = NOW() WHERE stream_id = $1",
-                (UUID(stream_id_str),)
+    async def get_user_email_for_stream(self, user_id: UUID) -> Optional[str]:
+        """Get user email from database"""
+        try:
+            user_data = await self.db_manager.execute_query(
+                "SELECT email FROM users WHERE user_id = $1 AND is_active = TRUE",
+                (user_id,), fetch_one=True
             )
-
-    async def _validate_and_fix_stream_states(self):
-        """Detect and fix inconsistent stream states"""
-        async with self._lock:
-            memory_streams = dict(self.active_streams)
-        
-        for stream_id_str, stream_info in memory_streams.items():
-            status = stream_info.get('status')
-            task = stream_info.get('task')
-            
-            # Check for zombie streams (stuck in starting state)
-            if status == 'starting':
-                start_time = stream_info.get('start_time')
-                if start_time and (datetime.now(timezone.utc) - start_time).total_seconds() > 60:
-                    logging.warning(f"Stream {stream_id_str} stuck in 'starting' state for >60s, cleaning up")
-                    await self._cleanup_stream_state(stream_id_str, mark_db_inactive=True)
-                    continue
-            
-            # Check for streams with failed tasks
-            if task and task.done() and task.exception():
-                logging.warning(f"Stream {stream_id_str} has failed task, cleaning up")
-                await self._cleanup_stream_state(stream_id_str, mark_db_inactive=True)
-                continue
-
-    async def get_detailed_stream_status(self, stream_id_str: str) -> Dict[str, Any]:
-        """Get detailed status information for debugging stream issues"""
-        
-        def serialize_value(value):
-            """Helper function to serialize various Python types to JSON-serializable formats"""
-            if value is None:
-                return None
-            elif isinstance(value, (str, int, float, bool)):
-                return value
-            elif isinstance(value, datetime):
-                return {
-                    "type": "datetime",
-                    "value": value.isoformat(),
-                    "timestamp": value.timestamp()
-                }
-            elif isinstance(value, UUID):
-                return {
-                    "type": "UUID", 
-                    "value": str(value)
-                }
-            elif isinstance(value, set):
-                return {
-                    "type": "set",
-                    "count": len(value),
-                    "items": [serialize_value(item) for item in list(value)[:5]]  # Show first 5 items
-                }
-            elif isinstance(value, np.ndarray):
-                return {
-                    "type": "numpy.ndarray",
-                    "shape": list(value.shape),
-                    "dtype": str(value.dtype),
-                    "size": value.size
-                }
-            elif isinstance(value, threading.Event):
-                return {
-                    "type": "threading.Event",
-                    "is_set": value.is_set()
-                }
-            elif isinstance(value, asyncio.Task):
-                return {
-                    "type": "asyncio.Task",
-                    "name": getattr(value, 'get_name', lambda: 'unknown')(),
-                    "done": value.done(),
-                    "cancelled": value.cancelled(),
-                    "exception": str(value.exception()) if value.done() and not value.cancelled() else None
-                }
-            elif isinstance(value, dict):
-                return {k: serialize_value(v) for k, v in value.items()}
-            elif isinstance(value, (list, tuple)):
-                return [serialize_value(item) for item in value]
-            else:
-                return {
-                    "type": str(type(value).__name__),
-                    "value": str(value)
-                }
-        
-        # Database status
-        try:
-            db_status = await self.db_manager.execute_query(
-                """SELECT stream_id, name, path, status, is_streaming, last_activity, 
-                        updated_at, created_at, location, area, building, zone, 
-                        floor_level, latitude, longitude
-                FROM video_stream WHERE stream_id = $1""",
-                (UUID(stream_id_str),), fetch_one=True
-            )
-            
-            if db_status:
-                db_status_serialized = {k: serialize_value(v) for k, v in db_status.items()}
-            else:
-                db_status_serialized = {"error": "Stream not found in database"}
-                
+            return user_data['email'] if user_data else None
         except Exception as e:
-            db_status_serialized = {"error": f"Database query failed: {e}"}
-        
-        # Memory status
-        async with self._lock:
-            memory_status = self.active_streams.get(stream_id_str)
-            if memory_status:
-                memory_status_serialized = serialize_value(memory_status)
-            else:
-                memory_status_serialized = {"error": "Not found in memory"}
-        
-        # Processing stats
-        processing_stats = self.stream_processing_stats.get(stream_id_str)
-        if processing_stats:
-            processing_stats_serialized = serialize_value(processing_stats)
-        else:
-            processing_stats_serialized = {"error": "No processing stats available"}
-        
-        # Shared stream status (if using sharing)
-        shared_stream_status_serialized = None
-        if hasattr(self, 'video_file_manager') and db_status and 'path' in db_status:
-            try:
-                source_path = db_status['path']
-                if source_path in self.video_file_manager.shared_streams:
-                    shared_stream = self.video_file_manager.shared_streams[source_path]
-                    shared_stream_status = shared_stream.get_stats()
-                    shared_stream_status_serialized = serialize_value(shared_stream_status)
-                else:
-                    shared_stream_status_serialized = {"info": "No shared stream found for this source"}
-            except Exception as e:
-                shared_stream_status_serialized = {"error": f"Failed to get shared stream status: {e}"}
-        
-        return {
-            "stream_id": stream_id_str,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "database_status": db_status_serialized,
-            "memory_status": memory_status_serialized,
-            "processing_stats": processing_stats_serialized,
-            "shared_stream_status": shared_stream_status_serialized
-        }
+            logger.error(f"Error getting user email for user_id {user_id}: {e}", exc_info=True)
+            return None
 
-    async def validate_video_file(self, file_path: str) -> bool:
-        """Validate video file before processing"""
-        import os
-        loop = asyncio.get_event_loop()
-        
-        def _check_file():
-            try:
-                # Check file existence and permissions
-                if not os.path.exists(file_path):
-                    logging.error(f"Video file does not exist: {file_path}")
-                    return False
-                
-                if not os.access(file_path, os.R_OK):
-                    logging.error(f"Video file is not readable: {file_path}")
-                    return False
-                
-                file_size = os.path.getsize(file_path)
-                if file_size < 1024:  # Less than 1KB is suspicious
-                    logging.error(f"Video file too small or empty: {file_path} ({file_size} bytes)")
-                    return False
-                
-                # Test with OpenCV
-                test_cap = cv2.VideoCapture(file_path, cv2.CAP_FFMPEG)
-                if not test_cap.isOpened():
-                    # Try alternative backend
-                    test_cap = cv2.VideoCapture(file_path, cv2.CAP_ANY)
-                    if not test_cap.isOpened():
-                        logging.error(f"OpenCV cannot open video file: {file_path}")
-                        return False
-                
-                # Try to read first frame
-                ret, frame = test_cap.read()
-                total_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                fps = test_cap.get(cv2.CAP_PROP_FPS)
-                
-                test_cap.release()
-                
-                if not ret or frame is None:
-                    logging.error(f"Cannot read frames from video file: {file_path}")
-                    return False
-                
-                logging.info(f"Video file validated: {file_path} ({total_frames} frames, {fps:.2f} FPS, {file_size} bytes)")
-                return True
-                
-            except Exception as e:
-                logging.error(f"Error validating video file {file_path}: {e}", exc_info=True)
-                return False
-        
-        return await loop.run_in_executor(thread_pool, _check_file)
-
-    async def pre_validate_streams(self, potential_streams_db):
-        """Pre-validate streams before attempting to start them"""
-        valid_streams = []
-        
-        for stream_data in potential_streams_db:
-            source_path = stream_data['path']
-            stream_id = str(stream_data['stream_id'])
-            
-            # Skip validation for non-file sources (URLs, camera indices)
-            if (source_path.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) or 
-                source_path.isdigit()):
-                valid_streams.append(stream_data)
-                continue
-            
-            # Validate file sources
-            try:
-                is_valid = await self.validate_video_file(source_path)
-                if is_valid:
-                    valid_streams.append(stream_data)
-                    logging.info(f"Stream {stream_id} validation passed for {source_path}")
-                else:
-                    logging.error(f"Stream {stream_id} validation failed for {source_path}")
-                    # Mark stream as error in database
-                    await self.db_manager.execute_query(
-                        "UPDATE video_stream SET status = 'error', is_streaming = FALSE, updated_at = NOW() WHERE stream_id = $1",
-                        (stream_data['stream_id'],)
-                    )
-                    # Send notification
-                    await self.add_notification(
-                        str(stream_data['user_id']), 
-                        str(stream_data['workspace_id']), 
-                        stream_id, 
-                        stream_data['name'], 
-                        "error", 
-                        f"Video file validation failed: {source_path}"
-                    )
-            except Exception as e:
-                logging.error(f"Error validating stream {stream_id}: {e}")
-                valid_streams.append(stream_data)  # Allow to proceed and fail gracefully later
-        
-        return valid_streams
-
-    async def get_frame_with_validation(self, shared_stream, stream_id_str, timeout=5.0):
-        """Get frame from shared stream with validation and timeout"""
-        loop = asyncio.get_event_loop()
-        start_time = time.time()
-        
-        while (time.time() - start_time) < timeout:
-            try:
-                # Get frame from shared stream
-                frame = await loop.run_in_executor(None, shared_stream.get_latest_frame, stream_id_str)
-                
-                if frame is not None:
-                    # Validate frame
-                    if frame.size > 0 and len(frame.shape) == 3:
-                        return frame
-                    else:
-                        logging.warning(f"Invalid frame received for stream {stream_id_str}")
-                
-                # Wait for new frame
-                frame_available = await loop.run_in_executor(
-                    None, shared_stream.wait_for_frame, 1.0
-                )
-                
-                if not frame_available:
-                    await asyncio.sleep(0.1)
-                    continue
-                    
-            except Exception as e:
-                logging.error(f"Error getting frame for stream {stream_id_str}: {e}")
-                await asyncio.sleep(0.5)
-        
-        return None
-
-    async def diagnose_stream_issues(self, stream_id_str: str) -> Dict[str, Any]:
-        """Diagnose issues with a specific stream"""
-        try:
-            stream_uuid = UUID(stream_id_str)
-            
-            # Get stream info from database
-            stream_info = await self.db_manager.execute_query(
-                "SELECT * FROM video_stream WHERE stream_id = $1",
-                (stream_uuid,), fetch_one=True
-            )
-            
-            if not stream_info:
-                return {"error": "Stream not found in database"}
-            
-            source_path = stream_info['path']
-            diagnostics = {
-                "stream_id": stream_id_str,
-                "source": source_path,
-                "database_status": stream_info['status'],
-                "is_streaming": stream_info['is_streaming'],
-                "file_diagnostics": {},
-                "shared_stream_status": {},
-                "memory_status": {}
-            }
-            
-            # File diagnostics for local files
-            if not source_path.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and not source_path.isdigit():
-                import os
-                try:
-                    diagnostics["file_diagnostics"] = {
-                        "exists": os.path.exists(source_path),
-                        "readable": os.access(source_path, os.R_OK) if os.path.exists(source_path) else False,
-                        "size": os.path.getsize(source_path) if os.path.exists(source_path) else 0,
-                        "modified": os.path.getmtime(source_path) if os.path.exists(source_path) else None
-                    }
-                    
-                    # Test OpenCV access
-                    if diagnostics["file_diagnostics"]["exists"]:
-                        test_cap = cv2.VideoCapture(source_path)
-                        diagnostics["file_diagnostics"]["opencv_can_open"] = test_cap.isOpened()
-                        if test_cap.isOpened():
-                            ret, frame = test_cap.read()
-                            diagnostics["file_diagnostics"]["can_read_frame"] = ret and frame is not None
-                            diagnostics["file_diagnostics"]["total_frames"] = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                            diagnostics["file_diagnostics"]["fps"] = test_cap.get(cv2.CAP_PROP_FPS)
-                        test_cap.release()
-                        
-                except Exception as e:
-                    diagnostics["file_diagnostics"]["error"] = str(e)
-            
-            # Shared stream status
-            if hasattr(self, 'video_file_manager') and source_path in self.video_file_manager.shared_streams:
-                shared_stream = self.video_file_manager.shared_streams[source_path]
-                diagnostics["shared_stream_status"] = {
-                    "is_running": shared_stream.is_running,
-                    "subscriber_count": len(shared_stream.subscribers),
-                    "frame_count": shared_stream.frame_count,
-                    "last_frame_time": shared_stream.last_frame_time,
-                    "error_count": shared_stream.error_count,
-                    "reconnect_attempts": shared_stream.reconnect_attempts,
-                    "last_error": shared_stream.last_error
-                }
-            
-            # Memory status
-            async with self._lock:
-                if stream_id_str in self.active_streams:
-                    stream_mem_info = self.active_streams[stream_id_str]
-                    diagnostics["memory_status"] = {
-                        "in_active_streams": True,
-                        "status": stream_mem_info.get('status'),
-                        "client_count": len(stream_mem_info.get('clients', set())),
-                        "last_frame_time": stream_mem_info.get('last_frame_time'),
-                        "has_latest_frame": stream_mem_info.get('latest_frame') is not None
-                    }
-                else:
-                    diagnostics["memory_status"]["in_active_streams"] = False
-            
-            return diagnostics
-            
-        except Exception as e:
-            return {"error": f"Diagnostic failed: {str(e)}"}
-
-    # Option 1: Using concurrent.futures for parallel execution
-    def detect_objects_with_threshold_parallel(self, frame: np.ndarray, conf_threshold: float = 0.4, 
-                                                threshold_settings: Dict[str, Any] = None) -> tuple[np.ndarray, int, bool, int, int, str]:
-        """Enhanced object detection with all three models running in parallel using ThreadPoolExecutor."""
-        if frame is None or frame.size == 0: 
-            return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
-
-        # Prepare frame (same as before)
-        max_dim = config.get("yolo_max_input_dim", 640)
-        h, w = frame.shape[:2]
-        scale = 1.0
-        if h > max_dim or w > max_dim:
-            scale = max_dim / max(h, w)
-            new_w, new_h = int(w * scale), int(h * scale)
-            new_w = max(2, new_w - (new_w % 2))
-            new_h = max(2, new_h - (new_h % 2))
-            input_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            input_frame = frame
-
-        try:
-            # Define prediction functions
-            def predict_people():
-                return self.people_model.predict(source=input_frame, conf=conf_threshold, classes=[0], verbose=False)
-            
-            def predict_gender():
-                return self.gender_model(source=input_frame, conf=0.3, verbose=False)
-            
-            def predict_fire():
-                return self.fire_model(source=input_frame, conf=0.3, verbose=False)
-
-            # Run all three models in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                # Submit all tasks
-                people_future = executor.submit(predict_people)
-                gender_future = executor.submit(predict_gender)
-                fire_future = executor.submit(predict_fire)
-                
-                # Get results
-                people_results = people_future.result()
-                gender_results = gender_future.result()
-                fire_results = fire_future.result()
-
-            # Process people count
-            person_count = 0
-            if people_results and people_results[0].boxes is not None:
-                person_count = len(people_results[0].boxes)
-
-            # Process gender count
-            male_count = female_count = 0
-            if person_count > 0 and gender_results and gender_results[0].boxes is not None:
-                male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
-                female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
-
-            # Process fire detection
-            fire_status = "no detection"
-            if fire_results and fire_results[0].boxes is not None:
-                classes = [int(box.cls) for box in fire_results[0].boxes]
-                if 0 in classes:
-                    fire_status = "fire"
-                elif 1 in classes:
-                    fire_status = "smoke"
-
-            # Check thresholds
-            alert_triggered = False
-            if threshold_settings and threshold_settings.get("alert_enabled", False):
-                greater_than = threshold_settings.get("greater_than")
-                less_than = threshold_settings.get("less_than")
-                
-                if greater_than is not None and person_count > greater_than:
-                    alert_triggered = True
-                elif less_than is not None and person_count < less_than:
-                    alert_triggered = True
-
-            # Annotate frame (use people results as primary)
-            annotated_frame = people_results[0].plot(img=input_frame.copy()) if people_results and people_results[0].boxes is not None else input_frame.copy()
-            
-            # Add text overlays
-            count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)
-            count_text = f"People: {person_count} | M: {male_count} | F: {female_count}"
-            cv2.putText(annotated_frame, count_text, (10, 20), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, count_color, 2, cv2.LINE_AA)
-            
-            if fire_status != "no detection":
-                cv2.putText(annotated_frame, f"FIRE: {fire_status.upper()}", 
-                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 0, 255), 2, cv2.LINE_AA)
-
-            # Alert styling
-            if alert_triggered:
-                red_overlay = annotated_frame.copy()
-                red_overlay[:] = (0, 0, 255)
-                annotated_frame = cv2.addWeighted(annotated_frame, 0.85, red_overlay, 0.15, 0)
-                
-            # Scale back if needed
-            if scale != 1.0:
-                annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
-                
-            return annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status
-            
-        except Exception as e:
-            logger.error(f"Parallel object detection error: {e}", exc_info=True)
-            return frame.copy(), 0, False, 0, 0, "no detection"
-
-    # Option 2: Async version for use within async context
-    async def detect_objects_with_threshold_parallel_async(self, frame: np.ndarray, conf_threshold: float = 0.4, 
-                                                        threshold_settings: Dict[str, Any] = None) -> tuple[np.ndarray, int, bool, int, int, str]:
-        """Async version using asyncio for parallel execution."""
-        if frame is None or frame.size == 0: 
-            return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
-
-        # Prepare frame
-        max_dim = config.get("yolo_max_input_dim", 640)
-        h, w = frame.shape[:2]
-        scale = 1.0
-        if h > max_dim or w > max_dim:
-            scale = max_dim / max(h, w)
-            new_w, new_h = int(w * scale), int(h * scale)
-            new_w = max(2, new_w - (new_w % 2))
-            new_h = max(2, new_h - (new_h % 2))
-            input_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            input_frame = frame
-
-        try:
-            loop = asyncio.get_event_loop()
-            
-            # Define prediction functions
-            def predict_people():
-                return self.people_model.predict(source=input_frame, conf=conf_threshold, classes=[0], verbose=False)
-            
-            def predict_gender():
-                return self.gender_model(source=input_frame, conf=0.3, verbose=False)
-            
-            def predict_fire():
-                return self.fire_model(source=input_frame, conf=0.3, verbose=False)
-
-            # Run all three models in parallel using asyncio
-            people_task = loop.run_in_executor(thread_pool, predict_people)
-            gender_task = loop.run_in_executor(thread_pool, predict_gender)
-            fire_task = loop.run_in_executor(thread_pool, predict_fire)
-            
-            # Wait for all results
-            people_results, gender_results, fire_results = await asyncio.gather(
-                people_task, gender_task, fire_task, return_exceptions=True
-            )
-            
-            # Handle any exceptions
-            if isinstance(people_results, Exception):
-                logger.error(f"People detection failed: {people_results}")
-                people_results = None
-            if isinstance(gender_results, Exception):
-                logger.error(f"Gender detection failed: {gender_results}")
-                gender_results = None
-            if isinstance(fire_results, Exception):
-                logger.error(f"Fire detection failed: {fire_results}")
-                fire_results = None
-
-            # Process results (same as before)
-            person_count = 0
-            if people_results and people_results[0].boxes is not None:
-                person_count = len(people_results[0].boxes)
-
-            male_count = female_count = 0
-            if person_count > 0 and gender_results and gender_results[0].boxes is not None:
-                male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
-                female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
-
-            fire_status = "no detection"
-            if fire_results and fire_results[0].boxes is not None:
-                classes = [int(box.cls) for box in fire_results[0].boxes]
-                if 0 in classes:
-                    fire_status = "fire"
-                elif 1 in classes:
-                    fire_status = "smoke"
-
-            # Rest of processing (threshold checking, annotation) same as before...
-            alert_triggered = False
-            if threshold_settings and threshold_settings.get("alert_enabled", False):
-                greater_than = threshold_settings.get("greater_than")
-                less_than = threshold_settings.get("less_than")
-                
-                if greater_than is not None and person_count > greater_than:
-                    alert_triggered = True
-                elif less_than is not None and person_count < less_than:
-                    alert_triggered = True
-
-            annotated_frame = people_results[0].plot(img=input_frame.copy()) if people_results and people_results[0].boxes is not None else input_frame.copy()
-            
-            count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)
-            count_text = f"People: {person_count} | M: {male_count} | F: {female_count}"
-            cv2.putText(annotated_frame, count_text, (10, 20), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, count_color, 2, cv2.LINE_AA)
-            
-            if fire_status != "no detection":
-                cv2.putText(annotated_frame, f"FIRE: {fire_status.upper()}", 
-                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 0, 255), 2, cv2.LINE_AA)
-
-            if alert_triggered:
-                red_overlay = annotated_frame.copy()
-                red_overlay[:] = (0, 0, 255)
-                annotated_frame = cv2.addWeighted(annotated_frame, 0.85, red_overlay, 0.15, 0)
-                
-            if scale != 1.0:
-                annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
-                
-            return annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status
-            
-        except Exception as e:
-            logger.error(f"Async parallel object detection error: {e}", exc_info=True)
-            return frame.copy(), 0, False, 0, 0, "no detection"
-
-    # Option 3: Optimized version with result caching and smart scheduling
-    def detect_objects_with_threshold(self, frame: np.ndarray, conf_threshold: float = 0.4, 
-                                                        threshold_settings: Dict[str, Any] = None) -> tuple[np.ndarray, int, bool, int, int, str]:
-        """Optimized parallel detection with intelligent scheduling and result caching."""
-        if frame is None or frame.size == 0: 
-            return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
-
-        # Frame counter for intelligent scheduling
-        frame_count = getattr(self, '_frame_count', 0) + 1
-        setattr(self, '_frame_count', frame_count)
-        
-        # Initialize cache if not exists
-        if not hasattr(self, '_detection_cache'):
-            self._detection_cache = {
-                'gender_results': None,
-                'fire_results': None,
-                'last_gender_frame': 0,
-                'last_fire_frame': 0
-            }
-
-        # Prepare frame
-        max_dim = config.get("yolo_max_input_dim", 640)
-        h, w = frame.shape[:2]
-        scale = 1.0
-        if h > max_dim or w > max_dim:
-            scale = max_dim / max(h, w)
-            new_w, new_h = int(w * scale), int(h * scale)
-            new_w = max(2, new_w - (new_w % 2))
-            new_h = max(2, new_h - (new_h % 2))
-            input_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            input_frame = frame
-
-        try:
-            # Always run people detection
-            def predict_people():
-                return self.people_model.predict(source=input_frame, conf=conf_threshold, classes=[0], verbose=False)
-
-            # Decide what else to run based on frame count and previous results
-            tasks_to_run = [predict_people]
-            task_names = ['people']
-
-            # Run gender detection every 2nd frame when people are detected
-            run_gender = frame_count % 2 == 0
-            if run_gender:
-                def predict_gender():
-                    return self.gender_model(source=input_frame, conf=0.3, verbose=False)
-                tasks_to_run.append(predict_gender)
-                task_names.append('gender')
-
-            # Run fire detection every 5th frame
-            run_fire = frame_count % 5 == 0
-            if run_fire:
-                def predict_fire():
-                    return self.fire_model(source=input_frame, conf=0.3, verbose=False)
-                tasks_to_run.append(predict_fire)
-                task_names.append('fire')
-
-            # Execute tasks in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks_to_run)) as executor:
-                futures = [executor.submit(task) for task in tasks_to_run]
-                results = [future.result() for future in futures]
-
-            # Parse results
-            people_results = results[0]
-            gender_results = None
-            fire_results = None
-
-            result_index = 1
-            if run_gender and len(results) > result_index:
-                gender_results = results[result_index]
-                self._detection_cache['gender_results'] = gender_results
-                self._detection_cache['last_gender_frame'] = frame_count
-                result_index += 1
-            else:
-                gender_results = self._detection_cache['gender_results']
-
-            if run_fire and len(results) > result_index:
-                fire_results = results[result_index]
-                self._detection_cache['fire_results'] = fire_results
-                self._detection_cache['last_fire_frame'] = frame_count
-            else:
-                fire_results = self._detection_cache['fire_results']
-
-            # Process people count
-            person_count = 0
-            if people_results and people_results[0].boxes is not None:
-                person_count = len(people_results[0].boxes)
-
-            # Process gender count
-            male_count = female_count = 0
-            if person_count > 0 and gender_results and gender_results[0].boxes is not None:
-                male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
-                female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
-
-            # Process fire detection
-            fire_status = "no detection"
-            if fire_results and fire_results[0].boxes is not None:
-                classes = [int(box.cls) for box in fire_results[0].boxes]
-                if 0 in classes:
-                    fire_status = "fire"
-                elif 1 in classes:
-                    fire_status = "smoke"
-
-            # Rest of processing...
-            alert_triggered = False
-            if threshold_settings and threshold_settings.get("alert_enabled", False):
-                greater_than = threshold_settings.get("greater_than")
-                less_than = threshold_settings.get("less_than")
-                
-                if greater_than is not None and person_count > greater_than:
-                    alert_triggered = True
-                elif less_than is not None and person_count < less_than:
-                    alert_triggered = True
-
-            annotated_frame = people_results[0].plot(img=input_frame.copy()) if people_results and people_results[0].boxes is not None else input_frame.copy()
-            
-            count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)
-            count_text = f"People: {person_count} | M: {male_count} | F: {female_count}"
-            cv2.putText(annotated_frame, count_text, (10, 20), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, count_color, 2, cv2.LINE_AA)
-            
-            if fire_status != "no detection":
-                cv2.putText(annotated_frame, f"FIRE: {fire_status.upper()}", 
-                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 0, 255), 2, cv2.LINE_AA)
-
-            if alert_triggered:
-                red_overlay = annotated_frame.copy()
-                red_overlay[:] = (0, 0, 255)
-                annotated_frame = cv2.addWeighted(annotated_frame, 0.85, red_overlay, 0.15, 0)
-                
-            if scale != 1.0:
-                annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
-                
-            return annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status
-            
-        except Exception as e:
-            logger.error(f"Optimized parallel object detection error: {e}", exc_info=True)
-            return frame.copy(), 0, False, 0, 0, "no detection"
-
-    # Optional: Add method to check cooldown status
     async def get_fire_notification_cooldown_status(self, stream_id_str: str) -> Dict[str, Any]:
         """Get fire notification cooldown status for a stream."""
         current_time = time.time()
@@ -3152,46 +2119,463 @@ class StreamManager:
             "cooldown_remaining_minutes": cooldown_remaining / 60.0
         }
 
-    # Optional: Add method to manually reset cooldown (for admin use)
-    async def reset_fire_notification_cooldown(self, stream_id_str: str) -> bool:
-        """Reset fire notification cooldown for a stream (admin function)."""
+    async def load_persistent_fire_state(self, stream_id_str: str):
+        """Load fire notification state from database to survive stream restarts"""
         try:
-            if stream_id_str in self.fire_notification_cooldowns:
-                del self.fire_notification_cooldowns[stream_id_str]
-                logging.info(f"Fire notification cooldown reset for stream {stream_id_str}")
-                return True
-            return False
+            # Check for recent fire notifications in database
+            recent_fire_query = """
+                SELECT MAX(timestamp) as last_fire_notification
+                FROM notifications 
+                WHERE stream_id = $1 AND status = 'fire_alert' 
+                AND timestamp >= $2
+            """
+            
+            # Look back 2 hours to catch any recent fire notifications
+            lookback_time = datetime.now(timezone.utc) - timedelta(hours=2)
+            
+            result = await self.db_manager.execute_query(
+                recent_fire_query, 
+                (UUID(stream_id_str), lookback_time),
+                fetch_one=True
+            )
+            
+            if result and result['last_fire_notification']:
+                last_notification_timestamp = result['last_fire_notification'].timestamp()
+                current_time = time.time()
+                
+                # If last notification was within cooldown period, restore cooldown
+                time_since_last = current_time - last_notification_timestamp
+                if time_since_last < self.fire_cooldown_duration:
+                    self.fire_notification_cooldowns[stream_id_str] = last_notification_timestamp
+                    remaining = self.fire_cooldown_duration - time_since_last
+                    logging.info(f"Restored fire cooldown for {stream_id_str}: {remaining/60:.1f} minutes remaining")
+                
         except Exception as e:
-            logging.error(f"Error resetting fire notification cooldown for stream {stream_id_str}: {e}")
+            logging.error(f"Error loading persistent fire state for {stream_id_str}: {e}")
+
+    async def send_fire_notification_if_allowed(self, stream_id_str: str, fire_status: str, 
+                                            owner_id: UUID, workspace_id: UUID, 
+                                            camera_name: str, location_info: Dict[str, Any] = None):
+        """Centralized fire notification with bulletproof cooldown management"""
+        
+        current_time = time.time()
+        
+        # Get previous fire state
+        previous_fire_status = self.fire_detection_states.get(stream_id_str, "no detection")
+        is_new_fire_detection = previous_fire_status == "no detection" and fire_status in ["fire", "smoke"]
+        
+        # Get cooldown info
+        last_notification_time = self.fire_notification_cooldowns.get(stream_id_str, 0)
+        time_since_last_notification = current_time - last_notification_time
+        
+        # STRICT cooldown check
+        cooldown_active = time_since_last_notification < self.fire_cooldown_duration
+        
+        # Log detailed state for debugging
+        logging.info(f"FIRE NOTIFICATION CHECK: stream={stream_id_str}, "
+                    f"fire_status={fire_status}, previous={previous_fire_status}, "
+                    f"is_new={is_new_fire_detection}, cooldown_active={cooldown_active}, "
+                    f"time_since_last={time_since_last_notification:.1f}s")
+        
+        # DECISION LOGIC: Send notification only if:
+        # 1. This is a NEW fire detection AND no cooldown active, OR
+        # 2. Cooldown has fully expired for ongoing fire
+        should_send = (is_new_fire_detection and not cooldown_active) or \
+                    (not is_new_fire_detection and not cooldown_active)
+        
+        if should_send:
+            try:
+                # Double-check cooldown one more time before sending
+                current_cooldown_check = time.time() - self.fire_notification_cooldowns.get(stream_id_str, 0)
+                if current_cooldown_check < self.fire_cooldown_duration:
+                    logging.warning(f"BLOCKED: Fire notification blocked by final cooldown check for {stream_id_str}")
+                    return False
+                
+                # Create alert message
+                if is_new_fire_detection:
+                    alert_message = f"🔥 FIRE/SMOKE EMERGENCY: {fire_status.upper()} detected in {camera_name}"
+                    log_type = "NEW DETECTION"
+                else:
+                    alert_message = f"🔥 FIRE/SMOKE ONGOING: {fire_status.upper()} still detected in {camera_name}"
+                    log_type = "COOLDOWN EXPIRED"
+                
+                logging.warning(f"SENDING FIRE NOTIFICATION ({log_type}): {alert_message}")
+                
+                # Send notification
+                await self.add_notification(
+                    str(owner_id), str(workspace_id), stream_id_str,
+                    camera_name, "fire_alert", alert_message
+                )
+                
+                # Send email
+                user_email = await self.get_user_email_for_stream(owner_id)
+                if user_email:
+                    await send_fire_alert_email(user_email, camera_name, fire_status, location_info)
+                
+                # CRITICAL: Update cooldown timestamp AFTER successful notification
+                notification_time = time.time()
+                self.fire_notification_cooldowns[stream_id_str] = notification_time
+                
+                logging.warning(f"🔥 FIRE NOTIFICATION SENT for {stream_id_str}. "
+                            f"Next available: {datetime.fromtimestamp(notification_time + self.fire_cooldown_duration)}")
+                
+                return True
+                
+            except Exception as e:
+                logging.error(f"Error sending fire notification for {stream_id_str}: {e}")
+                return False
+        else:
+            # Log why notification was blocked
+            if cooldown_active:
+                remaining = self.fire_cooldown_duration - time_since_last_notification
+                logging.info(f"Fire notification BLOCKED for {stream_id_str}: "
+                            f"cooldown active, {remaining/60:.1f} minutes remaining")
+            return False
+    
+    async def send_fire_alert_to_frontend(self, user_id: str, notification: Dict[str, Any], location_info: Optional[Dict[str, Any]] = None):
+        """Send fire alert in the format that frontend expects"""
+        
+        # First add to database
+        now_dt = datetime.now(timezone.utc)
+        notif_id = UUID(notification["id"])
+        
+        try: 
+            await self.db_manager.execute_query(
+                """INSERT INTO notifications 
+                (notification_id, user_id, workspace_id, stream_id, camera_name, status, message, timestamp, is_read, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
+                (notif_id, UUID(notification["user_id"]), UUID(notification["workspace_id"]), 
+                UUID(notification["stream_id"]) if notification["stream_id"] else None,
+                notification["camera_name"], notification["status"], notification["message"], 
+                now_dt, False, now_dt, now_dt)
+            )
+        except Exception as e_db:
+            logging.error(f"Failed to persist fire notification {str(notif_id)} to DB: {e_db}", exc_info=True)
+        
+        # Add to in-memory cache
+        async with self._notification_lock:
+            self.notifications.append(notification) 
+            self.notifications = self.notifications[-self.max_notifications:]
+        
+        # Get subscribers
+        subscribers_for_user_copy: List[WebSocket] = []
+        async with self._notification_lock:
+            subscribers_for_user_copy = list(self.notification_subscribers.get(user_id, set()))
+
+        if not subscribers_for_user_copy:
+            return
+        
+        # Create the message format that your frontend expects
+        # Based on your frontend code, it expects an array format for fire alerts
+        fire_alert_array = [{
+            "id": notification["id"],
+            "message": notification["message"],
+            "timestamp": notification["timestamp"],
+            "camera_name": notification["camera_name"],
+            "read": False
+        }]
+        
+        # Send as array format (this will trigger your frontend fire alert popup)
+        alert_payload = fire_alert_array
+        
+        logging.info(f"Sending fire alert array to frontend for user {user_id}: {alert_payload}")
+        
+        # Send to all websockets
+        tasks = []
+        valid_subscribers = []
+        for ws in subscribers_for_user_copy:
+            if ws.client_state == WebSocketState.CONNECTED:
+                tasks.append(ws.send_json(alert_payload))
+                valid_subscribers.append(ws)
+            else: 
+                asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            success_count = 0
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    ws_failed = valid_subscribers[i]
+                    logging.warning(f"Failed to send fire alert to WS for user {user_id}: {result}")
+                    asyncio.create_task(self.unsubscribe_from_notifications(user_id, ws_failed))
+                else:
+                    success_count += 1
+            
+            logging.info(f"Fire alert sent successfully to {success_count}/{len(tasks)} websockets for user {user_id}")
+        
+        return notification
+        
+    async def get_persistent_fire_state(self, stream_id: UUID) -> Dict[str, Any]:
+        """Get persistent fire state from database"""
+        try:
+            result = await self.db_manager.execute_query(
+                """SELECT fire_status, last_detection_time, last_notification_time 
+                FROM fire_detection_state WHERE stream_id = $1""",
+                (stream_id,), fetch_one=True
+            )
+            
+            if result:
+                return {
+                    'fire_status': result['fire_status'],
+                    'last_detection_time': result['last_detection_time'],
+                    'last_notification_time': result['last_notification_time']
+                }
+            return {
+                'fire_status': 'no detection',
+                'last_detection_time': None,
+                'last_notification_time': None
+            }
+        except Exception as e:
+            logging.error(f"Error getting persistent fire state for {stream_id}: {e}")
+            return {
+                'fire_status': 'no detection',
+                'last_detection_time': None,
+                'last_notification_time': None
+            }
+
+    async def diagnose_stream_activation_failure(self, stream_id_str: str) -> Dict[str, Any]:
+        """Diagnose why a stream failed to become active"""
+        try:
+            stream_uuid = UUID(stream_id_str)
+            
+            # Check database state
+            db_state = await self.db_manager.execute_query(
+                "SELECT status, is_streaming, last_activity, updated_at FROM video_stream WHERE stream_id = $1",
+                (stream_uuid,), fetch_one=True
+            )
+            
+            # Check in-memory state
+            async with self._lock:
+                memory_state = self.active_streams.get(stream_id_str, {})
+            
+            # Check shared stream state
+            shared_stream_info = {}
+            if hasattr(self, 'video_file_manager'):
+                # Find the source for this stream
+                for source, shared_stream in self.video_file_manager.shared_streams.items():
+                    if stream_id_str in shared_stream.subscribers:
+                        shared_stream_info = {
+                            'source': source,
+                            'is_running': shared_stream.is_running,
+                            'subscriber_count': len(shared_stream.subscribers),
+                            'last_successful_read': getattr(shared_stream, 'last_successful_read', 0),
+                            'stats': shared_stream.get_stats()
+                        }
+                        break
+            
+            return {
+                'stream_id': stream_id_str,
+                'db_state': db_state,
+                'memory_state': {
+                    'status': memory_state.get('status'),
+                    'task_done': memory_state.get('task') and memory_state.get('task').done(),
+                    'start_time': memory_state.get('start_time'),
+                    'last_frame_time': memory_state.get('last_frame_time')
+                },
+                'shared_stream_info': shared_stream_info
+            }
+            
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def should_send_fire_notification1(self, stream_id: UUID, current_fire_status: str) -> bool:
+        """Determine if fire notification should be sent based on persistent state and cooldown"""
+        try:
+            # Get persistent state from database
+            persistent_state = await self.get_persistent_fire_state(stream_id)
+            last_notification_time = persistent_state['last_notification_time']
+            
+            # If current status is not fire/smoke, never send notification
+            if current_fire_status not in ['fire', 'smoke']:
+                return False
+            
+            # Check cooldown - this is the ONLY condition that matters
+            current_time = datetime.now(timezone.utc)
+            
+            if last_notification_time is None:
+                # Never sent a notification before - send it
+                logging.info(f"First-time fire notification for {stream_id}")
+                return True
+            
+            # Calculate time since last notification
+            time_since_last = (current_time - last_notification_time).total_seconds()
+            cooldown_expired = time_since_last >= self.fire_cooldown_duration
+            
+            if cooldown_expired:
+                logging.info(f"Fire notification cooldown expired for {stream_id}. "
+                            f"Time since last: {time_since_last/60:.1f} minutes")
+                return True
+            else:
+                remaining = self.fire_cooldown_duration - time_since_last
+                logging.debug(f"Fire notification blocked by cooldown for {stream_id}. "
+                            f"Remaining: {remaining/60:.1f} minutes")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error checking fire notification decision for {stream_id}: {e}")
             return False
 
-    # Optional: Enhanced fire status reporting with cooldown info
-    def generate_fire_alert_message(self, fire_status: str, stream_id_str: str) -> str:
-        """Generate fire alert message with cooldown information."""
-        base_message = f"Fire/smoke detected: {fire_status}"
+    async def should_send_fire_notification(self, stream_id: UUID, current_fire_status: str) -> bool:
+        """
+        SIMPLIFIED: Check if fire notification should be sent based on cooldown only.
+        This method is now mainly used by debug endpoints.
+        """
+        if current_fire_status not in ['fire', 'smoke']:
+            return False
         
-        # Add cooldown info for debugging/admin purposes
+        stream_id_str = str(stream_id)
         current_time = time.time()
-        last_notification = self.fire_notification_cooldowns.get(stream_id_str, 0)
         
-        if last_notification > 0:
-            time_since_last = (current_time - last_notification) / 60.0  # in minutes
-            if time_since_last < self.fire_cooldown_duration / 60.0:
-                base_message += f" (Last alert: {time_since_last:.1f}min ago)"
+        # Check in-memory cooldown (primary source)
+        last_notification_time = self.fire_notification_cooldowns.get(stream_id_str, 0)
+        time_since_last = current_time - last_notification_time
         
-        return base_message
+        # Also check database as backup
+        persistent_state = await self.get_persistent_fire_state(stream_id)
+        if persistent_state['last_notification_time']:
+            time_since_db = (datetime.now(timezone.utc) - persistent_state['last_notification_time']).total_seconds()
+            time_since_last = min(time_since_last, time_since_db)
+        
+        return time_since_last >= self.fire_cooldown_duration
 
-"""
-# In your _process_stream_with_sharing method, change this line:
-processed_frame, person_count, alert_triggered, male_count, female_count, fire_status = await loop.run_in_executor(
-    thread_pool, self.detect_objects_with_threshold, frame, conf_threshold, threshold_settings
-)
+    async def update_persistent_fire_state(self, stream_id: UUID, fire_status: str, 
+                                        detection_time: datetime = None, 
+                                        notification_time: datetime = None):
+        """Update persistent fire state in database with proper UPSERT"""
+        try:
+            now = datetime.now(timezone.utc)
+            detection_time = detection_time or now
+            
+            # Use UPSERT to handle both insert and update cases
+            await self.db_manager.execute_query(
+                """INSERT INTO fire_detection_state 
+                (stream_id, fire_status, last_detection_time, last_notification_time, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (stream_id) 
+                DO UPDATE SET 
+                    fire_status = EXCLUDED.fire_status,
+                    last_detection_time = EXCLUDED.last_detection_time,
+                    last_notification_time = CASE 
+                        WHEN EXCLUDED.last_notification_time IS NOT NULL 
+                        THEN EXCLUDED.last_notification_time 
+                        ELSE fire_detection_state.last_notification_time 
+                    END,
+                    updated_at = EXCLUDED.updated_at""",
+                (stream_id, fire_status, detection_time, notification_time, now, now)
+            )
+            
+            logging.debug(f"Updated persistent fire state for {stream_id}: "
+                        f"status={fire_status}, notification_time={notification_time}")
+            
+        except Exception as e:
+            logging.error(f"Error updating persistent fire state for {stream_id}: {e}")
 
-# To this:
-processed_frame, person_count, alert_triggered, male_count, female_count, fire_status = await self.detect_objects_with_threshold_parallel_async(
-    frame, conf_threshold, threshold_settings
-)
-"""
+    async def load_fire_state_on_stream_start(self, stream_id: UUID):
+        """Load persistent fire state when stream starts - synchronize with database"""
+        stream_id_str = str(stream_id)
+        try:
+            # ALWAYS load from database first
+            persistent_state = await self.get_persistent_fire_state(stream_id)
+            
+            # Set in-memory state from database
+            self.fire_detection_states[stream_id_str] = persistent_state['fire_status']
+            
+            # Restore cooldown if within cooldown period
+            if persistent_state['last_notification_time']:
+                last_notification_timestamp = persistent_state['last_notification_time'].timestamp()
+                current_time = time.time()
+                time_since_last = current_time - last_notification_timestamp
+                
+                if time_since_last < self.fire_cooldown_duration:
+                    self.fire_notification_cooldowns[stream_id_str] = last_notification_timestamp
+                    remaining = self.fire_cooldown_duration - time_since_last
+                    logging.info(f"Restored fire cooldown for {stream_id_str}: "
+                            f"fire_status='{persistent_state['fire_status']}', "
+                            f"cooldown_remaining={remaining/60:.1f}min")
+                else:
+                    logging.info(f"Fire state loaded for {stream_id_str}: "
+                            f"fire_status='{persistent_state['fire_status']}', "
+                            f"cooldown_expired")
+            else:
+                logging.info(f"Fire state loaded for {stream_id_str}: "
+                        f"fire_status='{persistent_state['fire_status']}', "
+                        f"no_previous_notifications")
+            
+        except Exception as e:
+            logging.error(f"Error loading fire state for {stream_id}: {e}")
+            # Set safe defaults
+            self.fire_detection_states[stream_id_str] = "no detection"
+
+    async def cleanup_old_fire_states(self):
+        """Clean up old fire detection states - but preserve recent cooldowns"""
+        try:
+            # Remove fire states for deleted streams
+            await self.db_manager.execute_query(
+                """DELETE FROM fire_detection_state 
+                WHERE stream_id NOT IN (SELECT stream_id FROM video_stream)"""
+            )
+            
+            # Clean up very old notification states (older than 24 hours)
+            # This preserves the 10-minute cooldown while cleaning up old data
+            day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+            await self.db_manager.execute_query(
+                """UPDATE fire_detection_state 
+                SET last_notification_time = NULL 
+                WHERE last_notification_time < $1""",
+                (day_ago,)
+            )
+            
+            logging.debug("Cleaned up old fire detection states")
+            
+        except Exception as e:
+            logging.error(f"Error cleaning up fire states: {e}")
+
+    async def send_immediate_fire_alert(self, workspace_id_str: str, alert_data: Dict[str, Any]):
+        """Send immediate fire alert to all notification subscribers in the workspace"""
+        try:
+            # Get all users in this workspace
+            workspace_users_query = """
+                SELECT user_id FROM workspace_members WHERE workspace_id = $1
+            """
+            workspace_users = await self.db_manager.execute_query(
+                workspace_users_query, (UUID(workspace_id_str),), fetch_all=True
+            )
+            
+            if not workspace_users:
+                return
+                
+            # Send alert to all users in workspace
+            for user_row in workspace_users:
+                user_id_str = str(user_row['user_id'])
+                
+                # Check if user has active notification websocket connections
+                subscribers_for_user = []
+                async with self._notification_lock:
+                    subscribers_for_user = list(self.notification_subscribers.get(user_id_str, set()))
+                
+                if subscribers_for_user:
+                    # Send fire alert to all connected websockets for this user
+                    fire_alert_payload = {
+                        "type": "fire_emergency",
+                        "alert": alert_data,
+                        "server_time": datetime.now(timezone.utc).timestamp()
+                    }
+                    
+                    # Send to all websockets
+                    send_tasks = []
+                    for ws in subscribers_for_user:
+                        if ws.client_state == WebSocketState.CONNECTED:
+                            send_tasks.append(ws.send_json(fire_alert_payload))
+                    
+                    # Send all alerts concurrently
+                    if send_tasks:
+                        results = await asyncio.gather(*send_tasks, return_exceptions=True)
+                        success_count = sum(1 for r in results if not isinstance(r, Exception))
+                        logging.info(f"Fire alert sent to {success_count}/{len(send_tasks)} websockets for user {user_id_str}")
+                        
+        except Exception as e:
+            logging.error(f"Error sending immediate fire alert for workspace {workspace_id_str}: {e}")
+
 
 stream_manager = StreamManager() 
 
@@ -3205,18 +2589,65 @@ async def initialize_stream_manager():
 
 async def send_ping(websocket: WebSocket):
     try:
-        ping_interval = float(config.get("websocket_ping_interval", 30.0)) # Match stream_one.py config key
+        ping_interval = float(config.get("websocket_ping_interval", 30.0))
         while websocket.client_state == WebSocketState.CONNECTED:
             await asyncio.sleep(ping_interval)
-            if websocket.client_state == WebSocketState.CONNECTED: # Re-check state
-                await websocket.send_json({"type": "ping", "timestamp": datetime.now(timezone.utc).timestamp()})
-            else: break 
+            # Double-check state before sending ping
+            if websocket.client_state == WebSocketState.CONNECTED:
+                try:
+                    await websocket.send_json({
+                        "type": "ping", 
+                        "timestamp": datetime.now(timezone.utc).timestamp()
+                    })
+                except RuntimeError as e:
+                    if "close message has been sent" in str(e).lower():
+                        logging.debug("Ping failed: WebSocket already closing")
+                        break
+                    else:
+                        raise
+            else:
+                break 
     except (WebSocketDisconnect, asyncio.CancelledError, ConnectionResetError, RuntimeError):
         logging.debug("Ping task for WebSocket ended (disconnect/cancel/error).")
-    except Exception as e: # Catch any other exceptions during ping
+    except Exception as e:
         logging.error(f"Error in WebSocket ping task: {e}", exc_info=True)
 
-# === Endpoints to match stream_one.py ===
+async def _safe_close_websocket(websocket: WebSocket, username_for_log: Optional[str] = None):
+    """Safely close a WebSocket connection with proper state checking."""
+    try:
+        current_state = websocket.client_state
+        
+        # Only attempt to close if the websocket is in a state that allows closing
+        if current_state == WebSocketState.CONNECTED:
+            logging.debug(f"Closing websocket for {username_for_log}, state: {current_state}")
+            await websocket.close()
+        elif current_state == WebSocketState.CONNECTING:
+            # Wait a bit for connection to establish or fail, then try to close
+            logging.debug(f"Websocket connecting for {username_for_log}, waiting before close")
+            await asyncio.sleep(0.1)
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close()
+        elif current_state == WebSocketState.DISCONNECTED:
+            logging.debug(f"Websocket already disconnected for {username_for_log}")
+        elif current_state == WebSocketState.CLOSING:
+            logging.debug(f"Websocket already closing for {username_for_log}")
+        else:
+            logging.debug(f"Websocket in unexpected state {current_state} for {username_for_log}")
+            
+    except RuntimeError as e:
+        # This is expected if the websocket is already closed/disconnected
+        error_msg = str(e).lower()
+        if any(phrase in error_msg for phrase in [
+            "websocket is not connected", 
+            "already closed", 
+            "cannot call", 
+            "close message has been sent"
+        ]):
+            logging.debug(f"Websocket already closed for {username_for_log}: {e}")
+        else:
+            logging.warning(f"RuntimeError closing websocket for {username_for_log}: {e}")
+    except Exception as e:
+        logging.warning(f"Unexpected error closing websocket for {username_for_log}: {e}")
 
 @router.post("/start_stream/{stream_id_str}")
 async def start_workspace_stream_endpoint( # Renamed to match stream_one.py, path changed
@@ -3276,345 +2707,42 @@ async def stop_workspace_stream_endpoint( # Renamed
         logging.error(f"Error stopping stream {stream_id_str}: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
 
-@router.get("/streams") # Path changed
-async def get_all_workspace_streams_endpoint( # Renamed
-    workspace_id: Optional[str] = Query(None, description="Specific workspace ID (optional, defaults to user's active or all accessible)"), # Match stream_one description
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    try:
-        user_id_str = str(current_user_data["user_id"])
-        result = await stream_manager.get_workspace_streams(user_id_str, workspace_id)
-        return JSONResponse(content={"status": "success", "data": result}) # Match stream_one response structure
-    except HTTPException as e:
-        return JSONResponse(status_code=e.status_code, content={"status": "error", "message": e.detail})
-    except Exception as e:
-        logging.error(f"Error getting workspace streams: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
-
-# === ADDING MISSING BULK OPERATION ENDPOINTS ===
-@router.post("/start_all_streams", summary="Start all eligible streams in a workspace")
-async def start_all_streams_in_workspace(
-    workspace_id: UUID = Query(..., description="The ID of the workspace for which to start all streams"),
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    _user_id_val = current_user_data["user_id"]
-    if isinstance(_user_id_val, UUID):
-        requester_user_id = _user_id_val
-    else:
-        try:
-            requester_user_id = UUID(str(_user_id_val))
-        except ValueError:
-            logger.error(f"Invalid user_id format encountered in start_all_streams: {_user_id_val}")
-            raise HTTPException(status_code=400, detail="Invalid user ID format in token.")
-            
-    requester_username = current_user_data["username"]
-
-    try:
-        workspace_role_data = await check_workspace_membership_and_get_role(requester_user_id, workspace_id)
-        if workspace_role_data.get("role") not in ["owner", "admin", "member"]:
-            raise HTTPException(status_code=403, detail="User does not have permission to start all streams in this workspace.")
-    except HTTPException: raise
-    except Exception as e:
-        logging.error(f"Error during permission check for start_all_streams by {requester_username} in ws {workspace_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error verifying workspace permissions.")
-
-    results = []
-    streams_started_count = 0
-    streams_processed_count = 0
-
-    try:
-        streams_to_consider_query = """
-            SELECT vs.stream_id, vs.name, vs.user_id as owner_id,
-                   u.username as owner_username, u.is_active as owner_is_active,
-                   u.is_subscribed as owner_is_subscribed, u.count_of_camera as owner_camera_limit,
-                   u.role as owner_system_role
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            WHERE vs.workspace_id = $1 AND vs.is_streaming = FALSE;
-        """
-        streams_to_consider = await db_manager_global.execute_query(streams_to_consider_query, (workspace_id,), fetch_all=True)
-        streams_to_consider = streams_to_consider or []
-        
-        streams_processed_count = len(streams_to_consider)
-        if not streams_to_consider:
-            return JSONResponse(content={"status": "info", "message": "No streams available to start...", "workspace_id": str(workspace_id), "streams_processed": 0, "streams_started": 0, "details": []})
-
-        owner_active_streams_count_query = """
-            SELECT user_id, COUNT(*) as active_count FROM video_stream
-            WHERE workspace_id = $1 AND is_streaming = TRUE GROUP BY user_id;
-        """
-        active_counts_db = await db_manager_global.execute_query(owner_active_streams_count_query, (workspace_id,), fetch_all=True)
-        active_counts_db = active_counts_db or []
-        owner_active_streams_map = {row['user_id']: row['active_count'] for row in active_counts_db}
-
-        for stream_data in streams_to_consider:
-            stream_id, stream_name, owner_id = stream_data['stream_id'], stream_data['name'], stream_data['owner_id']
-            
-            if not stream_data['owner_is_active']:
-                results.append({"stream_id": str(stream_id), "name": stream_name, "status": "skipped", "message": "Stream owner is inactive."}); continue
-            if not stream_data['owner_is_subscribed'] and stream_data['owner_system_role'] != 'admin':
-                results.append({"stream_id": str(stream_id), "name": stream_name, "status": "skipped", "message": "Stream owner not subscribed (and not admin)." }); continue
-
-            owner_limit = stream_data['owner_camera_limit']
-            current_owner_active_count = owner_active_streams_map.get(owner_id, 0)
-
-            if stream_data['owner_system_role'] != 'admin' and current_owner_active_count >= owner_limit:
-                results.append({"stream_id": str(stream_id), "name": stream_name, "status": "skipped", "message": f"Owner camera limit ({owner_limit}) reached."}); continue
-
-            await db_manager_global.execute_query(
-                "UPDATE video_stream SET is_streaming = TRUE, status = 'processing', updated_at = $1 WHERE stream_id = $2",
-                (datetime.now(timezone.utc), stream_id)
-            )
-            streams_started_count += 1
-            owner_active_streams_map[owner_id] = current_owner_active_count + 1 
-            results.append({"stream_id": str(stream_id), "name": stream_name, "status": "initiated", "message": "Stream start initiated."})
-
-        return JSONResponse(content={"status": "success" if streams_started_count == streams_processed_count else "partial_success", "workspace_id": str(workspace_id), "streams_processed": streams_processed_count, "streams_started": streams_started_count, "details": results})
-    except HTTPException: raise
-    except Exception as e:
-        logging.error(f"Error in start_all_streams for ws {workspace_id} by {requester_username}: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error starting streams.", "workspace_id": str(workspace_id), "details": results})
-
-@router.post("/stop_all_streams", summary="Stop all running streams in a workspace")
-async def stop_all_streams_in_workspace(
-    workspace_id: UUID = Query(..., description="The ID of the workspace for which to stop all streams"),
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    _user_id_val = current_user_data["user_id"]
-    if isinstance(_user_id_val, UUID):
-        requester_user_id = _user_id_val
-    else:
-        try:
-            requester_user_id = UUID(str(_user_id_val))
-        except ValueError:
-            logger.error(f"Invalid user_id format encountered in stop_all_streams: {_user_id_val}")
-            raise HTTPException(status_code=400, detail="Invalid user ID format in token.")
-
-    requester_username = current_user_data["username"]
-
-    try:
-        workspace_role_data = await check_workspace_membership_and_get_role(requester_user_id, workspace_id)
-        if workspace_role_data.get("role") not in ["owner", "admin", "member"]:
-            raise HTTPException(status_code=403, detail="User does not have permission to stop all streams in this workspace.")
-    except HTTPException: raise
-    except Exception as e:
-        logging.error(f"Error during permission check for stop_all_streams by {requester_username} in ws {workspace_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error verifying workspace permissions.")
-
-    results = []
-    streams_stopped_count = 0
-    streams_processed_count = 0
-    
-    try:
-        streams_to_stop_query = """
-            SELECT vs.stream_id, vs.name, vs.user_id as owner_id
-            FROM video_stream vs WHERE vs.workspace_id = $1 AND vs.is_streaming = TRUE;
-        """
-        streams_to_stop = await db_manager_global.execute_query(streams_to_stop_query, (workspace_id,), fetch_all=True)
-        streams_to_stop = streams_to_stop or []
-
-        streams_processed_count = len(streams_to_stop)
-        if not streams_to_stop:
-            return JSONResponse(content={"status": "info", "message": "No streams running to stop.", "workspace_id": str(workspace_id), "streams_processed": 0, "streams_stopped": 0, "details": []})
-
-        for stream_data in streams_to_stop:
-            stream_id, stream_name, owner_id = stream_data['stream_id'], stream_data['name'], stream_data['owner_id']
-            updated_rows = await db_manager_global.execute_query(
-                "UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', updated_at = $1 WHERE stream_id = $2 AND is_streaming = TRUE",
-                (datetime.now(timezone.utc), stream_id), return_rowcount=True
-            )
-            if updated_rows and updated_rows > 0:
-                streams_stopped_count += 1
-                results.append({"stream_id": str(stream_id), "name": stream_name, "status": "stopped", "message": "Stream stop request processed."})
-                await stream_manager.add_notification(str(owner_id), str(workspace_id), str(stream_id), stream_name, "inactive", f"Camera '{stream_name}' stopped by {requester_username} (bulk action).")
-            else:
-                 results.append({"stream_id": str(stream_id), "name": stream_name, "status": "skipped", "message": "Stream already stopped or issue."})
-
-        return JSONResponse(content={"status": "success" if streams_stopped_count == streams_processed_count else "partial_success", "workspace_id": str(workspace_id), "streams_processed": streams_processed_count, "streams_stopped": streams_stopped_count, "details": results})
-    except HTTPException: raise
-    except Exception as e:
-        logging.error(f"Error in stop_all_streams for ws {workspace_id} by {requester_username}: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error stopping streams.", "workspace_id": str(workspace_id), "details": results})
-
-@router.post("/start_all_streams_v2")
-async def start_all_streams_v2_endpoint( # Name to match stream_one
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        requester_username = current_user_data["username"]
-        update_query = """
-            UPDATE video_stream vs SET is_streaming = TRUE, status = 'processing', updated_at = $1
-            FROM workspace_members wm
-            WHERE vs.workspace_id = wm.workspace_id AND wm.user_id = $2 AND vs.is_streaming = FALSE
-            RETURNING vs.stream_id;
-        """ # RETURNING to get count
-        now_utc = datetime.now(timezone.utc)
-        updated_streams = await db_manager_global.execute_query(update_query, (now_utc, UUID(requester_user_id_str)), fetch_all=True)
-        updated_rows = len(updated_streams) if updated_streams else 0
-
-        if updated_rows == 0:
-            return JSONResponse(content={"status": "info", "message": "No inactive streams to start in your accessible workspaces."})
-        logging.info(f"User {requester_username} requested to start all v2 streams. {updated_rows} streams marked for starting.")
-        return JSONResponse(content={"status": "success", "message": f"{updated_rows} streams marked to start."})
-    except Exception as e:
-        logging.error(f"Error in /start_all_streams_v2: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
-
-@router.post("/stop_all_streams_v2")
-async def stop_all_streams_v2_endpoint( # Name to match stream_one
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        requester_username = current_user_data["username"]
-        query = """
-            SELECT vs.stream_id, vs.name, vs.user_id, vs.workspace_id
-            FROM video_stream vs JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1 AND vs.is_streaming = TRUE
-        """
-        streams_to_stop = await db_manager_global.execute_query(query, (UUID(requester_user_id_str),), fetch_all=True)
-        streams_to_stop = streams_to_stop or []
-
-        if not streams_to_stop:
-            return JSONResponse(content={"status": "info", "message": "No active streams to stop in your accessible workspaces."})
-
-        stream_ids = [s["stream_id"] for s in streams_to_stop] # These are already UUIDs from DB
-        placeholders = ','.join([f'${i+2}' for i in range(len(stream_ids))]) # $1 for time, $2... for stream_ids
-        
-        update_query = f"""
-            UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', updated_at = $1
-            WHERE stream_id IN ({placeholders})
-        """
-        now_utc = datetime.now(timezone.utc)
-        await db_manager_global.execute_query(update_query, (now_utc, *stream_ids))
-
-        for stream in streams_to_stop:
-            await stream_manager.add_notification(str(stream["user_id"]), str(stream["workspace_id"]), str(stream["stream_id"]), stream["name"], "inactive", f"Camera '{stream['name']}' stopped by {requester_username} (v2 bulk action).")
-        logging.info(f"User {requester_username} stopped {len(streams_to_stop)} streams (v2).")
-        return JSONResponse(content={"status": "success", "message": f"{len(streams_to_stop)} streams stopped."})
-    except Exception as e:
-        logging.error(f"Error in /stop_all_streams_v2: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
-
-# === END OF BULK OPERATION ENDPOINTS ===
-
-# === NEW: LOCATION-BASED FILTERING ENDPOINT ===
-@router.get("/streams/by-location")
-async def get_streams_by_location(
-    location: Optional[str] = Query(None),
-    area: Optional[str] = Query(None),
-    building: Optional[str] = Query(None),
-    floor_level: Optional[str] = Query(None),
-    zone: Optional[str] = Query(None),
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    """Get streams filtered by location criteria."""
-    try:
-        user_id_str = str(current_user_data["user_id"])
-        
-        # Build query with location filters
-        base_query = """
-            SELECT vs.stream_id, vs.name, vs.path, vs.type, vs.status, vs.is_streaming,
-                   vs.location, vs.area, vs.building, vs.floor_level, vs.zone,
-                   vs.latitude, vs.longitude, u.username as owner_username,
-                   w.name as workspace_name, vs.workspace_id
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1
-        """
-        
-        params = [UUID(user_id_str)]
-        param_count = 1
-        
-        if location:
-            param_count += 1
-            base_query += f" AND vs.location = ${param_count}"
-            params.append(location)
-        if area:
-            param_count += 1
-            base_query += f" AND vs.area = ${param_count}"
-            params.append(area)
-        if building:
-            param_count += 1
-            base_query += f" AND vs.building = ${param_count}"
-            params.append(building)
-        if floor_level:
-            param_count += 1
-            base_query += f" AND vs.floor_level = ${param_count}"
-            params.append(floor_level)
-        if zone:
-            param_count += 1
-            base_query += f" AND vs.zone = ${param_count}"
-            params.append(zone)
-            
-        base_query += " ORDER BY vs.building, vs.floor_level, vs.zone, vs.area, vs.location, vs.name"
-        
-        streams = await db_manager_global.execute_query(base_query, tuple(params), fetch_all=True)
-        streams = streams or []
-        
-        formatted_streams = [{
-            "stream_id": str(s["stream_id"]),
-            "name": s["name"],
-            "status": s["status"],
-            "is_streaming": s["is_streaming"],
-            "location": s["location"],
-            "area": s["area"],
-            "building": s["building"],
-            "zone": s["zone"],
-            "floor_level": s["floor_level"],
-            "latitude": float(s["latitude"]) if s["latitude"] else None,
-            "longitude": float(s["longitude"]) if s["longitude"] else None,
-            "owner_username": s["owner_username"],
-            "workspace_name": s["workspace_name"],
-            "workspace_id": str(s["workspace_id"])
-        } for s in streams]
-        
-        return JSONResponse(content={
-            "status": "success",
-            "streams": formatted_streams,
-            "total": len(formatted_streams),
-            "filters_applied": {
-                "location": location,
-                "area": area, 
-                "building": building,
-                "floor_level": floor_level,
-                "zone": zone
-            }
-        })
-        
-    except Exception as e:
-        logging.error(f"Error getting streams by location: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
-
-@router.websocket("/stream") # Path changed
-async def websocket_workspace_stream(websocket: WebSocket): # Name kept from async_stream
+@router.websocket("/stream")
+async def websocket_workspace_stream(websocket: WebSocket):
     stream_id_str: Optional[str] = None
     ping_task: Optional[asyncio.Task] = None
     user_id_for_log: Optional[str] = None
+    websocket_closed = False
 
     try:
         await websocket.accept()
         query_params = dict(websocket.query_params)
         stream_id_str = query_params.get("stream_id")
         if not stream_id_str:
-            await websocket.send_json({"status": "error", "message": "stream_id is required."}); await websocket.close(1008); return # Payload match
+            await websocket.send_json({"status": "error", "message": "stream_id is required."})
+            websocket_closed = True
+            await websocket.close(1008)
+            return
 
         token = await session_manager_global.get_token_from_websocket(websocket)
         if not token:
-            await websocket.send_json({"status": "error", "message": "Authentication token required."}); await websocket.close(1008); return # Payload match
+            await websocket.send_json({"status": "error", "message": "Authentication token required."})
+            websocket_closed = True
+            await websocket.close(1008)
+            return
 
         token_data = await session_manager_global.verify_token(token, "access")
         if not token_data or await session_manager_global.is_token_blacklisted(token):
-            await websocket.send_json({"status": "error", "message": "Invalid or expired token."}); await websocket.close(1008); return # Payload match
+            await websocket.send_json({"status": "error", "message": "Invalid or expired token."})
+            websocket_closed = True
+            await websocket.close(1008)
+            return
         
         requester_user_id_str = token_data.user_id
         user_id_for_log = requester_user_id_str 
         stream_id_uuid = UUID(stream_id_str)
 
-        # UPDATED: Include location data in connection confirmation
+        # Get stream details with location data
         stream_details_query = """
             SELECT vs.workspace_id, vs.user_id as owner_id, vs.name, vs.is_streaming, vs.status, 
                    u.username as owner_username,
@@ -3626,7 +2754,10 @@ async def websocket_workspace_stream(websocket: WebSocket): # Name kept from asy
         stream_details_db = await db_manager_global.execute_query(stream_details_query, (stream_id_uuid,), fetch_one=True)
         
         if not stream_details_db:
-            await websocket.send_json({"status": "error", "message": "Stream not found."}); await websocket.close(1008); return
+            await websocket.send_json({"status": "error", "message": "Stream not found."})
+            websocket_closed = True
+            await websocket.close(1008)
+            return
 
         s_workspace_id = stream_details_db['workspace_id']
         s_name = stream_details_db['name']
@@ -3634,7 +2765,7 @@ async def websocket_workspace_stream(websocket: WebSocket): # Name kept from asy
         s_status_db = stream_details_db['status']
         s_owner_username = stream_details_db['owner_username']
         
-        # NEW: Extract location info for response
+        # Extract location info for response
         location_data = {
             "location": stream_details_db.get('location'),
             "area": stream_details_db.get('area'),
@@ -3643,7 +2774,7 @@ async def websocket_workspace_stream(websocket: WebSocket): # Name kept from asy
             "floor_level": stream_details_db.get('floor_level')
         }
 
-        requester_role_info = await check_workspace_membership_and_get_role(UUID(requester_user_id_str), s_workspace_id) # throws HTTPException on fail
+        requester_role_info = await check_workspace_membership_and_get_role(UUID(requester_user_id_str), s_workspace_id)
         
         stream_is_active_in_manager = False
         async with stream_manager._lock:
@@ -3653,30 +2784,51 @@ async def websocket_workspace_stream(websocket: WebSocket): # Name kept from asy
         
         if not s_is_streaming_db or not stream_is_active_in_manager:
             logging.info(f"WS: Stream {stream_id_str} not active (DB: {s_is_streaming_db}, Mgr: {stream_is_active_in_manager}, Status: {s_status_db}). Attempting start by {requester_user_id_str}.")
-            # Role check from stream_one.py before attempting start
-            if requester_role_info.get("role") not in ['admin', 'member', 'owner']: # owner can also start
-                 await websocket.send_json({"status": "error", "message": "Stream is not active. You do not have permission to start it."}); await websocket.close(1008); return
+            
+            if requester_role_info.get("role") not in ['admin', 'member', 'owner']:
+                await websocket.send_json({"status": "error", "message": "Stream is not active. You do not have permission to start it."})
+                websocket_closed = True
+                await websocket.close(1008)
+                return
 
             try:
-                await stream_manager.start_stream_in_workspace(stream_id_str, requester_user_id_str) # This marks for processing
+                await stream_manager.start_stream_in_workspace(stream_id_str, requester_user_id_str)
                 # Wait for stream_manager to pick it up
                 for _ in range(config.get("stream_ws_start_wait_attempts", 10)): 
                     async with stream_manager._lock:
                          current_stream_info_manager = stream_manager.active_streams.get(stream_id_str)
                     if current_stream_info_manager and current_stream_info_manager.get('status') == 'active':
-                        stream_is_active_in_manager = True; break
+                        stream_is_active_in_manager = True
+                        break
                     await asyncio.sleep(1.0)
                 if not stream_is_active_in_manager:
-                    db_state_after_start = await db_manager_global.execute_query("SELECT status, is_streaming from video_stream where stream_id = $1", (stream_id_uuid,), fetch_one=True)
+                    db_state_after_start = await db_manager_global.execute_query(
+                        "SELECT status, is_streaming from video_stream where stream_id = $1", 
+                        (stream_id_uuid,), fetch_one=True
+                    )
                     logger.warning(f"Stream {stream_id_str} failed to become active in StreamManager for WS. DB state: {db_state_after_start}")
-                    await websocket.send_json({"status": "error", "message": "Stream failed to initialize. Check server logs."}); await websocket.close(1011); return
+                    await websocket.send_json({"status": "error", "message": "Stream failed to initialize. Check server logs."})
+                    websocket_closed = True
+                    await websocket.close(1011)
+                    return
             except HTTPException as e_start:
-                await websocket.send_json({"status": "error", "message": f"Failed to start stream: {e_start.detail}"}); await websocket.close(1011); return
+                await websocket.send_json({"status": "error", "message": f"Failed to start stream: {e_start.detail}"})
+                websocket_closed = True
+                await websocket.close(1011)
+                return
 
         if not await stream_manager.connect_client_to_stream(stream_id_str, websocket):
-            await websocket.send_json({"status": "error", "message": "Failed to connect to active stream process."}); await websocket.close(1011); return
+            await websocket.send_json({"status": "error", "message": "Failed to connect to active stream process."})
+            websocket_closed = True
+            await websocket.close(1011)
+            return
 
-        # UPDATED: Include location data in connection response
+        # Check connection before sending confirmation
+        if websocket.client_state != WebSocketState.CONNECTED:
+            logging.warning(f"WebSocket disconnected before sending confirmation for {stream_id_str}")
+            return
+
+        # Send connection confirmation with location data
         await websocket.send_json({
             "status": "connected", 
             "message": f"Connected to stream: {s_name}",
@@ -3684,14 +2836,13 @@ async def websocket_workspace_stream(websocket: WebSocket): # Name kept from asy
             "owner": s_owner_username, 
             "workspace_id": str(s_workspace_id), 
             "your_role": requester_role_info.get("role"),
-            # NEW: Location information
             "location_info": location_data
         })
         
         ping_task = asyncio.create_task(send_ping(websocket))
         
-        target_fps = config.get("websocket_client_fps", 15.0) # Match stream_one.py (15fps)
-        target_frame_interval = 1.0 / target_fps if target_fps > 0 else 0.066 # (approx 15fps)
+        target_fps = config.get("websocket_client_fps", 15.0)
+        target_frame_interval = 1.0 / target_fps if target_fps > 0 else 0.066
 
         while websocket.client_state == WebSocketState.CONNECTED:
             latest_frame_b64 = None
@@ -3702,234 +2853,305 @@ async def websocket_workspace_stream(websocket: WebSocket): # Name kept from asy
                     stream_ok = True
                     latest_frame_np = stream_info.get('latest_frame')
                     if latest_frame_np is not None:
-                        # Consider if frame_to_base64 should be in executor if it's slow
-                        latest_frame_b64 = await asyncio.get_event_loop().run_in_executor(thread_pool, frame_to_base64, latest_frame_np)
+                        latest_frame_b64 = await asyncio.get_event_loop().run_in_executor(
+                            thread_pool, frame_to_base64, latest_frame_np
+                        )
             
             if not stream_ok:
-                await websocket.send_json({"status":"info", "message":"Stream ended or became inactive."}); break
+                if websocket.client_state == WebSocketState.CONNECTED:
+                    await websocket.send_json({"status":"info", "message":"Stream ended or became inactive."})
+                break
             
-            if latest_frame_b64:
-                await websocket.send_json({ # Match stream_one.py payload
-                    "stream_id": stream_id_str, "frame": latest_frame_b64,
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
+            if latest_frame_b64 and websocket.client_state == WebSocketState.CONNECTED:
+                try:
+                    await websocket.send_json({
+                        "stream_id": stream_id_str, 
+                        "frame": latest_frame_b64,
+                        "timestamp": datetime.now(timezone.utc).timestamp()
+                    })
+                except RuntimeError as e:
+                    if "close message has been sent" in str(e).lower():
+                        logging.debug(f"Frame send failed: WebSocket already closing for stream {stream_id_str}")
+                        break
+                    else:
+                        raise
             await asyncio.sleep(target_frame_interval)
+            
     except WebSocketDisconnect:
         logging.info(f"WS client disconnected from stream {stream_id_str or 'unknown'} (User: {user_id_for_log or 'unknown'})")
+        websocket_closed = True
     except asyncio.CancelledError:
         logging.info(f"WS task for stream {stream_id_str or 'unknown'} cancelled (User: {user_id_for_log or 'unknown'}).")
     except ValueError as ve: 
         logging.warning(f"WS stream error (User: {user_id_for_log or 'unknown'}, Stream: {stream_id_str or 'unknown'}): Invalid ID format - {ve}")
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try: await websocket.send_json({"status": "error", "message": "Invalid stream ID format."}); await websocket.close(1008)
-            except: pass # Ignore error on close if already closing
+        if not websocket_closed and websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.send_json({"status": "error", "message": "Invalid stream ID format."})
+                websocket_closed = True
+                await websocket.close(1008)
+            except:
+                pass
     except Exception as e:
         logging.error(f"WS stream error ({stream_id_str or 'unknown'}, User: {user_id_for_log or 'unknown'}): {e}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try: await websocket.send_json({"status": "error", "message": "Internal server error."}); await websocket.close(1011)
-            except: pass
-    finally:
-        if ping_task and not ping_task.done(): ping_task.cancel()
-        if stream_id_str: await stream_manager.disconnect_client(stream_id_str, websocket)
-        # Ensure websocket is closed if not already
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.close()
-
-@router.websocket("/notify1")
-async def websocket_notify1(websocket: WebSocket):
-    user_id_str: Optional[str] = None
-    username_for_log: Optional[str] = None
-    ping_task: Optional[asyncio.Task] = None
-
-    try:
-        await websocket.accept()
-        token = await session_manager_global.get_token_from_websocket(websocket)
-        if not token: # Payload match stream_one.py
-            await websocket.send_json({"status": "error", "message": "Authentication token required."}); await websocket.close(1008); return
-
-        token_data = await session_manager_global.verify_token(token, "access")
-        if not token_data or await session_manager_global.is_token_blacklisted(token): # Payload match
-            await websocket.send_json({"status": "error", "message": "Invalid or expired token."}); await websocket.close(1008); return
-        
-        user_id_str = token_data.user_id
-        user_db_data = await user_manager_global.get_user_by_id(UUID(user_id_str)) # Fetch user for logging
-        username_for_log = user_db_data.get("username") if user_db_data else f"user_{user_id_str}"
-            
-        await websocket.send_json({ # Payload match
-            "status": "connected", "message": "Connected to notification stream",
-            "server_time": datetime.now(timezone.utc).timestamp()
-        })
-        
-        # Get workspace_id from token if available, else None for all user's notifications.
-        # stream_one.py's initial_notifications: workspace_id_filter=None, include_read=False, limit=20
-        initial_notifications = await stream_manager.get_notifications(user_id_str, workspace_id_filter=None, include_read=False, limit=20)
-        if initial_notifications: # Payload match
-            await websocket.send_json({"type": "notifications_batch", "notifications": initial_notifications, "server_time": datetime.now(timezone.utc).timestamp()})
-        
-        if not await stream_manager.subscribe_to_notifications(user_id_str, websocket):
-            logging.warning(f"Notify WS: Failed to subscribe {username_for_log} post-connection.")
-            # Optionally close if subscription is critical, stream_one.py doesn't explicitly
-        
-        ping_task = asyncio.create_task(send_ping(websocket))
-
-        while websocket.client_state == WebSocketState.CONNECTED:
+        if not websocket_closed and websocket.client_state == WebSocketState.CONNECTED:
             try:
-                # Timeout from config, matching stream_one.py key
-                receive_timeout = float(config.get("websocket_receive_timeout", 45.0))
-                message = await asyncio.wait_for(websocket.receive_json(), timeout=receive_timeout)
-                
-                if message.get("type") == "pong": 
-                    logging.debug(f"Notification WS: Pong received from {username_for_log}")
-                    continue 
-                elif message.get("type") == "mark_read":
-                    notif_ids_raw = message.get("notification_ids") # stream_one uses "notification_ids"
-                    if isinstance(notif_ids_raw, list) and user_id_str:
-                        updated_count = 0
-                        valid_notif_ids_to_mark: List[UUID] = []
-                        for nid_str_raw in notif_ids_raw:
-                            try: valid_notif_ids_to_mark.append(UUID(str(nid_str_raw)))
-                            except ValueError: logging.warning(f"Invalid notification ID format for mark_read from {username_for_log}: {nid_str_raw}")
-                        
-                        if valid_notif_ids_to_mark:
-                            # Batched update would be more efficient for many IDs
-                            for nid_uuid in valid_notif_ids_to_mark:
-                                try:
-                                    res = await db_manager_global.execute_query(
-                                        "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3 AND is_read = FALSE",
-                                        (datetime.now(timezone.utc), nid_uuid, UUID(user_id_str)), return_rowcount=True
-                                    )
-                                    if res and res > 0: updated_count +=1
-                                except Exception as e_mark: logger.error(f"Error marking notification {nid_uuid} as read for {user_id_str}: {e_mark}")
-                        # Ack structure from stream_one.py
-                        await websocket.send_json({"type": "ack_mark_read", "ids": notif_ids_raw}) # Send back original list of IDs processed
-
-            except asyncio.TimeoutError: continue # No message from client, normal
-            except WebSocketDisconnect: break # Client disconnected
-            except asyncio.CancelledError: raise # Propagate cancellation
-            except Exception as e_recv:
-                logging.error(f"Notify WS: Error receiving from {username_for_log}: {e_recv}", exc_info=True); break
-    
-    except WebSocketDisconnect:
-        logging.info(f"Notify WS: Client {username_for_log or 'unknown'} disconnected.")
-    except asyncio.CancelledError:
-        logging.info(f"Notify WS task for {username_for_log or 'unknown'} cancelled.")
-    except Exception as e_outer:
-        logging.error(f"Notify WS: Outer error ({username_for_log or 'unknown'}): {e_outer}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try: await websocket.send_json({"status": "error", "message": "Internal server error."}) # Payload match
-            except: pass # Ignore error on close
+                await websocket.send_json({"status": "error", "message": "Internal server error."})
+                websocket_closed = True
+                await websocket.close(1011)
+            except:
+                pass
     finally:
-        if user_id_str: await stream_manager.unsubscribe_from_notifications(user_id_str, websocket)
-        if ping_task and not ping_task.done(): ping_task.cancel()
-        if websocket.client_state != WebSocketState.DISCONNECTED: await websocket.close()
-        logging.debug(f"Notify WS: Connection cleanup for {username_for_log or 'unknown'}.")
+        if ping_task and not ping_task.done():
+            ping_task.cancel()
+        if stream_id_str:
+            await stream_manager.disconnect_client(stream_id_str, websocket)
+        
+        # Close websocket safely only if not already closed
+        if not websocket_closed:
+            await _safe_close_websocket(websocket, user_id_for_log)
 
 @router.websocket("/notify")
 async def websocket_notify(websocket: WebSocket):
     user_id_str: Optional[str] = None
     username_for_log: Optional[str] = None
     ping_task: Optional[asyncio.Task] = None
+    websocket_closed = False
+    connection_start_time = time.time()
 
     try:
         await websocket.accept()
+        
+        # ADD connection delay to prevent rapid reconnections
+        await asyncio.sleep(0.5)
+        
         token = await session_manager_global.get_token_from_websocket(websocket)
-        if not token: # Payload match stream_one.py
-            await websocket.send_json({"status": "error", "message": "Authentication token required."}); await websocket.close(1008); return
+        if not token:
+            await websocket.send_json({"status": "error", "message": "Authentication token required."})
+            websocket_closed = True
+            await websocket.close(1008)
+            return
 
         token_data = await session_manager_global.verify_token(token, "access")
-        if not token_data or await session_manager_global.is_token_blacklisted(token): # Payload match
-            await websocket.send_json({"status": "error", "message": "Invalid or expired token."}); await websocket.close(1008); return
+        if not token_data or await session_manager_global.is_token_blacklisted(token):
+            await websocket.send_json({"status": "error", "message": "Invalid or expired token."})
+            websocket_closed = True
+            await websocket.close(1008)
+            return
         
         user_id_str = token_data.user_id
-        user_db_data = await user_manager_global.get_user_by_id(UUID(user_id_str)) # Fetch user for logging
+        user_db_data = await user_manager_global.get_user_by_id(UUID(user_id_str))
         username_for_log = user_db_data.get("username") if user_db_data else f"user_{user_id_str}"
+
+        # ADD connection stability check
+        if websocket.client_state != WebSocketState.CONNECTED:
+            logging.warning(f"WebSocket disconnected during authentication for {username_for_log}")
+            return
+        
+        # ADD connection rate limiting
+        connection_duration = time.time() - connection_start_time
+        if connection_duration < 2.0:  # If connection is too fast, add delay
+            await asyncio.sleep(2.0 - connection_duration)
+
+        logging.info(f"Notify WS: User {username_for_log} connected successfully")
             
-        await websocket.send_json({ # Payload match
-            "status": "connected", "message": "Connected to notification stream",
+        await websocket.send_json({
+            "status": "connected", 
+            "message": "Connected to notification stream",
             "server_time": datetime.now(timezone.utc).timestamp()
         })
         
-        # Get workspace_id from token if available, else None for all user's notifications.
-        # stream_one.py's initial_notifications: workspace_id_filter=None, include_read=False, limit=20
-        initial_notifications = await stream_manager.get_notifications(user_id_str, workspace_id_filter=None, include_read=False, limit=20)
+        # Get initial notifications with error handling
+        try:
+            initial_notifications = await stream_manager.get_notifications(
+                user_id_str, workspace_id_filter=None, include_read=False, limit=20
+            )
+            
+            # Send initial notifications if any and still connected
+            if initial_notifications and websocket.client_state == WebSocketState.CONNECTED:
+                formatted_notifications = []
+                for notification in initial_notifications:
+                    formatted_notifications.append({
+                        "id": notification.get("id"),
+                        "user_id": notification.get("user_id"),
+                        "workspace_id": notification.get("workspace_id"),
+                        "stream_id": notification.get("stream_id"),
+                        "camera_name": notification.get("camera_name"),
+                        "status": notification.get("status"),
+                        "message": notification.get("message"),
+                        "timestamp": notification.get("timestamp"),
+                        "read": notification.get("read", False)
+                    })
+                
+                await websocket.send_json({
+                    "type": "initial_notifications",
+                    "notifications": formatted_notifications,
+                    "count": len(formatted_notifications)
+                })
+        except Exception as e_notif:
+            logging.error(f"Error getting initial notifications for {username_for_log}: {e_notif}")
         
-        # Convert to the desired format matching HTTP GET response
-        formatted_notifications = []
-        for notification in initial_notifications:
-            formatted_notifications.append({
-                "id": notification.get("notification_id"),
-                "user_id": notification.get("user_id"),
-                "workspace_id": notification.get("workspace_id"),
-                "stream_id": notification.get("stream_id"),
-                "camera_name": notification.get("camera_name"),
-                "status": notification.get("status"),
-                "message": notification.get("message"),
-                "timestamp": notification.get("created_at").timestamp() if notification.get("created_at") else datetime.now(timezone.utc).timestamp(),
-                "read": notification.get("is_read", False)
-            })
-        
-        if formatted_notifications: # Payload match
-            await websocket.send_json(formatted_notifications)  # Send as array directly
-        
-        if not await stream_manager.subscribe_to_notifications(user_id_str, websocket):
+        # Subscribe to notifications
+        subscription_success = await stream_manager.subscribe_to_notifications(user_id_str, websocket)
+        if not subscription_success:
             logging.warning(f"Notify WS: Failed to subscribe {username_for_log} post-connection.")
-            # Optionally close if subscription is critical, stream_one.py doesn't explicitly
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json({
+                    "status": "warning", 
+                    "message": "Subscription failed, notifications may be delayed"
+                })
         
-        ping_task = asyncio.create_task(send_ping(websocket))
+        # ADD ping with longer interval for stability
+        ping_task = asyncio.create_task(send_ping_with_stability_check(websocket, username_for_log))
+        logging.info(f"Notify WS: Setup complete for {username_for_log}, entering message loop")
 
-        while websocket.client_state == WebSocketState.CONNECTED:
+        # Main message loop with improved error handling
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        while websocket.client_state == WebSocketState.CONNECTED and consecutive_errors < max_consecutive_errors:
             try:
-                # Timeout from config, matching stream_one.py key
-                receive_timeout = float(config.get("websocket_receive_timeout", 45.0))
+                receive_timeout = float(config.get("websocket_receive_timeout", 60.0))  # Increased timeout
                 message = await asyncio.wait_for(websocket.receive_json(), timeout=receive_timeout)
+                
+                # Reset error counter on successful message
+                consecutive_errors = 0
                 
                 if message.get("type") == "pong": 
                     logging.debug(f"Notification WS: Pong received from {username_for_log}")
-                    continue 
+                    continue
+                    
                 elif message.get("type") == "mark_read":
-                    notif_ids_raw = message.get("notification_ids") # stream_one uses "notification_ids"
-                    if isinstance(notif_ids_raw, list) and user_id_str:
-                        updated_count = 0
-                        valid_notif_ids_to_mark: List[UUID] = []
-                        for nid_str_raw in notif_ids_raw:
-                            try: valid_notif_ids_to_mark.append(UUID(str(nid_str_raw)))
-                            except ValueError: logging.warning(f"Invalid notification ID format for mark_read from {username_for_log}: {nid_str_raw}")
-                        
-                        if valid_notif_ids_to_mark:
-                            # Batched update would be more efficient for many IDs
-                            for nid_uuid in valid_notif_ids_to_mark:
-                                try:
-                                    res = await db_manager_global.execute_query(
-                                        "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3 AND is_read = FALSE",
-                                        (datetime.now(timezone.utc), nid_uuid, UUID(user_id_str)), return_rowcount=True
-                                    )
-                                    if res and res > 0: updated_count +=1
-                                except Exception as e_mark: logger.error(f"Error marking notification {nid_uuid} as read for {user_id_str}: {e_mark}")
-                        # Ack structure from stream_one.py
-                        await websocket.send_json({"type": "ack_mark_read", "ids": notif_ids_raw}) # Send back original list of IDs processed
+                    await handle_mark_read_message(message, user_id_str, username_for_log, websocket)
+                
+                elif message.get("type") == "acknowledge_fire_alert":
+                    alert_id = message.get("alert_id")
+                    logging.info(f"Fire alert {alert_id} acknowledged by {username_for_log}")
+                            
+                else:
+                    logging.warning(f"Unknown message type from {username_for_log}: {message.get('type')}")
 
-            except asyncio.TimeoutError: continue # No message from client, normal
-            except WebSocketDisconnect: break # Client disconnected
-            except asyncio.CancelledError: raise # Propagate cancellation
+            except asyncio.TimeoutError:
+                # Send keepalive on timeout
+                if websocket.client_state == WebSocketState.CONNECTED:
+                    try:
+                        await websocket.send_json({
+                            "type": "keepalive", 
+                            "server_time": datetime.now(timezone.utc).timestamp()
+                        })
+                    except Exception:
+                        break
+                continue
+                
+            except WebSocketDisconnect:
+                logging.info(f"Notify WS: Client {username_for_log} disconnected normally")
+                websocket_closed = True
+                break
+                
             except Exception as e_recv:
-                logging.error(f"Notify WS: Error receiving from {username_for_log}: {e_recv}", exc_info=True); break
+                consecutive_errors += 1
+                logging.error(f"Notify WS: Error receiving from {username_for_log} (#{consecutive_errors}): {e_recv}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logging.error(f"Too many consecutive errors for {username_for_log}, closing connection")
+                    break
+                    
+                await asyncio.sleep(1.0)  # Brief pause before retrying
     
     except WebSocketDisconnect:
         logging.info(f"Notify WS: Client {username_for_log or 'unknown'} disconnected.")
-    except asyncio.CancelledError:
-        logging.info(f"Notify WS task for {username_for_log or 'unknown'} cancelled.")
+        websocket_closed = True
     except Exception as e_outer:
         logging.error(f"Notify WS: Outer error ({username_for_log or 'unknown'}): {e_outer}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try: await websocket.send_json({"status": "error", "message": "Internal server error."}) # Payload match
-            except: pass # Ignore error on close
+        if not websocket_closed and websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.send_json({"status": "error", "message": "Internal server error."})
+                websocket_closed = True
+                await websocket.close(1011)
+            except Exception:
+                pass
     finally:
-        if user_id_str: await stream_manager.unsubscribe_from_notifications(user_id_str, websocket)
-        if ping_task and not ping_task.done(): ping_task.cancel()
-        if websocket.client_state != WebSocketState.DISCONNECTED: await websocket.close()
-        logging.debug(f"Notify WS: Connection cleanup for {username_for_log or 'unknown'}.")
+        # Cleanup with improved error handling
+        if ping_task and not ping_task.done():
+            ping_task.cancel()
+            try:
+                await asyncio.wait_for(ping_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
 
-@router.get("/notify") # HTTP GET, matches stream_one.py
+        if user_id_str:
+            try:
+                await stream_manager.unsubscribe_from_notifications(user_id_str, websocket)
+            except Exception as e_unsub:
+                logging.error(f"Error unsubscribing {username_for_log}: {e_unsub}")
+
+        if not websocket_closed:
+            await _safe_close_websocket(websocket, username_for_log)
+
+async def send_ping_with_stability_check(websocket: WebSocket, username_for_log: str):
+    try:
+        ping_interval = float(config.get("websocket_ping_interval", 45.0))  # Longer interval
+        consecutive_ping_failures = 0
+        max_ping_failures = 3
+        
+        while (websocket.client_state == WebSocketState.CONNECTED and 
+               consecutive_ping_failures < max_ping_failures):
+            await asyncio.sleep(ping_interval)
+            
+            if websocket.client_state == WebSocketState.CONNECTED:
+                try:
+                    await websocket.send_json({
+                        "type": "ping", 
+                        "timestamp": datetime.now(timezone.utc).timestamp()
+                    })
+                    consecutive_ping_failures = 0  # Reset on success
+                except Exception as e:
+                    consecutive_ping_failures += 1
+                    logging.warning(f"Ping failed for {username_for_log} (#{consecutive_ping_failures}): {e}")
+                    if consecutive_ping_failures >= max_ping_failures:
+                        break
+            else:
+                break
+                
+    except Exception as e:
+        logging.debug(f"Ping task ended for {username_for_log}: {e}")
+
+async def handle_mark_read_message(message: dict, user_id_str: str, username_for_log: str, websocket: WebSocket):
+    try:
+        notif_ids_raw = message.get("notification_ids", [])
+        if isinstance(notif_ids_raw, list) and user_id_str:
+            updated_count = 0
+            valid_notif_ids_to_mark: List[UUID] = []
+            
+            for nid_str_raw in notif_ids_raw:
+                try:
+                    valid_notif_ids_to_mark.append(UUID(str(nid_str_raw)))
+                except ValueError:
+                    logging.warning(f"Invalid notification ID format for mark_read from {username_for_log}: {nid_str_raw}")
+            
+            if valid_notif_ids_to_mark:
+                for nid_uuid in valid_notif_ids_to_mark:
+                    try:
+                        res = await db_manager_global.execute_query(
+                            "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3 AND is_read = FALSE",
+                            (datetime.now(timezone.utc), nid_uuid, UUID(user_id_str)), 
+                            return_rowcount=True
+                        )
+                        if res and res > 0:
+                            updated_count += 1
+                    except Exception as e_mark:
+                        logging.error(f"Error marking notification {nid_uuid} as read for {user_id_str}: {e_mark}")
+            
+            # Send acknowledgment
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json({
+                    "type": "ack_mark_read", 
+                    "ids": notif_ids_raw, 
+                    "updated_count": updated_count
+                })
+    except Exception as e:
+        logging.error(f"Error handling mark_read for {username_for_log}: {e}")
+
+@router.get("/notify")
 async def get_http_notifications(
     since: Optional[float] = Query(None, description="Timestamp (seconds since epoch) to get notifications from"),
     limit: int = Query(50, ge=1, le=200),
@@ -3950,7 +3172,7 @@ async def get_http_notifications(
         logging.error(f"Error getting HTTP notifications for user {username_for_log}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to get notifications: {str(e)}") # Match stream_one
 
-@router.post("/notify/{notification_id_str}/read") # Matches stream_one.py
+@router.post("/notify/{notification_id_str}/read")
 async def mark_notification_read_endpoint(
     notification_id_str: str,
     current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
@@ -3978,2306 +3200,463 @@ async def mark_notification_read_endpoint(
         logging.error(f"Error marking notification {notification_id_str} as read for {username_for_log}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to mark notification as read: {str(e)}")
 
-@router.post("/streams/{stream_id}/thresholds")
-async def update_stream_thresholds(
-    stream_id: str,
-    settings: ThresholdSettings,
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    """Update count thresholds for a specific stream."""
-    try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        stream_id_uuid = UUID(stream_id)
-        
-        # Verify stream exists and user has access
-        stream_info = await db_manager_global.execute_query(
-            "SELECT workspace_id, name FROM video_stream WHERE stream_id = $1",
-            (stream_id_uuid,), fetch_one=True
-        )
-        
-        if not stream_info:
-            raise HTTPException(status_code=404, detail="Stream not found")
-        
-        # Check workspace membership
-        await check_workspace_membership_and_get_role(UUID(requester_user_id_str), stream_info['workspace_id'])
-        
-        # Validate thresholds
-        if (settings.count_threshold_greater is not None and 
-            settings.count_threshold_less is not None and 
-            settings.count_threshold_greater <= settings.count_threshold_less):
-            raise HTTPException(status_code=400, detail="Greater threshold must be higher than less threshold")
-        
-        # Update thresholds
-        await db_manager_global.execute_query(
-            """UPDATE video_stream 
-               SET count_threshold_greater = $1, count_threshold_less = $2, 
-                   alert_enabled = $3, updated_at = NOW() 
-               WHERE stream_id = $4""",
-            (settings.count_threshold_greater, settings.count_threshold_less, 
-             settings.alert_enabled, stream_id_uuid)
-        )
-        
-        return JSONResponse(content={
-            "status": "success",
-            "message": f"Thresholds updated for stream '{stream_info['name']}'",
-            "settings": {
-                "count_threshold_greater": settings.count_threshold_greater,
-                "count_threshold_less": settings.count_threshold_less,
-                "alert_enabled": settings.alert_enabled
-            }
-        })
-        
-    except HTTPException:
-        raise
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid stream ID format")
-    except Exception as e:
-        logging.error(f"Error updating stream thresholds: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@router.get("/streams/{stream_id}/thresholds")
-async def get_stream_thresholds(
+@router.get("/debug/fire-cooldown/{stream_id}")
+async def debug_fire_cooldown_status(
     stream_id: str,
     current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
 ):
-    """Get count thresholds for a specific stream."""
+    """Debug endpoint to check fire notification cooldown status"""
     try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        stream_id_uuid = UUID(stream_id)
-        
-        # Get stream info with thresholds
-        stream_info = await db_manager_global.execute_query(
-            """SELECT vs.workspace_id, vs.name, vs.count_threshold_greater, 
-                      vs.count_threshold_less, vs.alert_enabled
-               FROM video_stream vs WHERE vs.stream_id = $1""",
-            (stream_id_uuid,), fetch_one=True
-        )
-        
-        if not stream_info:
-            raise HTTPException(status_code=404, detail="Stream not found")
-        
-        # Check workspace membership
-        await check_workspace_membership_and_get_role(UUID(requester_user_id_str), stream_info['workspace_id'])
-        
+        status = await stream_manager.get_fire_notification_cooldown_status(stream_id)
         return JSONResponse(content={
             "status": "success",
-            "stream_id": stream_id,
-            "name": stream_info['name'],
-            "thresholds": {
-                "count_threshold_greater": stream_info.get('count_threshold_greater'),
-                "count_threshold_less": stream_info.get('count_threshold_less'),
-                "alert_enabled": stream_info.get('alert_enabled', False)
-            }
+            "cooldown_info": status,
+            "current_time": time.time(),
+            "server_time": datetime.now(timezone.utc).isoformat()
         })
-        
-    except HTTPException:
-        raise
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid stream ID format")
     except Exception as e:
-        logging.error(f"Error getting stream thresholds: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"Error getting fire cooldown status for {stream_id}: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-@router.get("/workspaces/{workspace_id}/alert-streams")
-async def get_workspace_alert_streams(
-    workspace_id: str,
+@router.get("/debug/fire-state/{stream_id}")
+async def debug_fire_state(
+    stream_id: str,
     current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
 ):
-    """Get all streams with alerts enabled in a workspace."""
+    """Debug endpoint to check persistent fire state"""
     try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        workspace_id_uuid = UUID(workspace_id)
-        
-        # Check workspace membership
-        await check_workspace_membership_and_get_role(UUID(requester_user_id_str), workspace_id_uuid)
-        
-        # Get streams with alerts enabled
-        alert_streams = await db_manager_global.execute_query(
-            """SELECT stream_id, name, location, area, building, zone,
-                      count_threshold_greater, count_threshold_less, 
-                      alert_enabled, status, is_streaming
-               FROM video_stream 
-               WHERE workspace_id = $1 AND alert_enabled = TRUE
-               ORDER BY building, zone, area, location, name""",
-            (workspace_id_uuid,), fetch_all=True
-        )
-        
-        formatted_streams = [{
-            "stream_id": str(s["stream_id"]),
-            "name": s["name"],
-            "location": s["location"],
-            "area": s["area"],
-            "building": s["building"],
-            "zone": s["zone"],
-            "status": s["status"],
-            "is_streaming": s["is_streaming"],
-            "thresholds": {
-                "count_threshold_greater": s.get('count_threshold_greater'),
-                "count_threshold_less": s.get('count_threshold_less'),
-                "alert_enabled": s.get('alert_enabled', False)
-            }
-        } for s in alert_streams or []]
-        
-        return JSONResponse(content={
-            "status": "success",
-            "workspace_id": workspace_id,
-            "alert_streams": formatted_streams,
-            "total": len(formatted_streams)
-        })
-        
-    except HTTPException:
-        raise
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid workspace ID format")
-    except Exception as e:
-        logging.error(f"Error getting workspace alert streams: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-# === LOCATION-BASED STREAM MANAGEMENT ENDPOINTS ===
-
-@router.post("/streams/start-by-location")
-async def start_streams_by_location(
-    location: Optional[str] = Query(None),
-    area: Optional[str] = Query(None),
-    building: Optional[str] = Query(None),
-    zone: Optional[str] = Query(None),
-    floor_level: Optional[str] = Query(None),
-    workspace_id: Optional[str] = Query(None, description="Specific workspace ID (optional)"),
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    """Start all streams matching the specified location criteria."""
-    try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        requester_username = current_user_data["username"]
-        
-        # Build query to find matching streams
-        base_query = """
-            SELECT vs.stream_id, vs.name, vs.user_id, vs.workspace_id, vs.location, vs.area, 
-                   vs.building, vs.zone, vs.floor_level,
-                   u.username as owner_username, u.is_active as owner_is_active,
-                   u.is_subscribed as owner_is_subscribed, u.count_of_camera as owner_camera_limit,
-                   u.role as owner_system_role, w.name as workspace_name
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1 AND vs.is_streaming = FALSE
-        """
-        
-        params = [UUID(requester_user_id_str)]
-        param_count = 1
-        
-        # Add location filters
-        if workspace_id:
-            param_count += 1
-            base_query += f" AND vs.workspace_id = ${param_count}"
-            params.append(UUID(workspace_id))
-        if location:
-            param_count += 1
-            base_query += f" AND vs.location = ${param_count}"
-            params.append(location)
-        if area:
-            param_count += 1
-            base_query += f" AND vs.area = ${param_count}"
-            params.append(area)
-        if building:
-            param_count += 1
-            base_query += f" AND vs.building = ${param_count}"
-            params.append(building)
-        if zone:
-            param_count += 1
-            base_query += f" AND vs.zone = ${param_count}"
-            params.append(zone)
-        if floor_level:
-            param_count += 1
-            base_query += f" AND vs.floor_level = ${param_count}"
-            params.append(floor_level)
-            
-        base_query += " ORDER BY vs.workspace_id, vs.building, vs.zone, vs.area, vs.location, vs.name"
-        
-        streams_to_consider = await db_manager_global.execute_query(base_query, tuple(params), fetch_all=True)
-        streams_to_consider = streams_to_consider or []
-        
-        if not streams_to_consider:
-            return JSONResponse(content={
-                "status": "info",
-                "message": "No inactive streams found matching the specified location criteria",
-                "filters_applied": {
-                    "location": location,
-                    "area": area,
-                    "building": building,
-                    "zone": zone,
-                    "floor_level": floor_level,
-                    "workspace_id": workspace_id
-                },
-                "streams_processed": 0,
-                "streams_started": 0,
-                "details": []
-            })
-        
-        # Get current active stream counts per owner per workspace
-        workspace_ids = list(set(str(s['workspace_id']) for s in streams_to_consider))
-        workspace_placeholders = ','.join([f'${i+1}' for i in range(len(workspace_ids))])
-        
-        owner_active_streams_query = f"""
-            SELECT user_id, workspace_id, COUNT(*) as active_count 
-            FROM video_stream
-            WHERE workspace_id IN ({workspace_placeholders}) AND is_streaming = TRUE 
-            GROUP BY user_id, workspace_id
-        """
-        active_counts_db = await db_manager_global.execute_query(
-            owner_active_streams_query, 
-            tuple(UUID(wid) for wid in workspace_ids), 
-            fetch_all=True
-        )
-        active_counts_db = active_counts_db or []
-        
-        # Create lookup map: (user_id, workspace_id) -> active_count
-        owner_active_streams_map = {
-            (row['user_id'], row['workspace_id']): row['active_count'] 
-            for row in active_counts_db
-        }
-        
-        results = []
-        streams_started_count = 0
-        streams_processed_count = len(streams_to_consider)
-        
-        for stream_data in streams_to_consider:
-            stream_id = stream_data['stream_id']
-            stream_name = stream_data['name']
-            owner_id = stream_data['user_id']
-            ws_id = stream_data['workspace_id']
-            
-            # Check owner eligibility
-            if not stream_data['owner_is_active']:
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data['location'],
-                        "area": stream_data['area'],
-                        "building": stream_data['building'],
-                        "zone": stream_data['zone'],
-                        "floor_level": stream_data['floor_level']
-                    },
-                    "status": "skipped",
-                    "message": "Stream owner is inactive"
-                })
-                continue
-                
-            if not stream_data['owner_is_subscribed'] and stream_data['owner_system_role'] != 'admin':
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data['location'],
-                        "area": stream_data['area'],
-                        "building": stream_data['building'],
-                        "zone": stream_data['zone'],
-                        "floor_level": stream_data['floor_level']
-                    },
-                    "status": "skipped",
-                    "message": "Stream owner not subscribed (and not admin)"
-                })
-                continue
-            
-            # Check camera limits
-            owner_limit = stream_data['owner_camera_limit']
-            current_owner_active_count = owner_active_streams_map.get((owner_id, ws_id), 0)
-            
-            if stream_data['owner_system_role'] != 'admin' and current_owner_active_count >= owner_limit:
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data['location'],
-                        "area": stream_data['area'],
-                        "building": stream_data['building'],
-                        "zone": stream_data['zone'],
-                        "floor_level": stream_data['floor_level']
-                    },
-                    "status": "skipped",
-                    "message": f"Owner camera limit ({owner_limit}) reached"
-                })
-                continue
-            
-            # Start the stream
-            await db_manager_global.execute_query(
-                "UPDATE video_stream SET is_streaming = TRUE, status = 'processing', updated_at = $1 WHERE stream_id = $2",
-                (datetime.now(timezone.utc), stream_id)
-            )
-            
-            streams_started_count += 1
-            owner_active_streams_map[(owner_id, ws_id)] = current_owner_active_count + 1
-            
-            results.append({
-                "stream_id": str(stream_id),
-                "name": stream_name,
-                "workspace": stream_data['workspace_name'],
-                "location_info": {
-                    "location": stream_data['location'],
-                    "area": stream_data['area'],
-                    "building": stream_data['building'],
-                    "zone": stream_data['zone'],
-                    "floor_level": stream_data['floor_level']
-                },
-                "status": "initiated",
-                "message": "Stream start initiated"
-            })
-        
-        status = "success" if streams_started_count == streams_processed_count else "partial_success"
-        if streams_started_count == 0:
-            status = "info"
-            
-        return JSONResponse(content={
-            "status": status,
-            "message": f"Started {streams_started_count} of {streams_processed_count} streams matching location criteria",
-            "filters_applied": {
-                "location": location,
-                "area": area,
-                "building": building,
-                "zone": zone,
-                "floor_level": floor_level,
-                "workspace_id": workspace_id
-            },
-            "streams_processed": streams_processed_count,
-            "streams_started": streams_started_count,
-            "details": results
-        })
-        
-    except Exception as e:
-        logging.error(f"Error starting streams by location: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={
-            "status": "error",
-            "message": "Internal server error",
-            "filters_applied": {
-                "location": location,
-                "area": area,
-                "building": building,
-                "zone": zone,
-                "floor_level": floor_level,
-                "workspace_id": workspace_id
-            }
-        })
-
-@router.post("/streams/stop-by-location")
-async def stop_streams_by_location(
-    location: Optional[str] = Query(None),
-    area: Optional[str] = Query(None),
-    building: Optional[str] = Query(None),
-    zone: Optional[str] = Query(None),
-    floor_level: Optional[str] = Query(None),
-    workspace_id: Optional[str] = Query(None, description="Specific workspace ID (optional)"),
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    """Stop all streams matching the specified location criteria."""
-    try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        requester_username = current_user_data["username"]
-        
-        # Build query to find matching active streams
-        base_query = """
-            SELECT vs.stream_id, vs.name, vs.user_id, vs.workspace_id, vs.location, vs.area,
-                   vs.building, vs.zone, vs.floor_level, w.name as workspace_name
-            FROM video_stream vs
-            JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1 AND vs.is_streaming = TRUE
-        """
-        
-        params = [UUID(requester_user_id_str)]
-        param_count = 1
-        
-        # Add location filters
-        if workspace_id:
-            param_count += 1
-            base_query += f" AND vs.workspace_id = ${param_count}"
-            params.append(UUID(workspace_id))
-        if location:
-            param_count += 1
-            base_query += f" AND vs.location = ${param_count}"
-            params.append(location)
-        if area:
-            param_count += 1
-            base_query += f" AND vs.area = ${param_count}"
-            params.append(area)
-        if building:
-            param_count += 1
-            base_query += f" AND vs.building = ${param_count}"
-            params.append(building)
-        if zone:
-            param_count += 1
-            base_query += f" AND vs.zone = ${param_count}"
-            params.append(zone)
-        if floor_level:
-            param_count += 1
-            base_query += f" AND vs.floor_level = ${param_count}"
-            params.append(floor_level)
-            
-        base_query += " ORDER BY vs.workspace_id, vs.building, vs.zone, vs.area, vs.location, vs.name"
-        
-        streams_to_stop = await db_manager_global.execute_query(base_query, tuple(params), fetch_all=True)
-        streams_to_stop = streams_to_stop or []
-        
-        if not streams_to_stop:
-            return JSONResponse(content={
-                "status": "info",
-                "message": "No active streams found matching the specified location criteria",
-                "filters_applied": {
-                    "location": location,
-                    "area": area,
-                    "building": building,
-                    "zone": zone,
-                    "floor_level": floor_level,
-                    "workspace_id": workspace_id
-                },
-                "streams_processed": 0,
-                "streams_stopped": 0,
-                "details": []
-            })
-        
-        results = []
-        streams_stopped_count = 0
-        streams_processed_count = len(streams_to_stop)
-        
-        for stream_data in streams_to_stop:
-            stream_id = stream_data['stream_id']
-            stream_name = stream_data['name']
-            owner_id = stream_data['user_id']
-            ws_id = stream_data['workspace_id']
-            
-            updated_rows = await db_manager_global.execute_query(
-                "UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', updated_at = $1 WHERE stream_id = $2 AND is_streaming = TRUE",
-                (datetime.now(timezone.utc), stream_id), return_rowcount=True
-            )
-            
-            if updated_rows and updated_rows > 0:
-                streams_stopped_count += 1
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data['location'],
-                        "area": stream_data['area'],
-                        "building": stream_data['building'],
-                        "zone": stream_data['zone'],
-                        "floor_level": stream_data['floor_level']
-                    },
-                    "status": "stopped",
-                    "message": "Stream stop request processed"
-                })
-                
-                # Send notification
-                await stream_manager.add_notification(
-                    str(owner_id), str(ws_id), str(stream_id), stream_name, 
-                    "inactive", f"Camera '{stream_name}' stopped by {requester_username} (location-based action)"
-                )
-            else:
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data['location'],
-                        "area": stream_data['area'],
-                        "building": stream_data['building'],
-                        "zone": stream_data['zone'],
-                        "floor_level": stream_data['floor_level']
-                    },
-                    "status": "skipped",
-                    "message": "Stream already stopped or issue occurred"
-                })
-        
-        status = "success" if streams_stopped_count == streams_processed_count else "partial_success"
-        if streams_stopped_count == 0:
-            status = "info"
-            
-        return JSONResponse(content={
-            "status": status,
-            "message": f"Stopped {streams_stopped_count} of {streams_processed_count} streams matching location criteria",
-            "filters_applied": {
-                "location": location,
-                "area": area,
-                "building": building,
-                "zone": zone,
-                "floor_level": floor_level,
-                "workspace_id": workspace_id
-            },
-            "streams_processed": streams_processed_count,
-            "streams_stopped": streams_stopped_count,
-            "details": results
-        })
-        
-    except Exception as e:
-        logging.error(f"Error stopping streams by location: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={
-            "status": "error",
-            "message": "Internal server error",
-            "filters_applied": {
-                "location": location,
-                "area": area,
-                "building": building,
-                "zone": zone,
-                "floor_level": floor_level,
-                "workspace_id": workspace_id
-            }
-        })
-
-# === WEBSOCKET ENDPOINTS FOR LOCATION-BASED STREAMING ===
-
-@router.websocket("/stream/by-location")
-async def websocket_location_stream(websocket: WebSocket):
-    """WebSocket endpoint for streaming multiple cameras by location criteria."""
-    user_id_for_log: Optional[str] = None
-    ping_task: Optional[asyncio.Task] = None
-    connected_streams: Dict[str, bool] = {}
-    
-    try:
-        await websocket.accept()
-        query_params = dict(websocket.query_params)
-        
-        # Extract location filters from query parameters
-        location = query_params.get("location")
-        area = query_params.get("area")
-        building = query_params.get("building")
-        zone = query_params.get("zone")
-        floor_level = query_params.get("floor_level")
-        workspace_id = query_params.get("workspace_id")
-        
-        # Validate that at least one filter is provided
-        if not any([location, area, building, zone, floor_level]):
-            await websocket.send_json({
-                "status": "error", 
-                "message": "At least one location filter (location, area, building, zone, floor_level) is required"
-            })
-            await websocket.close(1008)
-            return
-        
-        # Authenticate user
-        token = await session_manager_global.get_token_from_websocket(websocket)
-        if not token:
-            await websocket.send_json({"status": "error", "message": "Authentication token required"})
-            await websocket.close(1008)
-            return
-            
-        token_data = await session_manager_global.verify_token(token, "access")
-        if not token_data or await session_manager_global.is_token_blacklisted(token):
-            await websocket.send_json({"status": "error", "message": "Invalid or expired token"})
-            await websocket.close(1008)
-            return
-            
-        user_id_for_log = token_data.user_id
-        
-        # Find matching streams
-        base_query = """
-            SELECT vs.stream_id, vs.name, vs.workspace_id, vs.is_streaming, vs.status,
-                   vs.location, vs.area, vs.building, vs.zone, vs.floor_level,
-                   u.username as owner_username, w.name as workspace_name
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1
-        """
-        
-        params = [UUID(user_id_for_log)]
-        param_count = 1
-        
-        # Add location filters
-        if workspace_id:
-            param_count += 1
-            base_query += f" AND vs.workspace_id = ${param_count}"
-            params.append(UUID(workspace_id))
-        if location:
-            param_count += 1
-            base_query += f" AND vs.location = ${param_count}"
-            params.append(location)
-        if area:
-            param_count += 1
-            base_query += f" AND vs.area = ${param_count}"
-            params.append(area)
-        if building:
-            param_count += 1
-            base_query += f" AND vs.building = ${param_count}"
-            params.append(building)
-        if zone:
-            param_count += 1
-            base_query += f" AND vs.zone = ${param_count}"
-            params.append(zone)
-        if floor_level:
-            param_count += 1
-            base_query += f" AND vs.floor_level = ${param_count}"
-            params.append(floor_level)
-            
-        base_query += " ORDER BY vs.building, vs.zone, vs.area, vs.location, vs.name"
-        
-        matching_streams = await db_manager_global.execute_query(base_query, tuple(params), fetch_all=True)
-        matching_streams = matching_streams or []
-        
-        if not matching_streams:
-            await websocket.send_json({
-                "status": "error",
-                "message": "No streams found matching the specified location criteria"
-            })
-            await websocket.close(1008)
-            return
-        
-        # Connect to each matching stream
-        active_streams = []
-        for stream_data in matching_streams:
-            stream_id_str = str(stream_data['stream_id'])
-            
-            # Try to connect to active streams or start inactive ones
-            if stream_data['is_streaming'] and stream_data['status'] == 'active':
-                if await stream_manager.connect_client_to_stream(stream_id_str, websocket):
-                    connected_streams[stream_id_str] = True
-                    active_streams.append({
-                        "stream_id": stream_id_str,
-                        "name": stream_data['name'],
-                        "status": "connected",
-                        "location_info": {
-                            "location": stream_data['location'],
-                            "area": stream_data['area'],
-                            "building": stream_data['building'],
-                            "zone": stream_data['zone'],
-                            "floor_level": stream_data['floor_level']
-                        }
-                    })
-                else:
-                    active_streams.append({
-                        "stream_id": stream_id_str,
-                        "name": stream_data['name'],
-                        "status": "connection_failed",
-                        "location_info": {
-                            "location": stream_data['location'],
-                            "area": stream_data['area'],
-                            "building": stream_data['building'],
-                            "zone": stream_data['zone'],
-                            "floor_level": stream_data['floor_level']
-                        }
-                    })
-            else:
-                active_streams.append({
-                    "stream_id": stream_id_str,
-                    "name": stream_data['name'],
-                    "status": "inactive",
-                    "location_info": {
-                        "location": stream_data['location'],
-                        "area": stream_data['area'],
-                        "building": stream_data['building'],
-                        "zone": stream_data['zone'],
-                        "floor_level": stream_data['floor_level']
-                    }
-                })
-        
-        # Send connection confirmation
-        await websocket.send_json({
-            "status": "connected",
-            "message": f"Connected to location-based stream",
-            "filters_applied": {
-                "location": location,
-                "area": area,
-                "building": building,
-                "zone": zone,
-                "floor_level": floor_level,
-                "workspace_id": workspace_id
-            },
-            "streams": active_streams,
-            "total_streams": len(matching_streams),
-            "connected_streams": len([s for s in active_streams if s["status"] == "connected"])
-        })
-        
-        if not connected_streams:
-            await websocket.send_json({
-                "status": "info",
-                "message": "No active streams to display. All streams in the specified location are inactive."
-            })
-            await websocket.close(1000)
-            return
-        
-        ping_task = asyncio.create_task(send_ping(websocket))
-        
-        # Stream frames from all connected streams
-        target_fps = config.get("websocket_client_fps", 15.0)
-        target_frame_interval = 1.0 / target_fps if target_fps > 0 else 0.066
-        
-        while websocket.client_state == WebSocketState.CONNECTED and connected_streams:
-            frames_data = []
-            streams_still_active = {}
-            
-            # Collect frames from all connected streams
-            async with stream_manager._lock:
-                for stream_id_str in list(connected_streams.keys()):
-                    stream_info = stream_manager.active_streams.get(stream_id_str, {})
-                    
-                    if stream_info and stream_info.get('status') == 'active':
-                        streams_still_active[stream_id_str] = True
-                        latest_frame_np = stream_info.get('latest_frame')
-                        
-                        if latest_frame_np is not None:
-                            try:
-                                frame_b64 = await asyncio.get_event_loop().run_in_executor(
-                                    thread_pool, frame_to_base64, latest_frame_np
-                                )
-                                
-                                # Find stream details for this frame
-                                stream_details = next(
-                                    (s for s in matching_streams if str(s['stream_id']) == stream_id_str), 
-                                    None
-                                )
-                                
-                                frames_data.append({
-                                    "stream_id": stream_id_str,
-                                    "name": stream_details['name'] if stream_details else "Unknown",
-                                    "frame": frame_b64,
-                                    "location_info": {
-                                        "location": stream_details['location'] if stream_details else None,
-                                        "area": stream_details['area'] if stream_details else None,
-                                        "building": stream_details['building'] if stream_details else None,
-                                        "zone": stream_details['zone'] if stream_details else None,
-                                        "floor_level": stream_details['floor_level'] if stream_details else None
-                                    } if stream_details else {}
-                                })
-                            except Exception as e:
-                                logging.error(f"Error processing frame for stream {stream_id_str}: {e}")
-                    else:
-                        # Stream is no longer active, remove from connected streams
-                        await stream_manager.disconnect_client(stream_id_str, websocket)
-            
-            # Update connected streams to only include active ones
-            connected_streams = streams_still_active
-            
-            if not connected_streams:
-                await websocket.send_json({
-                    "status": "info",
-                    "message": "All streams have ended or become inactive"
-                })
-                break
-            
-            # Send frames if any are available
-            if frames_data:
-                await websocket.send_json({
-                    "type": "multi_stream_frames",
-                    "frames": frames_data,
-                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                    "active_streams": len(connected_streams)
-                })
-            
-            await asyncio.sleep(target_frame_interval)
-            
-    except WebSocketDisconnect:
-        logging.info(f"Location-based WS client disconnected (User: {user_id_for_log or 'unknown'})")
-    except asyncio.CancelledError:
-        logging.info(f"Location-based WS task cancelled (User: {user_id_for_log or 'unknown'})")
-    except ValueError as ve:
-        logging.warning(f"Location-based WS error: Invalid ID format - {ve}")
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.send_json({"status": "error", "message": "Invalid ID format"})
-                await websocket.close(1008)
-            except:
-                pass
-    except Exception as e:
-        logging.error(f"Location-based WS error (User: {user_id_for_log or 'unknown'}): {e}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.send_json({"status": "error", "message": "Internal server error"})
-                await websocket.close(1011)
-            except:
-                pass
-    finally:
-        if ping_task and not ping_task.done():
-            ping_task.cancel()
-        
-        # Disconnect from all connected streams
-        for stream_id_str in connected_streams:
-            await stream_manager.disconnect_client(stream_id_str, websocket)
-        
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.close()
-
-@router.websocket("/stream/single-by-location")
-async def websocket_single_location_stream(websocket: WebSocket):
-    """WebSocket endpoint for streaming from the first available camera matching location criteria."""
-    user_id_for_log: Optional[str] = None
-    ping_task: Optional[asyncio.Task] = None
-    current_stream_id: Optional[str] = None
-    
-    try:
-        await websocket.accept()
-        query_params = dict(websocket.query_params)
-        
-        # Extract location filters
-        location = query_params.get("location")
-        area = query_params.get("area") 
-        building = query_params.get("building")
-        zone = query_params.get("zone")
-        floor_level = query_params.get("floor_level")
-        workspace_id = query_params.get("workspace_id")
-        
-        # Validate that at least one filter is provided
-        if not any([location, area, building, zone, floor_level]):
-            await websocket.send_json({
-                "status": "error",
-                "message": "At least one location filter is required"
-            })
-            await websocket.close(1008)
-            return
-        
-        # Authenticate user
-        token = await session_manager_global.get_token_from_websocket(websocket)
-        if not token:
-            await websocket.send_json({"status": "error", "message": "Authentication token required"})
-            await websocket.close(1008)
-            return
-            
-        token_data = await session_manager_global.verify_token(token, "access")
-        if not token_data or await session_manager_global.is_token_blacklisted(token):
-            await websocket.send_json({"status": "error", "message": "Invalid or expired token"})
-            await websocket.close(1008)
-            return
-            
-        user_id_for_log = token_data.user_id
-        
-        # Find the first matching active stream
-        base_query = """
-            SELECT vs.stream_id, vs.name, vs.workspace_id, vs.is_streaming, vs.status,
-                   vs.location, vs.area, vs.building, vs.zone, vs.floor_level,
-                   u.username as owner_username
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1 AND vs.is_streaming = TRUE AND vs.status = 'active'
-        """
-        
-        params = [UUID(user_id_for_log)]
-        param_count = 1
-        
-        # Add location filters
-        if workspace_id:
-            param_count += 1
-            base_query += f" AND vs.workspace_id = ${param_count}"
-            params.append(UUID(workspace_id))
-        if location:
-            param_count += 1
-            base_query += f" AND vs.location = ${param_count}"
-            params.append(location)
-        if area:
-            param_count += 1
-            base_query += f" AND vs.area = ${param_count}"
-            params.append(area)
-        if building:
-            param_count += 1
-            base_query += f" AND vs.building = ${param_count}"
-            params.append(building)
-        if zone:
-            param_count += 1
-            base_query += f" AND vs.zone = ${param_count}"
-            params.append(zone)
-        if floor_level:
-            param_count += 1
-            base_query += f" AND vs.floor_level = ${param_count}"
-            params.append(floor_level)
-            
-        base_query += " ORDER BY vs.building, vs.zone, vs.area, vs.location, vs.name LIMIT 1"
-        
-        matching_stream = await db_manager_global.execute_query(base_query, tuple(params), fetch_one=True)
-        
-        if not matching_stream:
-            await websocket.send_json({
-                "status": "error",
-                "message": "No active streams found matching the specified location criteria"
-            })
-            await websocket.close(1008)
-            return
-        
-        current_stream_id = str(matching_stream['stream_id'])
-        
-        # Check workspace membership
-        await check_workspace_membership_and_get_role(UUID(user_id_for_log), matching_stream['workspace_id'])
-        
-        # Connect to the stream
-        if not await stream_manager.connect_client_to_stream(current_stream_id, websocket):
-            await websocket.send_json({
-                "status": "error",
-                "message": "Failed to connect to the stream"
-            })
-            await websocket.close(1011)
-            return
-        
-        # Send connection confirmation
-        await websocket.send_json({
-            "status": "connected",
-            "message": f"Connected to stream: {matching_stream['name']}",
-            "stream_id": current_stream_id,
-            "stream_name": matching_stream['name'],
-            "owner": matching_stream['owner_username'],
-            "workspace_id": str(matching_stream['workspace_id']),
-            "location_info": {
-                "location": matching_stream['location'],
-                "area": matching_stream['area'],
-                "building": matching_stream['building'],
-                "zone": matching_stream['zone'],
-                "floor_level": matching_stream['floor_level']
-            },
-            "filters_applied": {
-                "location": location,
-                "area": area,
-                "building": building,
-                "zone": zone,
-                "floor_level": floor_level,
-                "workspace_id": workspace_id
-            }
-        })
-        
-        ping_task = asyncio.create_task(send_ping(websocket))
-        
-        # Stream frames
-        target_fps = config.get("websocket_client_fps", 15.0)
-        target_frame_interval = 1.0 / target_fps if target_fps > 0 else 0.066
-        
-        while websocket.client_state == WebSocketState.CONNECTED:
-            latest_frame_b64 = None
-            stream_ok = False
-            
-            async with stream_manager._lock:
-                stream_info = stream_manager.active_streams.get(current_stream_id, {})
-                if stream_info and stream_info.get('status') == 'active':
-                    stream_ok = True
-                    latest_frame_np = stream_info.get('latest_frame')
-                    if latest_frame_np is not None:
-                        latest_frame_b64 = await asyncio.get_event_loop().run_in_executor(
-                            thread_pool, frame_to_base64, latest_frame_np
-                        )
-            
-            if not stream_ok:
-                await websocket.send_json({
-                    "status": "info",
-                    "message": "Stream ended or became inactive"
-                })
-                break
-            
-            if latest_frame_b64:
-                await websocket.send_json({
-                    "stream_id": current_stream_id,
-                    "frame": latest_frame_b64,
-                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                    "location_info": {
-                        "location": matching_stream['location'],
-                        "area": matching_stream['area'],
-                        "building": matching_stream['building'],
-                        "zone": matching_stream['zone'],
-                        "floor_level": matching_stream['floor_level']
-                    }
-                })
-            
-            await asyncio.sleep(target_frame_interval)
-            
-    except WebSocketDisconnect:
-        logging.info(f"Single location WS client disconnected (User: {user_id_for_log or 'unknown'})")
-    except asyncio.CancelledError:
-        logging.info(f"Single location WS task cancelled (User: {user_id_for_log or 'unknown'})")
-    except ValueError as ve:
-        logging.warning(f"Single location WS error: Invalid ID format - {ve}")
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.send_json({"status": "error", "message": "Invalid ID format"})
-                await websocket.close(1008)
-            except:
-                pass
-    except Exception as e:
-        logging.error(f"Single location WS error (User: {user_id_for_log or 'unknown'}): {e}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.send_json({"status": "error", "message": "Internal server error"})
-                await websocket.close(1011)
-            except:
-                pass
-    finally:
-        if ping_task and not ping_task.done():
-            ping_task.cancel()
-        
-        if current_stream_id:
-            await stream_manager.disconnect_client(current_stream_id, websocket)
-        
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.close()
-
-# === ADDITIONAL UTILITY ENDPOINTS FOR LOCATION-BASED OPERATIONS ===
-
-@router.get("/streams/locations/hierarchy")
-async def get_location_hierarchy_for_streams(
-    workspace_id: Optional[str] = Query(None, description="Filter by workspace ID"),
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    """Get the location hierarchy for streams with stream counts."""
-    try:
-        user_id_str = str(current_user_data["user_id"])
-        
-        base_query = """
-            SELECT DISTINCT 
-                vs.building, vs.floor_level, vs.zone, vs.area, vs.location,
-                COUNT(*) as stream_count,
-                COUNT(CASE WHEN vs.is_streaming = TRUE THEN 1 END) as active_streams,
-                COUNT(CASE WHEN vs.status = 'active' THEN 1 END) as healthy_streams
-            FROM video_stream vs
-            JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1
-        """
-        
-        params = [UUID(user_id_str)]
-        param_count = 1
-        
-        if workspace_id:
-            param_count += 1
-            base_query += f" AND vs.workspace_id = ${param_count}"
-            params.append(UUID(workspace_id))
-        
-        base_query += """
-            GROUP BY vs.building, vs.floor_level, vs.zone, vs.area, vs.location
-            ORDER BY vs.building, vs.floor_level, vs.zone, vs.area, vs.location
-        """
-        
-        hierarchy_data = await db_manager_global.execute_query(base_query, tuple(params), fetch_all=True)
-        hierarchy_data = hierarchy_data or []
-        
-        # Organize into hierarchy structure
-        buildings = {}
-        
-        for row in hierarchy_data:
-            building = row['building'] or 'Unknown Building'
-            floor_level = row['floor_level'] or 'Unknown Floor'
-            zone = row['zone'] or 'Unknown Zone'
-            area = row['area'] or 'Unknown Area'
-            location = row['location'] or 'Unknown Location'
-            
-            if building not in buildings:
-                buildings[building] = {
-                    'name': building,
-                    'total_streams': 0,
-                    'active_streams': 0,
-                    'healthy_streams': 0,
-                    'floors': {}
-                }
-            
-            if floor_level not in buildings[building]['floors']:
-                buildings[building]['floors'][floor_level] = {
-                    'name': floor_level,
-                    'total_streams': 0,
-                    'active_streams': 0,
-                    'healthy_streams': 0,
-                    'zones': {}
-                }
-            
-            if zone not in buildings[building]['floors'][floor_level]['zones']:
-                buildings[building]['floors'][floor_level]['zones'][zone] = {
-                    'name': zone,
-                    'total_streams': 0,
-                    'active_streams': 0,
-                    'healthy_streams': 0,
-                    'areas': {}
-                }
-            
-            if area not in buildings[building]['floors'][floor_level]['zones'][zone]['areas']:
-                buildings[building]['floors'][floor_level]['zones'][zone]['areas'][area] = {
-                    'name': area,
-                    'total_streams': 0,
-                    'active_streams': 0,
-                    'healthy_streams': 0,
-                    'locations': {}
-                }
-            
-            # Add location data
-            buildings[building]['floors'][floor_level]['zones'][zone]['areas'][area]['locations'][location] = {
-                'name': location,
-                'total_streams': row['stream_count'],
-                'active_streams': row['active_streams'],
-                'healthy_streams': row['healthy_streams']
-            }
-            
-            # Aggregate counts upward
-            buildings[building]['total_streams'] += row['stream_count']
-            buildings[building]['active_streams'] += row['active_streams']
-            buildings[building]['healthy_streams'] += row['healthy_streams']
-            
-            buildings[building]['floors'][floor_level]['total_streams'] += row['stream_count']
-            buildings[building]['floors'][floor_level]['active_streams'] += row['active_streams']
-            buildings[building]['floors'][floor_level]['healthy_streams'] += row['healthy_streams']
-            
-            buildings[building]['floors'][floor_level]['zones'][zone]['total_streams'] += row['stream_count']
-            buildings[building]['floors'][floor_level]['zones'][zone]['active_streams'] += row['active_streams']
-            buildings[building]['floors'][floor_level]['zones'][zone]['healthy_streams'] += row['healthy_streams']
-            
-            buildings[building]['floors'][floor_level]['zones'][zone]['areas'][area]['total_streams'] += row['stream_count']
-            buildings[building]['floors'][floor_level]['zones'][zone]['areas'][area]['active_streams'] += row['active_streams']
-            buildings[building]['floors'][floor_level]['zones'][zone]['areas'][area]['healthy_streams'] += row['healthy_streams']
-        
-        # Convert to list format
-        hierarchy_list = []
-        for building_name, building_data in buildings.items():
-            building_item = {
-                'type': 'building',
-                'name': building_name,
-                'total_streams': building_data['total_streams'],
-                'active_streams': building_data['active_streams'],
-                'healthy_streams': building_data['healthy_streams'],
-                'children': []
-            }
-            
-            for floor_name, floor_data in building_data['floors'].items():
-                floor_item = {
-                    'type': 'floor_level',
-                    'name': floor_name,
-                    'total_streams': floor_data['total_streams'],
-                    'active_streams': floor_data['active_streams'],
-                    'healthy_streams': floor_data['healthy_streams'],
-                    'children': []
-                }
-                
-                for zone_name, zone_data in floor_data['zones'].items():
-                    zone_item = {
-                        'type': 'zone',
-                        'name': zone_name,
-                        'total_streams': zone_data['total_streams'],
-                        'active_streams': zone_data['active_streams'],
-                        'healthy_streams': zone_data['healthy_streams'],
-                        'children': []
-                    }
-                    
-                    for area_name, area_data in zone_data['areas'].items():
-                        area_item = {
-                            'type': 'area',
-                            'name': area_name,
-                            'total_streams': area_data['total_streams'],
-                            'active_streams': area_data['active_streams'],
-                            'healthy_streams': area_data['healthy_streams'],
-                            'children': []
-                        }
-                        
-                        for location_name, location_data in area_data['locations'].items():
-                            location_item = {
-                                'type': 'location',
-                                'name': location_name,
-                                'total_streams': location_data['total_streams'],
-                                'active_streams': location_data['active_streams'],
-                                'healthy_streams': location_data['healthy_streams'],
-                                'children': []
-                            }
-                            area_item['children'].append(location_item)
-                        
-                        zone_item['children'].append(area_item)
-                    
-                    floor_item['children'].append(zone_item)
-                
-                building_item['children'].append(floor_item)
-            
-            hierarchy_list.append(building_item)
-        
-        return JSONResponse(content={
-            "status": "success",
-            "hierarchy": hierarchy_list,
-            "workspace_filter": workspace_id,
-            "total_buildings": len(hierarchy_list),
-            "summary": {
-                "total_streams": sum(b['total_streams'] for b in hierarchy_list),
-                "active_streams": sum(b['active_streams'] for b in hierarchy_list),
-                "healthy_streams": sum(b['healthy_streams'] for b in hierarchy_list)
-            }
-        })
-        
-    except Exception as e:
-        logging.error(f"Error getting location hierarchy: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={
-            "status": "error",
-            "message": "Internal server error"
-        })
-
-@router.get("/streams/locations/search")
-async def search_streams_by_location_filters(
-    q: Optional[str] = Query(None, description="Search query for location names"),
-    location_type: Optional[Union[str, List[str]]] = Query(None, description="Filter by location type(s): building, floor_level, zone, area, location"),
-    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific location(s)"),
-    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific area(s)"),
-    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific building(s)"),
-    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific floor level(s)"),
-    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific zone(s)"),
-    workspace_id: Optional[str] = Query(None),
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    """Search for streams using location-based filters and text search."""
-    
-    # Parse all the filter parameters
-    location_type = parse_string_or_list(location_type)
-    locations = parse_string_or_list(locations)
-    areas = parse_string_or_list(areas)
-    buildings = parse_string_or_list(buildings)
-    floor_levels = parse_string_or_list(floor_levels)
-    zones = parse_string_or_list(zones)
-    
-    user_id_str = str(current_user_data["user_id"])
-    username = current_user_data.get("username", "unknown")
-    
-    try:
-        # Complete query to match /source/user fields
-        base_query = """
-            SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path, 
-                   vs.type, vs.status, vs.is_streaming, vs.created_at, vs.updated_at,
-                   vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
-                   vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
-                   w.name as workspace_name, vs.workspace_id
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            LEFT JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1
-        """
-        
-        params = [UUID(user_id_str)]
-        param_count = 1
-        
-        if workspace_id:
-            param_count += 1
-            base_query += f" AND vs.workspace_id = ${param_count}"
-            params.append(UUID(workspace_id))
-        
-        # Add text search with special handling for location_type + q combination
-        if q:
-            # Check if q contains comma-separated values and we have a specific location_type
-            q_values = parse_string_or_list(q)
-            
-            if location_type and len(location_type) == 1 and q_values and len(q_values) > 1:
-                # Handle specific case: location_type=areas&q=Area 1,Area 2
-                location_field_map = {
-                    "area": "vs.area",
-                    "areas": "vs.area", 
-                    "building": "vs.building",
-                    "buildings": "vs.building",
-                    "floor_level": "vs.floor_level",
-                    "floor_levels": "vs.floor_level",
-                    "zone": "vs.zone",
-                    "zones": "vs.zone",
-                    "location": "vs.location",
-                    "locations": "vs.location"
-                }
-                
-                field_name = location_field_map.get(location_type[0])
-                if field_name:
-                    # Use exact match for specific values
-                    param_count += 1
-                    q_placeholders = ", ".join([f"${param_count + i}" for i in range(len(q_values))])
-                    base_query += f" AND {field_name} IN ({q_placeholders})"
-                    params.extend(q_values)
-                    param_count += len(q_values) - 1
-                else:
-                    # Fallback to general text search
-                    param_count += 1
-                    search_condition = f"""
-                        AND (
-                            vs.name ILIKE ${param_count} OR 
-                            vs.building ILIKE ${param_count} OR 
-                            vs.floor_level ILIKE ${param_count} OR 
-                            vs.zone ILIKE ${param_count} OR 
-                            vs.area ILIKE ${param_count} OR 
-                            vs.location ILIKE ${param_count}
-                        )
-                    """
-                    base_query += search_condition
-                    params.append(f"%{q}%")
-            else:
-                # Regular text search
-                param_count += 1
-                search_condition = f"""
-                    AND (
-                        vs.name ILIKE ${param_count} OR 
-                        vs.building ILIKE ${param_count} OR 
-                        vs.floor_level ILIKE ${param_count} OR 
-                        vs.zone ILIKE ${param_count} OR 
-                        vs.area ILIKE ${param_count} OR 
-                        vs.location ILIKE ${param_count}
-                    )
-                """
-                base_query += search_condition
-                params.append(f"%{q}%")
-        
-        # Add location type filter (now supports multiple types)
-        if location_type:
-            type_conditions = []
-            for loc_type in location_type:
-                if loc_type == "building":
-                    type_conditions.append("(vs.building IS NOT NULL AND vs.building != '')")
-                elif loc_type == "floor_level":
-                    type_conditions.append("(vs.floor_level IS NOT NULL AND vs.floor_level != '')")
-                elif loc_type == "zone":
-                    type_conditions.append("(vs.zone IS NOT NULL AND vs.zone != '')")
-                elif loc_type == "area":
-                    type_conditions.append("(vs.area IS NOT NULL AND vs.area != '')")
-                elif loc_type == "location":
-                    type_conditions.append("(vs.location IS NOT NULL AND vs.location != '')")
-            
-            if type_conditions:
-                base_query += f" AND ({' OR '.join(type_conditions)})"
-        
-        # Add specific location filters
-        if locations:
-            param_count += 1
-            location_placeholders = ", ".join([f"${param_count + i}" for i in range(len(locations))])
-            base_query += f" AND vs.location IN ({location_placeholders})"
-            params.extend(locations)
-            param_count += len(locations) - 1
-        
-        if areas:
-            param_count += 1
-            area_placeholders = ", ".join([f"${param_count + i}" for i in range(len(areas))])
-            base_query += f" AND vs.area IN ({area_placeholders})"
-            params.extend(areas)
-            param_count += len(areas) - 1
-        
-        if buildings:
-            param_count += 1
-            building_placeholders = ", ".join([f"${param_count + i}" for i in range(len(buildings))])
-            base_query += f" AND vs.building IN ({building_placeholders})"
-            params.extend(buildings)
-            param_count += len(buildings) - 1
-        
-        if floor_levels:
-            param_count += 1
-            floor_placeholders = ", ".join([f"${param_count + i}" for i in range(len(floor_levels))])
-            base_query += f" AND vs.floor_level IN ({floor_placeholders})"
-            params.extend(floor_levels)
-            param_count += len(floor_levels) - 1
-        
-        if zones:
-            param_count += 1
-            zone_placeholders = ", ".join([f"${param_count + i}" for i in range(len(zones))])
-            base_query += f" AND vs.zone IN ({zone_placeholders})"
-            params.extend(zones)
-        
-        base_query += " ORDER BY u.username, vs.created_at DESC"
-        
-        # Rest of the function remains the same...
-        results = await db_manager_global.execute_query(base_query, tuple(params), fetch_all=True)
-        results = results or []
-        
-        # Format results to match /source/user response structure exactly
-        formatted_results = [
-            {
-                "id": str(r["stream_id"]),
-                "user_id": str(r["user_id"]),
-                "owner_username": r["owner_username"],
-                "name": r["name"],
-                "path": r["path"],
-                "type": r["type"],
-                "status": r["status"],
-                "is_streaming": r["is_streaming"],
-                "location": r["location"],
-                "area": r["area"],
-                "building": r["building"],
-                "floor_level": r["floor_level"],
-                "zone": r["zone"],
-                "latitude": float(r["latitude"]) if r["latitude"] else None,
-                "longitude": float(r["longitude"]) if r["longitude"] else None,
-                "count_threshold_greater": r["count_threshold_greater"],
-                "count_threshold_less": r["count_threshold_less"],
-                "alert_enabled": r["alert_enabled"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-                "workspace_id": str(r["workspace_id"]) if r["workspace_id"] else None,
-                "workspace_name": r["workspace_name"],
-                "static_base64": encoded_string
-            } for r in results
-        ]
-        
-        return formatted_results
-        
-    except ValueError as ve:
-        logger.error(f"Invalid data for location search for user {username}: {ve}", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Invalid data: {ve}")
-    except Exception as e:
-        logger.error(f"Error searching streams by location for user {username}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected error occurred while searching streams.")
-
-
-@router.post("/start_streams_bulk")
-async def start_streams_bulk_endpoint(
-    stream_ids: List[str] = Query(..., description="List of stream IDs to start"),
-    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
-):
-    """Start multiple streams from a list of stream IDs."""
-    try:
-        requester_user_id_str = str(current_user_data["user_id"])
-        requester_username = current_user_data["username"]
-        
-        if not stream_ids:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "No stream IDs provided"}
-            )
-        
-        if len(stream_ids) > 50:  # Reasonable limit to prevent abuse
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Maximum 50 streams can be started at once"}
-            )
-        
-        # Validate stream ID formats
-        valid_stream_uuids = []
-        invalid_ids = []
-        
-        for stream_id_str in stream_ids:
-            try:
-                valid_stream_uuids.append(UUID(stream_id_str))
-            except ValueError:
-                invalid_ids.append(stream_id_str)
-        
-        if invalid_ids:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error", 
-                    "message": f"Invalid stream ID format(s): {', '.join(invalid_ids)}"
-                }
-            )
-        
-        # Get stream details with workspace and owner info
-        placeholders = ','.join([f'${i+1}' for i in range(len(valid_stream_uuids))])
-        
-        streams_query = f"""
-            SELECT vs.stream_id, vs.name, vs.user_id as owner_id, vs.workspace_id, vs.is_streaming,
-                   vs.status, vs.location, vs.area, vs.building, vs.zone, vs.floor_level,
-                   u.username as owner_username, u.is_active as owner_is_active,
-                   u.is_subscribed as owner_is_subscribed, u.count_of_camera as owner_camera_limit,
-                   u.role as owner_system_role, w.name as workspace_name
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            WHERE vs.stream_id IN ({placeholders})
-        """
-        
-        streams_data = await db_manager_global.execute_query(
-            streams_query, tuple(valid_stream_uuids), fetch_all=True
-        )
-        streams_data = streams_data or []
-        
-        # Check for missing streams
-        found_stream_ids = {str(s['stream_id']) for s in streams_data}
-        missing_stream_ids = [sid for sid in stream_ids if sid not in found_stream_ids]
-        
-        results = []
-        streams_started_count = 0
-        streams_processed_count = len(streams_data)
-        
-        # Add missing streams to results
-        for missing_id in missing_stream_ids:
-            results.append({
-                "stream_id": missing_id,
-                "name": "Unknown",
-                "workspace": "Unknown",
-                "status": "not_found",
-                "message": "Stream not found"
-            })
-        
-        if not streams_data:
-            return JSONResponse(content={
-                "status": "error" if missing_stream_ids else "info",
-                "message": "No valid streams found to process",
-                "streams_processed": 0,
-                "streams_started": 0,
-                "details": results
-            })
-        
-        # Check workspace access for all streams
-        workspace_access_checks = {}
-        for stream_data in streams_data:
-            workspace_id = stream_data['workspace_id']
-            if workspace_id not in workspace_access_checks:
-                try:
-                    await check_workspace_membership_and_get_role(
-                        UUID(requester_user_id_str), workspace_id
-                    )
-                    workspace_access_checks[workspace_id] = True
-                except HTTPException:
-                    workspace_access_checks[workspace_id] = False
-        
-        # Get current active stream counts per owner per workspace
-        workspace_ids = list(set(s['workspace_id'] for s in streams_data))
-        if workspace_ids:
-            ws_placeholders = ','.join([f'${i+1}' for i in range(len(workspace_ids))])
-            owner_active_streams_query = f"""
-                SELECT user_id, workspace_id, COUNT(*) as active_count 
-                FROM video_stream
-                WHERE workspace_id IN ({ws_placeholders}) AND is_streaming = TRUE 
-                GROUP BY user_id, workspace_id
-            """
-            active_counts_db = await db_manager_global.execute_query(
-                owner_active_streams_query, tuple(workspace_ids), fetch_all=True
-            )
-            active_counts_db = active_counts_db or []
-            
-            owner_active_streams_map = {
-                (row['user_id'], row['workspace_id']): row['active_count'] 
-                for row in active_counts_db
-            }
-        else:
-            owner_active_streams_map = {}
-        
-        # Process each stream
-        for stream_data in streams_data:
-            stream_id = stream_data['stream_id']
-            stream_name = stream_data['name']
-            workspace_id = stream_data['workspace_id']
-            owner_id = stream_data['owner_id']
-            
-            # Check workspace access
-            if not workspace_access_checks.get(workspace_id, False):
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data.get('location'),
-                        "area": stream_data.get('area'),
-                        "building": stream_data.get('building'),
-                        "zone": stream_data.get('zone'),
-                        "floor_level": stream_data.get('floor_level')
-                    },
-                    "status": "access_denied",
-                    "message": "No access to workspace or workspace not found"
-                })
-                continue
-            
-            # Check if already streaming
-            if stream_data['is_streaming']:
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data.get('location'),
-                        "area": stream_data.get('area'),
-                        "building": stream_data.get('building'),
-                        "zone": stream_data.get('zone'),
-                        "floor_level": stream_data.get('floor_level')
-                    },
-                    "status": "already_streaming",
-                    "message": "Stream is already active"
-                })
-                continue
-            
-            # Check owner eligibility
-            if not stream_data['owner_is_active']:
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data.get('location'),
-                        "area": stream_data.get('area'),
-                        "building": stream_data.get('building'),
-                        "zone": stream_data.get('zone'),
-                        "floor_level": stream_data.get('floor_level')
-                    },
-                    "status": "skipped",
-                    "message": "Stream owner is inactive"
-                })
-                continue
-            
-            if not stream_data['owner_is_subscribed'] and stream_data['owner_system_role'] != 'admin':
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data.get('location'),
-                        "area": stream_data.get('area'),
-                        "building": stream_data.get('building'),
-                        "zone": stream_data.get('zone'),
-                        "floor_level": stream_data.get('floor_level')
-                    },
-                    "status": "skipped",
-                    "message": "Stream owner not subscribed (and not admin)"
-                })
-                continue
-            
-            # Check camera limits
-            owner_limit = stream_data['owner_camera_limit']
-            current_owner_active_count = owner_active_streams_map.get((owner_id, workspace_id), 0)
-            
-            if stream_data['owner_system_role'] != 'admin' and current_owner_active_count >= owner_limit:
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data.get('location'),
-                        "area": stream_data.get('area'),
-                        "building": stream_data.get('building'),
-                        "zone": stream_data.get('zone'),
-                        "floor_level": stream_data.get('floor_level')
-                    },
-                    "status": "skipped",
-                    "message": f"Owner camera limit ({owner_limit}) reached"
-                })
-                continue
-            
-            # Start the stream
-            try:
-                await db_manager_global.execute_query(
-                    "UPDATE video_stream SET is_streaming = TRUE, status = 'processing', updated_at = $1 WHERE stream_id = $2",
-                    (datetime.now(timezone.utc), stream_id)
-                )
-                
-                streams_started_count += 1
-                owner_active_streams_map[(owner_id, workspace_id)] = current_owner_active_count + 1
-                
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data.get('location'),
-                        "area": stream_data.get('area'),
-                        "building": stream_data.get('building'),
-                        "zone": stream_data.get('zone'),
-                        "floor_level": stream_data.get('floor_level')
-                    },
-                    "status": "initiated",
-                    "message": "Stream start initiated"
-                })
-                
-                # Add success notification
-                await stream_manager.add_notification(
-                    str(owner_id), str(workspace_id), str(stream_id), stream_name,
-                    "processing", f"Camera '{stream_name}' start initiated by {requester_username} (bulk action)"
-                )
-                
-            except Exception as e:
-                logging.error(f"Error starting stream {stream_id}: {e}", exc_info=True)
-                results.append({
-                    "stream_id": str(stream_id),
-                    "name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data.get('location'),
-                        "area": stream_data.get('area'),
-                        "building": stream_data.get('building'),
-                        "zone": stream_data.get('zone'),
-                        "floor_level": stream_data.get('floor_level')
-                    },
-                    "status": "error",
-                    "message": f"Failed to start stream: {str(e)[:100]}"
-                })
-        
-        # Determine overall status
-        total_requested = len(stream_ids)
-        total_found = len(streams_data)
-        
-        if streams_started_count == 0:
-            status = "info" if total_found == 0 else "failed"
-            message = "No streams were started"
-        elif streams_started_count == total_requested:
-            status = "success"
-            message = f"All {streams_started_count} streams started successfully"
-        else:
-            status = "partial_success"
-            message = f"Started {streams_started_count} of {total_requested} requested streams"
-        
-        return JSONResponse(content={
-            "status": status,
-            "message": message,
-            "summary": {
-                "total_requested": total_requested,
-                "streams_found": total_found,
-                "streams_started": streams_started_count,
-                "missing_streams": len(missing_stream_ids),
-                "requester": requester_username
-            },
-            "details": results
-        })
-        
-    except Exception as e:
-        logging.error(f"Error in bulk stream start: {e}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": "Internal server error during bulk stream start",
-                "details": []
-            }
-        )
-
-@router.websocket("/start_streams_bulk")
-async def websocket_start_streams_bulk(websocket: WebSocket):
-    """WebSocket endpoint for bulk starting streams with real-time progress updates."""
-    user_id_for_log: Optional[str] = None
-    username_for_log: Optional[str] = None
-    ping_task: Optional[asyncio.Task] = None
-    
-    try:
-        await websocket.accept()
-        
-        # Authenticate user
-        token = await session_manager_global.get_token_from_websocket(websocket)
-        if not token:
-            await websocket.send_json({
-                "status": "error", 
-                "message": "Authentication token required."
-            })
-            await websocket.close(1008)
-            return
-            
-        token_data = await session_manager_global.verify_token(token, "access")
-        if not token_data or await session_manager_global.is_token_blacklisted(token):
-            await websocket.send_json({
-                "status": "error", 
-                "message": "Invalid or expired token."
-            })
-            await websocket.close(1008)
-            return
-            
-        user_id_for_log = token_data.user_id
-        
-        # Get user data for logging
-        user_db_data = await user_manager_global.get_user_by_id(UUID(user_id_for_log))
-        username_for_log = user_db_data.get("username") if user_db_data else f"user_{user_id_for_log}"
-        
-        # Send connection confirmation
-        await websocket.send_json({
-            "status": "connected",
-            "message": "Connected to bulk stream start service",
-            "user": username_for_log,
-            "timestamp": datetime.now(timezone.utc).timestamp()
-        })
-        
-        ping_task = asyncio.create_task(send_ping(websocket))
-        
-        # Main message processing loop
-        while websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                # Wait for start request from client
-                receive_timeout = float(config.get("websocket_receive_timeout", 45.0))
-                message = await asyncio.wait_for(websocket.receive_json(), timeout=receive_timeout)
-                
-                # Handle different message types
-                if message.get("type") == "pong":
-                    logging.debug(f"Bulk start WS: Pong received from {username_for_log}")
-                    continue
-                
-                elif message.get("type") == "start_streams":
-                    stream_ids = message.get("stream_ids", [])
-                    
-                    if not stream_ids:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "No stream IDs provided",
-                            "timestamp": datetime.now(timezone.utc).timestamp()
-                        })
-                        continue
-                    
-                    if len(stream_ids) > 50:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "Maximum 50 streams can be started at once",
-                            "timestamp": datetime.now(timezone.utc).timestamp()
-                        })
-                        continue
-                    
-                    # Process the bulk start request
-                    await process_bulk_start_request(
-                        websocket, stream_ids, user_id_for_log, username_for_log
-                    )
-                
-                else:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": f"Unknown message type: {message.get('type', 'none')}",
-                        "timestamp": datetime.now(timezone.utc).timestamp()
-                    })
-                    
-            except asyncio.TimeoutError:
-                # No message from client, continue
-                continue
-            except WebSocketDisconnect:
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as e_recv:
-                logging.error(f"Bulk start WS: Error receiving from {username_for_log}: {e_recv}", exc_info=True)
-                if websocket.client_state == WebSocketState.CONNECTED:
-                    try:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "Error processing message",
-                            "timestamp": datetime.now(timezone.utc).timestamp()
-                        })
-                    except:
-                        pass
-                break
-                
-    except WebSocketDisconnect:
-        logging.info(f"Bulk start WS: Client {username_for_log or 'unknown'} disconnected")
-    except asyncio.CancelledError:
-        logging.info(f"Bulk start WS task for {username_for_log or 'unknown'} cancelled")
-    except Exception as e_outer:
-        logging.error(f"Bulk start WS: Outer error ({username_for_log or 'unknown'}): {e_outer}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.send_json({
-                    "status": "error", 
-                    "message": "Internal server error"
-                })
-            except:
-                pass
-    finally:
-        if ping_task and not ping_task.done():
-            ping_task.cancel()
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.close()
-        logging.debug(f"Bulk start WS: Connection cleanup for {username_for_log or 'unknown'}")
-
-async def process_bulk_start_request(
-    websocket: WebSocket, 
-    stream_ids: List[str], 
-    user_id_str: str, 
-    username: str
-):
-    """Process a bulk stream start request with real-time progress updates."""
-    
-    # Send initial acknowledgment
-    await websocket.send_json({
-        "type": "start_initiated",
-        "total_streams": len(stream_ids),
-        "message": f"Starting bulk operation for {len(stream_ids)} streams",
-        "timestamp": datetime.now(timezone.utc).timestamp()
-    })
-    
-    try:
-        # Validate stream ID formats
-        valid_stream_uuids = []
-        invalid_ids = []
-        
-        for i, stream_id_str in enumerate(stream_ids):
-            try:
-                valid_stream_uuids.append(UUID(stream_id_str))
-            except ValueError:
-                invalid_ids.append(stream_id_str)
-                await websocket.send_json({
-                    "type": "stream_error",
-                    "stream_id": stream_id_str,
-                    "error": "Invalid stream ID format",
-                    "progress": {
-                        "processed": i + 1,
-                        "total": len(stream_ids)
-                    },
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-        
-        if not valid_stream_uuids:
-            await websocket.send_json({
-                "type": "bulk_complete",
-                "success": False,
-                "message": "No valid stream IDs provided",
-                "summary": {
-                    "total_requested": len(stream_ids),
-                    "streams_started": 0,
-                    "errors": len(invalid_ids)
-                },
-                "timestamp": datetime.now(timezone.utc).timestamp()
-            })
-            return
-        
-        # Send validation complete
-        await websocket.send_json({
-            "type": "validation_complete",
-            "valid_streams": len(valid_stream_uuids),
-            "invalid_streams": len(invalid_ids),
-            "timestamp": datetime.now(timezone.utc).timestamp()
-        })
-        
-        # Get stream details
-        placeholders = ','.join([f'${i+1}' for i in range(len(valid_stream_uuids))])
-        streams_query = f"""
-            SELECT vs.stream_id, vs.name, vs.user_id as owner_id, vs.workspace_id, vs.is_streaming,
-                   vs.status, vs.location, vs.area, vs.building, vs.zone, vs.floor_level,
-                   u.username as owner_username, u.is_active as owner_is_active,
-                   u.is_subscribed as owner_is_subscribed, u.count_of_camera as owner_camera_limit,
-                   u.role as owner_system_role, w.name as workspace_name
-            FROM video_stream vs
-            JOIN users u ON vs.user_id = u.user_id
-            JOIN workspaces w ON vs.workspace_id = w.workspace_id
-            WHERE vs.stream_id IN ({placeholders})
-        """
-        
-        streams_data = await db_manager_global.execute_query(
-            streams_query, tuple(valid_stream_uuids), fetch_all=True
-        )
-        streams_data = streams_data or []
-        
-        # Check for missing streams
-        found_stream_ids = {str(s['stream_id']) for s in streams_data}
-        missing_stream_ids = [sid for sid in stream_ids if sid not in found_stream_ids]
-        
-        # Send missing streams notifications
-        for missing_id in missing_stream_ids:
-            await websocket.send_json({
-                "type": "stream_not_found",
-                "stream_id": missing_id,
-                "message": "Stream not found",
-                "timestamp": datetime.now(timezone.utc).timestamp()
-            })
-        
-        if not streams_data:
-            await websocket.send_json({
-                "type": "bulk_complete",
-                "success": False,
-                "message": "No valid streams found to process",
-                "summary": {
-                    "total_requested": len(stream_ids),
-                    "streams_started": 0,
-                    "not_found": len(missing_stream_ids)
-                },
-                "timestamp": datetime.now(timezone.utc).timestamp()
-            })
-            return
-        
-        # Check workspace access
-        await websocket.send_json({
-            "type": "checking_permissions",
-            "message": "Checking workspace permissions",
-            "timestamp": datetime.now(timezone.utc).timestamp()
-        })
-        
-        workspace_access_checks = {}
-        for stream_data in streams_data:
-            workspace_id = stream_data['workspace_id']
-            if workspace_id not in workspace_access_checks:
-                try:
-                    await check_workspace_membership_and_get_role(
-                        UUID(user_id_str), workspace_id
-                    )
-                    workspace_access_checks[workspace_id] = True
-                except HTTPException:
-                    workspace_access_checks[workspace_id] = False
-        
-        # Get current active stream counts
-        workspace_ids = list(set(s['workspace_id'] for s in streams_data))
-        owner_active_streams_map = {}
-        
-        if workspace_ids:
-            ws_placeholders = ','.join([f'${i+1}' for i in range(len(workspace_ids))])
-            owner_active_streams_query = f"""
-                SELECT user_id, workspace_id, COUNT(*) as active_count 
-                FROM video_stream
-                WHERE workspace_id IN ({ws_placeholders}) AND is_streaming = TRUE 
-                GROUP BY user_id, workspace_id
-            """
-            active_counts_db = await db_manager_global.execute_query(
-                owner_active_streams_query, tuple(workspace_ids), fetch_all=True
-            )
-            active_counts_db = active_counts_db or []
-            
-            owner_active_streams_map = {
-                (row['user_id'], row['workspace_id']): row['active_count'] 
-                for row in active_counts_db
+        stream_uuid = UUID(stream_id)
+        persistent_state = await stream_manager.get_persistent_fire_state(stream_uuid)
+        
+        cooldown_info = {}
+        if persistent_state['last_notification_time']:
+            time_since_last = (datetime.now(timezone.utc) - persistent_state['last_notification_time']).total_seconds()
+            cooldown_info = {
+                'time_since_last_notification': time_since_last,
+                'cooldown_remaining': max(0, stream_manager.fire_cooldown_duration - time_since_last),
+                'can_notify': time_since_last >= stream_manager.fire_cooldown_duration
             }
         
-        # Process each stream with real-time updates
-        streams_started_count = 0
-        processed_count = 0
-        
-        await websocket.send_json({
-            "type": "processing_started",
-            "message": "Starting individual stream processing",
-            "total_to_process": len(streams_data),
-            "timestamp": datetime.now(timezone.utc).timestamp()
-        })
-        
-        for stream_data in streams_data:
-            processed_count += 1
-            stream_id = stream_data['stream_id']
-            stream_name = stream_data['name']
-            workspace_id = stream_data['workspace_id']
-            owner_id = stream_data['owner_id']
-            
-            # Send progress update
-            await websocket.send_json({
-                "type": "processing_stream",
-                "stream_id": str(stream_id),
-                "stream_name": stream_name,
-                "progress": {
-                    "processed": processed_count,
-                    "total": len(streams_data)
-                },
-                "timestamp": datetime.now(timezone.utc).timestamp()
-            })
-            
-            # Check workspace access
-            if not workspace_access_checks.get(workspace_id, False):
-                await websocket.send_json({
-                    "type": "stream_skipped",
-                    "stream_id": str(stream_id),
-                    "stream_name": stream_name,
-                    "reason": "No access to workspace",
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-                continue
-            
-            # Check if already streaming
-            if stream_data['is_streaming']:
-                await websocket.send_json({
-                    "type": "stream_skipped",
-                    "stream_id": str(stream_id),
-                    "stream_name": stream_name,
-                    "reason": "Already streaming",
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-                continue
-            
-            # Check owner eligibility
-            if not stream_data['owner_is_active']:
-                await websocket.send_json({
-                    "type": "stream_skipped",
-                    "stream_id": str(stream_id),
-                    "stream_name": stream_name,
-                    "reason": "Owner is inactive",
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-                continue
-            
-            if not stream_data['owner_is_subscribed'] and stream_data['owner_system_role'] != 'admin':
-                await websocket.send_json({
-                    "type": "stream_skipped",
-                    "stream_id": str(stream_id),
-                    "stream_name": stream_name,
-                    "reason": "Owner not subscribed",
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-                continue
-            
-            # Check camera limits
-            owner_limit = stream_data['owner_camera_limit']
-            current_owner_active_count = owner_active_streams_map.get((owner_id, workspace_id), 0)
-            
-            if stream_data['owner_system_role'] != 'admin' and current_owner_active_count >= owner_limit:
-                await websocket.send_json({
-                    "type": "stream_skipped",
-                    "stream_id": str(stream_id),
-                    "stream_name": stream_name,
-                    "reason": f"Camera limit reached ({owner_limit})",
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-                continue
-            
-            # Start the stream
-            try:
-                await db_manager_global.execute_query(
-                    "UPDATE video_stream SET is_streaming = TRUE, status = 'processing', updated_at = $1 WHERE stream_id = $2",
-                    (datetime.now(timezone.utc), stream_id)
-                )
-                
-                streams_started_count += 1
-                owner_active_streams_map[(owner_id, workspace_id)] = current_owner_active_count + 1
-                
-                await websocket.send_json({
-                    "type": "stream_started",
-                    "stream_id": str(stream_id),
-                    "stream_name": stream_name,
-                    "workspace": stream_data['workspace_name'],
-                    "location_info": {
-                        "location": stream_data.get('location'),
-                        "area": stream_data.get('area'),
-                        "building": stream_data.get('building'),
-                        "zone": stream_data.get('zone'),
-                        "floor_level": stream_data.get('floor_level')
-                    },
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-                
-                # Send notification to stream owner
-                await stream_manager.add_notification(
-                    str(owner_id), str(workspace_id), str(stream_id), stream_name,
-                    "processing", f"Camera '{stream_name}' start initiated by {username} (WebSocket bulk)"
-                )
-                
-            except Exception as e:
-                logging.error(f"Error starting stream {stream_id} via WebSocket: {e}", exc_info=True)
-                await websocket.send_json({
-                    "type": "stream_error",
-                    "stream_id": str(stream_id),
-                    "stream_name": stream_name,
-                    "error": f"Failed to start: {str(e)[:100]}",
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-        
-        # Send completion summary
-        total_requested = len(stream_ids)
-        success_rate = (streams_started_count / total_requested * 100) if total_requested > 0 else 0
-        
-        await websocket.send_json({
-            "type": "bulk_complete",
-            "success": True,
-            "message": f"Bulk operation completed: {streams_started_count}/{total_requested} streams started",
-            "summary": {
-                "total_requested": total_requested,
-                "streams_started": streams_started_count,
-                "success_rate": round(success_rate, 1),
-                "processed": processed_count,
-                "missing": len(missing_stream_ids),
-                "invalid_ids": len(invalid_ids),
-                "requester": username
-            },
-            "timestamp": datetime.now(timezone.utc).timestamp()
-        })
-        
-    except Exception as e:
-        logging.error(f"Error in WebSocket bulk start processing: {e}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.send_json({
-                    "type": "bulk_error",
-                    "message": "Internal error during bulk processing",
-                    "timestamp": datetime.now(timezone.utc).timestamp()
-                })
-            except:
-                pass
-
-
-# Add these debug endpoints to your router
-
-@router.get("/debug/shared_streams")
-async def debug_shared_streams():
-    """Debug endpoint to check shared stream status"""
-    if hasattr(stream_manager, 'video_file_manager'):
-        stats = stream_manager.video_file_manager.get_all_stats()
-        return {"shared_streams": stats}
-    return {"error": "Video file manager not available"}
-
-@router.post("/debug/force_restart_shared/{source_path}")
-async def debug_force_restart_shared_stream(source_path: str):
-    """Force restart a shared stream for debugging"""
-    try:
-        # URL decode the source path
-        import urllib.parse
-        decoded_source = urllib.parse.unquote(source_path)
-        
-        result = await stream_manager.force_restart_shared_stream(decoded_source)
-        return {"success": result, "source": decoded_source}
-    except Exception as e:
-        return {"error": f"Failed to restart shared stream: {e}"}
-
-@router.post("/debug/log_state")
-async def debug_log_current_state():
-    """Trigger logging of current stream manager state"""
-    try:
-        await stream_manager.log_stream_manager_state()
-        return {"success": True, "message": "State logged to console"}
-    except Exception as e:
-        return {"error": f"Failed to log state: {e}"}
-
-@router.get("/debug/validate_source/{source_path}")
-async def debug_validate_source(source_path: str):
-    """Validate a video source for debugging"""
-    try:
-        import urllib.parse
-        decoded_source = urllib.parse.unquote(source_path)
-        
-        is_valid = await stream_manager._validate_stream_source(decoded_source)
         return {
-            "source": decoded_source,
-            "is_valid": is_valid,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "status": "success",
+            "persistent_state": {
+                "fire_status": persistent_state['fire_status'],
+                "last_detection_time": persistent_state['last_detection_time'].isoformat() if persistent_state['last_detection_time'] else None,
+                "last_notification_time": persistent_state['last_notification_time'].isoformat() if persistent_state['last_notification_time'] else None
+            },
+            "cooldown_info": cooldown_info,
+            "server_time": datetime.now(timezone.utc).isoformat()
         }
     except Exception as e:
-        return {"error": f"Failed to validate source: {e}"}
+        return {"status": "error", "message": str(e)}
 
-
-@router.get("/debug/stream/{stream_id}")
-async def debug_stream_status(stream_id: str, response: Response):
-    """Get detailed debug information for a specific stream"""
+@router.get("/debug/fire-test/{stream_id}")
+async def test_fire_cooldown_system(
+    stream_id: str,
+    action: str = Query("status", description="Action: status, reset, force_notify"),
+    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
+):
+    """Test endpoint for fire cooldown system"""
     try:
-        # Validate stream_id format
-        try:
-            UUID(stream_id)
-        except ValueError:
-            response.status_code = 400
-            return {"error": "Invalid stream_id format. Must be a valid UUID."}
+        stream_uuid = UUID(stream_id)
+        current_time = datetime.now(timezone.utc)
         
-        # Get the detailed status
-        status = await stream_manager.get_detailed_stream_status(stream_id)
-        
-        # Additional validation that the response is JSON serializable
-        import json
-        try:
-            json.dumps(status)
-        except TypeError as json_error:
-            logging.error(f"JSON serialization error in debug endpoint: {json_error}")
+        if action == "status":
+            # Get comprehensive status
+            persistent_state = await stream_manager.get_persistent_fire_state(stream_uuid)
+            cooldown_info = await stream_manager.get_fire_notification_cooldown_status(stream_id)
+            
+            in_memory_state = stream_manager.fire_detection_states.get(stream_id, "unknown")
+            
             return {
-                "error": "Failed to serialize debug data",
+                "status": "success",
                 "stream_id": stream_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "details": str(json_error)
+                "current_time": current_time.isoformat(),
+                "persistent_state": {
+                    "fire_status": persistent_state['fire_status'],
+                    "last_detection_time": persistent_state['last_detection_time'].isoformat() if persistent_state['last_detection_time'] else None,
+                    "last_notification_time": persistent_state['last_notification_time'].isoformat() if persistent_state['last_notification_time'] else None
+                },
+                "in_memory_state": in_memory_state,
+                "cooldown_info": cooldown_info,
+                "next_notification_available": (
+                    persistent_state['last_notification_time'] + timedelta(seconds=stream_manager.fire_cooldown_duration)
+                ).isoformat() if persistent_state['last_notification_time'] else "immediately"
             }
         
-        return status
+        elif action == "reset":
+            # Reset cooldown for testing
+            stream_manager.fire_notification_cooldowns.pop(stream_id, None)
+            await stream_manager.update_persistent_fire_state(stream_uuid, "no detection")
+            return {"status": "success", "message": "Fire state and cooldown reset"}
         
+        elif action == "force_notify":
+            # Force a test notification (bypasses cooldown)
+            await stream_manager.add_notification(
+                str(current_user_data["user_id"]), 
+                "test-workspace", 
+                stream_id,
+                "Test Camera", 
+                "fire_alert", 
+                "🔥 TEST FIRE NOTIFICATION - This is a test"
+            )
+            return {"status": "success", "message": "Test notification sent"}
+        
+        else:
+            return {"status": "error", "message": "Invalid action. Use: status, reset, or force_notify"}
+            
     except Exception as e:
-        logging.error(f"Error in debug_stream_status for stream {stream_id}: {e}", exc_info=True)
-        response.status_code = 500
-        return {
-            "error": f"Failed to get stream status: {str(e)}",
-            "stream_id": stream_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+        return {"status": "error", "message": str(e)}
 
-@router.get("/debug/streams")
-async def debug_all_streams():
-    """Get debug information for all streams"""
+@router.get("/debug/stream-diagnosis/{stream_id}")
+async def diagnose_stream_issues(
+    stream_id: str,
+    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
+):
+    """Diagnose stream activation and processing issues"""
     try:
-        debug_info = await stream_manager.debug_all_streams()
+        diagnosis = await stream_manager.diagnose_stream_activation_failure(stream_id)
+        return {"status": "success", "diagnosis": diagnosis}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@router.get("/debug/people-cooldown/{stream_id}")
+async def debug_people_count_cooldown_status(
+    stream_id: str,
+    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
+):
+    """Debug endpoint to check people count notification cooldown status"""
+    try:
+        current_time = time.time()
+        last_notification_time = stream_manager.people_count_notification_cooldowns.get(stream_id, 0)
         
-        # Validate JSON serializability
-        import json
-        try:
-            json.dumps(debug_info)
-        except TypeError as json_error:
-            logging.error(f"JSON serialization error in debug all streams: {json_error}")
-            return {
-                "error": "Failed to serialize all streams debug data",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "details": str(json_error)
+        if last_notification_time == 0:
+            status = {
+                "stream_id": stream_id,
+                "can_notify": True,
+                "last_notification": None,
+                "cooldown_remaining": 0
+            }
+        else:
+            time_since_last = current_time - last_notification_time
+            can_notify = time_since_last >= stream_manager.people_count_cooldown_duration
+            cooldown_remaining = max(0, stream_manager.people_count_cooldown_duration - time_since_last)
+            
+            status = {
+                "stream_id": stream_id,
+                "can_notify": can_notify,
+                "last_notification": datetime.fromtimestamp(last_notification_time, tz=timezone.utc).isoformat(),
+                "cooldown_remaining": cooldown_remaining,
+                "cooldown_remaining_minutes": cooldown_remaining / 60.0
             }
         
-        return debug_info
-        
+        return JSONResponse(content={
+            "status": "success",
+            "cooldown_info": status,
+            "current_time": current_time,
+            "server_time": datetime.now(timezone.utc).isoformat()
+        })
     except Exception as e:
-        logging.error(f"Error in debug_all_streams: {e}", exc_info=True)
-        return {
-            "error": f"Failed to get all streams debug info: {str(e)}",
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+        logger.error(f"Error getting people count cooldown status for {stream_id}: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-@router.get("/debug/video-sharing")
-async def debug_video_sharing():
-    """Get debug information about video sharing"""
-    try:
-        sharing_stats = await stream_manager.get_video_sharing_stats()
+
+# @router.websocket("/notify")
+# async def websocket_notify(websocket: WebSocket):
+#     user_id_str: Optional[str] = None
+#     username_for_log: Optional[str] = None
+#     ping_task: Optional[asyncio.Task] = None
+#     websocket_closed = False  # Track if we've already closed the connection
+
+#     try:
+#         await websocket.accept()
+#         token = await session_manager_global.get_token_from_websocket(websocket)
+#         if not token:
+#             await websocket.send_json({"status": "error", "message": "Authentication token required."})
+#             websocket_closed = True
+#             await websocket.close(1008)
+#             return
+
+#         token_data = await session_manager_global.verify_token(token, "access")
+#         if not token_data or await session_manager_global.is_token_blacklisted(token):
+#             await websocket.send_json({"status": "error", "message": "Invalid or expired token."})
+#             websocket_closed = True
+#             await websocket.close(1008)
+#             return
         
-        # Add additional debug info
-        debug_info = {
-            **sharing_stats,
-            "video_file_manager_exists": hasattr(stream_manager, 'video_file_manager'),
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+#         user_id_str = token_data.user_id
+#         user_db_data = await user_manager_global.get_user_by_id(UUID(user_id_str))
+#         username_for_log = user_db_data.get("username") if user_db_data else f"user_{user_id_str}"
+
+#         logging.info(f"Notify WS: User {username_for_log} connected successfully")
+            
+#         # Check if still connected before sending
+#         if websocket.client_state != WebSocketState.CONNECTED:
+#             logging.warning(f"WebSocket disconnected during authentication for {username_for_log}")
+#             return
+            
+#         await websocket.send_json({
+#             "status": "connected", 
+#             "message": "Connected to notification stream",
+#             "server_time": datetime.now(timezone.utc).timestamp()
+#         })
         
-        return debug_info
+#         # Get initial notifications
+#         initial_notifications = await stream_manager.get_notifications(
+#             user_id_str, workspace_id_filter=None, include_read=False, limit=20
+#         )
         
-    except Exception as e:
-        logging.error(f"Error in debug_video_sharing: {e}", exc_info=True)
-        return {
-            "error": f"Failed to get video sharing debug info: {str(e)}",
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+#         # Format notifications
+#         formatted_notifications = []
+#         for notification in initial_notifications:
+#             formatted_notifications.append({
+#                 "id": notification.get("id"),  # Use "id" not "notification_id"
+#                 "user_id": notification.get("user_id"),
+#                 "workspace_id": notification.get("workspace_id"),
+#                 "stream_id": notification.get("stream_id"),
+#                 "camera_name": notification.get("camera_name"),
+#                 "status": notification.get("status"),
+#                 "message": notification.get("message"),
+#                 "timestamp": notification.get("timestamp"),  # Already in correct format
+#                 "read": notification.get("read", False)
+#             })
+        
+#         # Send initial notifications if any and still connected
+#         if formatted_notifications and websocket.client_state == WebSocketState.CONNECTED:
+#             await websocket.send_json(formatted_notifications)
+        
+#         # Subscribe to notifications
+#         subscription_success = await stream_manager.subscribe_to_notifications(user_id_str, websocket)
+#         if not subscription_success:
+#             logging.warning(f"Notify WS: Failed to subscribe {username_for_log} post-connection.")
+#             if websocket.client_state == WebSocketState.CONNECTED:
+#                 await websocket.send_json({
+#                     "status": "warning", 
+#                     "message": "Subscription failed, notifications may be delayed"
+#                 })
+        
+#         ping_task = asyncio.create_task(send_ping(websocket))
+#         logging.info(f"Notify WS: Setup complete for {username_for_log}, entering message loop")
+
+#         # Main message loop
+#         while websocket.client_state == WebSocketState.CONNECTED:
+#             try:
+#                 receive_timeout = float(config.get("websocket_receive_timeout", 45.0))
+#                 message = await asyncio.wait_for(websocket.receive_json(), timeout=receive_timeout)
+                
+#                 if message.get("type") == "pong": 
+#                     logging.debug(f"Notification WS: Pong received from {username_for_log}")
+#                     continue
+                    
+#                 elif message.get("type") == "mark_read":
+#                     notif_ids_raw = message.get("notification_ids", [])
+#                     if isinstance(notif_ids_raw, list) and user_id_str:
+#                         updated_count = 0
+#                         valid_notif_ids_to_mark: List[UUID] = []
+                        
+#                         for nid_str_raw in notif_ids_raw:
+#                             try:
+#                                 valid_notif_ids_to_mark.append(UUID(str(nid_str_raw)))
+#                             except ValueError:
+#                                 logging.warning(f"Invalid notification ID format for mark_read from {username_for_log}: {nid_str_raw}")
+                        
+#                         if valid_notif_ids_to_mark:
+#                             for nid_uuid in valid_notif_ids_to_mark:
+#                                 try:
+#                                     res = await db_manager_global.execute_query(
+#                                         "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3 AND is_read = FALSE",
+#                                         (datetime.now(timezone.utc), nid_uuid, UUID(user_id_str)), 
+#                                         return_rowcount=True
+#                                     )
+#                                     if res and res > 0:
+#                                         updated_count += 1
+#                                 except Exception as e_mark:
+#                                     logger.error(f"Error marking notification {nid_uuid} as read for {user_id_str}: {e_mark}")
+                        
+#                         # Send acknowledgment only if still connected
+#                         if websocket.client_state == WebSocketState.CONNECTED:
+#                             await websocket.send_json({
+#                                 "type": "ack_mark_read", 
+#                                 "ids": notif_ids_raw, 
+#                                 "updated_count": updated_count
+#                             })
+#                 else:
+#                     logging.warning(f"Unknown message type from {username_for_log}: {message.get('type')}")
+
+#             except asyncio.TimeoutError:
+#                 continue  # No message from client, normal
+#             except WebSocketDisconnect:
+#                 logging.info(f"Notify WS: Client {username_for_log} disconnected normally")
+#                 websocket_closed = True
+#                 break
+#             except asyncio.CancelledError:
+#                 logging.info(f"Notify WS: Task cancelled for {username_for_log}")
+#                 raise
+#             except Exception as e_recv:
+#                 logging.error(f"Notify WS: Error receiving from {username_for_log}: {e_recv}", exc_info=True)
+#                 break
     
+#     except WebSocketDisconnect:
+#         logging.info(f"Notify WS: Client {username_for_log or 'unknown'} disconnected.")
+#         websocket_closed = True
+#     except asyncio.CancelledError:
+#         logging.info(f"Notify WS task for {username_for_log or 'unknown'} cancelled.")
+#     except Exception as e_outer:
+#         logging.error(f"Notify WS: Outer error ({username_for_log or 'unknown'}): {e_outer}", exc_info=True)
+#         # Try to send error message if connection is still viable
+#         if not websocket_closed and websocket.client_state == WebSocketState.CONNECTED:
+#             try:
+#                 await websocket.send_json({"status": "error", "message": "Internal server error."})
+#                 websocket_closed = True
+#                 await websocket.close(1011)
+#             except Exception:
+#                 pass  # Ignore error during error handling
+#     finally:
+#         # Comprehensive cleanup
+#         logging.debug(f"Notify WS: Starting cleanup for {username_for_log or 'unknown'}")
+
+#         # Cancel ping task first
+#         if ping_task and not ping_task.done():
+#             ping_task.cancel()
+#             try:
+#                 await asyncio.wait_for(ping_task, timeout=1.0)
+#             except (asyncio.CancelledError, asyncio.TimeoutError):
+#                 pass
+#             except Exception as e_ping:
+#                 logging.debug(f"Error cancelling ping task for {username_for_log}: {e_ping}")
+
+#         # Unsubscribe from notifications
+#         if user_id_str:
+#             try:
+#                 await stream_manager.unsubscribe_from_notifications(user_id_str, websocket)
+#             except Exception as e_unsub:
+#                 logging.error(f"Error unsubscribing {username_for_log}: {e_unsub}")
+
+#         # Close websocket safely only if not already closed
+#         if not websocket_closed:
+#             await _safe_close_websocket(websocket, username_for_log)
+        
+#         logging.debug(f"Notify WS: Cleanup completed for {username_for_log or 'unknown'}")
+
+
+# @router.get("/streams/locations/search")
+# async def search_streams_by_location(
+#     location_type: str = Query(..., description="Type of location filter: location, area, building, zone, floor_level"),
+#     q: str = Query(..., description="Search query for the location"),
+#     current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
+# ):
+#     """Search streams by location information"""
+#     try:
+#         user_id_str = str(current_user_data["user_id"])
+#         user_id_obj = UUID(user_id_str)
+        
+#         # Get user's workspaces
+#         user_workspaces_db = await db_manager_global.execute_query(
+#             "SELECT workspace_id FROM workspace_members WHERE user_id = $1", 
+#             (user_id_obj,), fetch_all=True
+#         )
+#         user_workspaces_db = user_workspaces_db or []
+#         target_workspace_ids_objs = [row['workspace_id'] for row in user_workspaces_db]
+        
+#         if not target_workspace_ids_objs:
+#             return JSONResponse(content={
+#                 "status": "success",
+#                 "streams": [],
+#                 "total": 0,
+#                 "message": "No workspaces found for user"
+#             })
+        
+#         # Build the query based on location_type
+#         location_column_map = {
+#             "location": "vs.location",
+#             "area": "vs.area", 
+#             "building": "vs.building",
+#             "zone": "vs.zone",
+#             "floor_level": "vs.floor_level"
+#         }
+        
+#         if location_type not in location_column_map:
+#             return JSONResponse(status_code=400, content={
+#                 "status": "error",
+#                 "message": f"Invalid location_type. Must be one of: {list(location_column_map.keys())}"
+#             })
+        
+#         location_column = location_column_map[location_type]
+        
+#         # Create placeholders for workspace IDs
+#         workspace_placeholders = ', '.join([f'${i+2}' for i in range(len(target_workspace_ids_objs))])
+        
+#         # Build the search query
+#         search_query = f"""
+#             SELECT vs.stream_id, vs.name, vs.path, vs.type, vs.status, vs.is_streaming,
+#                    vs.user_id as owner_id, u.username as owner_username,
+#                    vs.workspace_id, w.name as workspace_name,
+#                    vs.created_at, vs.updated_at,
+#                    vs.location, vs.area, vs.building, vs.zone, vs.floor_level, 
+#                    vs.latitude, vs.longitude,
+#                    vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled
+#             FROM video_stream vs
+#             JOIN users u ON vs.user_id = u.user_id
+#             JOIN workspaces w ON vs.workspace_id = w.workspace_id
+#             WHERE vs.workspace_id IN ({workspace_placeholders})
+#             AND {location_column} ILIKE $1
+#             ORDER BY w.name, vs.name
+#         """
+        
+#         # Execute the query
+#         search_pattern = f"%{q}%"
+#         query_params = [search_pattern] + target_workspace_ids_objs
+        
+#         streams_data_db = await db_manager_global.execute_query(
+#             search_query, tuple(query_params), fetch_all=True
+#         )
+#         streams_data_db = streams_data_db or []
+        
+#         # Format results
+#         formatted_streams = []
+#         for s in streams_data_db:
+#             formatted_streams.append({
+#                 "id": str(s["stream_id"]),  # Make sure this matches your frontend expectation
+#                 "stream_id": str(s["stream_id"]),
+#                 "name": s["name"],
+#                 "path": s["path"],
+#                 "type": s["type"],
+#                 "status": s["status"],
+#                 "is_streaming": s["is_streaming"],
+#                 "owner_id": str(s["owner_id"]),
+#                 "owner_username": s["owner_username"],
+#                 "workspace_id": str(s["workspace_id"]),
+#                 "workspace_name": s["workspace_name"],
+#                 "created_at": s["created_at"].isoformat() if s["created_at"] else None,
+#                 "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
+#                 "can_control": True,
+#                 # Location fields
+#                 "location": s["location"],
+#                 "area": s["area"],
+#                 "building": s["building"],
+#                 "zone": s["zone"],
+#                 "floor_level": s["floor_level"],
+#                 "latitude": float(s["latitude"]) if s["latitude"] else None,
+#                 "longitude": float(s["longitude"]) if s["longitude"] else None,
+#                 # Alert thresholds
+#                 "count_threshold_greater": s["count_threshold_greater"],
+#                 "count_threshold_less": s["count_threshold_less"],
+#                 "alert_enabled": s["alert_enabled"]
+#             })
+        
+#         return JSONResponse(content={
+#             "status": "success", 
+#             "streams": formatted_streams,
+#             "total": len(formatted_streams),
+#             "search_criteria": {
+#                 "location_type": location_type,
+#                 "query": q
+#             }
+#         })
+        
+#     except Exception as e:
+#         logging.error(f"Error searching streams by location for user {user_id_str}: {e}", exc_info=True)
+#         return JSONResponse(status_code=500, content={
+#             "status": "error",
+#             "message": "Internal server error during location search"
+#         })
