@@ -1338,3 +1338,15 @@ def sanitize_camera_data_with_alerts(data: Dict[str, Any]) -> Dict[str, Any]:
             sanitized[threshold_field] = None
     
     return sanitized
+
+class UserCameraCountUpdate(BaseModel):
+    user_id: str = Field(..., description="User ID to update camera count for")
+    count_of_camera: int = Field(..., ge=0, le=1000, description="New camera count limit (0-1000)")
+
+class UserCameraCountResponse(BaseModel):
+    user_id: str
+    username: str
+    count_of_camera: int
+    previous_count: int
+    message: str
+    

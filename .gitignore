@@ -85,3 +85,7 @@ coverage/
 
 *.pt
 ###############
+
+test.py
+test0.py
+test1.py

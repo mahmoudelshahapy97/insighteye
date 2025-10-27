@@ -14,7 +14,7 @@ import base64
 import json
 from schemas_models import (
     CameraStreamQueryParams, StreamCreate, StreamUpdate, StreamDelete, CameraState, 
-    CamerasStateResponse, CameraBulkUploadResult, CameraCSVRecord
+    CamerasStateResponse, CameraBulkUploadResult, CameraCSVRecord, UserCameraCountUpdate, UserCameraCountResponse
 )
 from schemas_models import (
     LocationCreate, LocationUpdate, LocationResponse, 
@@ -2814,3 +2814,362 @@ async def get_zones(
     except Exception as e:
         logger.error(f"Error getting zones: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve zones.")
+
+
+@router.put("/admin/user-camera-limit", status_code=status.HTTP_200_OK)
+async def update_user_camera_limit(
+    update_data: UserCameraCountUpdate,
+    request: Request,
+    current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Update the camera count limit for a specific user.
+    Only system admins can update camera limits.
+    """
+    admin_user_id = None
+    admin_username = "unknown"
+    
+    try:
+        # Verify admin privileges
+        admin_user_id = current_admin_data["user_id"]
+        admin_username = current_admin_data["username"]
+        
+        if current_admin_data.get("role") != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="System admin privileges required to update camera limits."
+            )
+        
+        # Validate and convert user_id
+        target_user_id = ensure_uuid_str(update_data.user_id)
+        
+        # Get current user information
+        user_query = """
+            SELECT user_id, username, count_of_camera, role
+            FROM users
+            WHERE user_id = $1
+        """
+        user_info = await db_manager.execute_query(
+            user_query,
+            params=(UUID(target_user_id),),
+            fetch_one=True
+        )
+        
+        if not user_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with ID {target_user_id} not found."
+            )
+        
+        previous_count = user_info["count_of_camera"]
+        target_username = user_info["username"]
+        
+        # Prevent modifying another admin's camera count (optional security check)
+        if user_info["role"] == "admin" and str(admin_user_id) != target_user_id:
+            logger.warning(
+                f"Admin {admin_username} attempted to modify camera limit for another admin {target_username}"
+            )
+            # You can uncomment this to prevent admins from modifying other admins
+            # raise HTTPException(
+            #     status_code=status.HTTP_403_FORBIDDEN,
+            #     detail="Cannot modify camera limits for other admin users."
+            # )
+        
+        # Update the camera count
+        update_query = """
+            UPDATE users
+            SET count_of_camera = $1
+            WHERE user_id = $2
+            RETURNING count_of_camera
+        """
+        
+        result = await db_manager.execute_query(
+            update_query,
+            params=(update_data.count_of_camera, UUID(target_user_id)),
+            fetch_one=True
+        )
+        
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update camera count."
+            )
+        
+        # Log the action
+        await session_manager.log_action(
+            content=f"Admin '{admin_username}' updated camera limit for user '{target_username}' (ID: {target_user_id}) from {previous_count} to {update_data.count_of_camera}",
+            user_id=str(admin_user_id),
+            action_type="Updated_User_Camera_Limit",
+            ip_address=request.client.host if request.client else "Unknown",
+            user_agent=request.headers.get("user-agent", "Unknown"),
+            status="info"
+        )
+        
+        return UserCameraCountResponse(
+            user_id=target_user_id,
+            username=target_username,
+            count_of_camera=result["count_of_camera"],
+            previous_count=previous_count,
+            message=f"Camera limit updated successfully from {previous_count} to {result['count_of_camera']}"
+        )
+        
+    except asyncpg.PostgresError as db_err:
+        logger.error(
+            f"Database error updating camera limit by admin {admin_username}: {db_err}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Database error occurred while updating camera limit."
+        )
+    except ValueError as ve:
+        logger.error(
+            f"Invalid data in update_user_camera_limit by admin {admin_username}: {ve}",
+            exc_info=True
+        )
+        raise HTTPException(status_code=400, detail=f"Invalid data: {ve}")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(
+            f"Unexpected error in update_user_camera_limit by admin {admin_username}: {e}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while updating camera limit."
+        )
+
+
+@router.put("/admin/batch-user-camera-limit", status_code=status.HTTP_200_OK)
+async def batch_update_user_camera_limits(
+    updates: List[UserCameraCountUpdate],
+    request: Request,
+    current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Update camera count limits for multiple users in batch.
+    Only system admins can update camera limits.
+    """
+    admin_user_id = None
+    admin_username = "unknown"
+    
+    try:
+        # Verify admin privileges
+        admin_user_id = current_admin_data["user_id"]
+        admin_username = current_admin_data["username"]
+        
+        if current_admin_data.get("role") != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="System admin privileges required to update camera limits."
+            )
+        
+        if not updates:
+            return {
+                "message": "No updates provided.",
+                "updated_users": [],
+                "failed_users": []
+            }
+        
+        updated_users = []
+        failed_users = []
+        
+        for update_data in updates:
+            try:
+                # Validate user_id
+                target_user_id = ensure_uuid_str(update_data.user_id)
+                
+                # Get current user info
+                user_query = """
+                    SELECT user_id, username, count_of_camera
+                    FROM users
+                    WHERE user_id = $1
+                """
+                user_info = await db_manager.execute_query(
+                    user_query,
+                    params=(UUID(target_user_id),),
+                    fetch_one=True
+                )
+                
+                if not user_info:
+                    failed_users.append({
+                        "user_id": target_user_id,
+                        "reason": "User not found"
+                    })
+                    continue
+                
+                previous_count = user_info["count_of_camera"]
+                
+                # Update camera count
+                update_query = """
+                    UPDATE users
+                    SET count_of_camera = $1
+                    WHERE user_id = $2
+                    RETURNING count_of_camera
+                """
+                
+                result = await db_manager.execute_query(
+                    update_query,
+                    params=(update_data.count_of_camera, UUID(target_user_id)),
+                    fetch_one=True
+                )
+                
+                if result:
+                    updated_users.append({
+                        "user_id": target_user_id,
+                        "username": user_info["username"],
+                        "previous_count": previous_count,
+                        "new_count": result["count_of_camera"]
+                    })
+                else:
+                    failed_users.append({
+                        "user_id": target_user_id,
+                        "reason": "Update failed"
+                    })
+                    
+            except Exception as e_user:
+                logger.error(
+                    f"Error updating camera limit for user {update_data.user_id}: {e_user}",
+                    exc_info=True
+                )
+                failed_users.append({
+                    "user_id": update_data.user_id,
+                    "reason": str(e_user)
+                })
+        
+        # Log the batch action
+        log_content = f"Admin '{admin_username}' batch updated camera limits for {len(updates)} user(s). "
+        log_content += f"Successful: {len(updated_users)}, Failed: {len(failed_users)}."
+        
+        await session_manager.log_action(
+            content=log_content,
+            user_id=str(admin_user_id),
+            action_type="Batch_Updated_User_Camera_Limits",
+            ip_address=request.client.host if request.client else "Unknown",
+            user_agent=request.headers.get("user-agent", "Unknown"),
+            status="info" if not failed_users else "warning"
+        )
+        
+        response_status = status.HTTP_200_OK
+        if failed_users and not updated_users:
+            response_status = status.HTTP_400_BAD_REQUEST
+        elif failed_users:
+            response_status = status.HTTP_207_MULTI_STATUS
+        
+        return Response(
+            content=json.dumps({
+                "message": f"Batch update completed. Updated: {len(updated_users)}, Failed: {len(failed_users)}",
+                "updated_users": updated_users,
+                "failed_users": failed_users
+            }),
+            status_code=response_status,
+            media_type="application/json"
+        )
+        
+    except asyncpg.PostgresError as db_err:
+        logger.error(
+            f"Database error in batch camera limit update by admin {admin_username}: {db_err}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Database error occurred during batch update."
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(
+            f"Unexpected error in batch camera limit update by admin {admin_username}: {e}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred during batch update."
+        )
+
+
+@router.get("/admin/user-camera-limit/{user_id}", status_code=status.HTTP_200_OK)
+async def get_user_camera_limit(
+    user_id: str,
+    current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get the current camera count limit for a specific user.
+    System admins can view any user's limit. Regular users can only view their own.
+    """
+    try:
+        requesting_user_id = current_admin_data["user_id"]
+        requesting_user_role = current_admin_data.get("role")
+        
+        # Validate user_id
+        target_user_id = ensure_uuid_str(user_id)
+        
+        # Check permissions
+        if requesting_user_role != "admin" and str(requesting_user_id) != target_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only view your own camera limit."
+            )
+        
+        # Get user information
+        query = """
+            SELECT user_id, username, email, count_of_camera, role, 
+                   is_active, is_subscribed, created_at
+            FROM users
+            WHERE user_id = $1
+        """
+        user_info = await db_manager.execute_query(
+            query,
+            params=(UUID(target_user_id),),
+            fetch_one=True
+        )
+        
+        if not user_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with ID {target_user_id} not found."
+            )
+        
+        # Get current camera count across all workspaces
+        camera_count_query = """
+            SELECT COUNT(*) as total_cameras
+            FROM video_stream
+            WHERE user_id = $1
+        """
+        camera_count = await db_manager.execute_query(
+            camera_count_query,
+            params=(UUID(target_user_id),),
+            fetch_one=True
+        )
+        
+        return {
+            "user_id": str(user_info["user_id"]),
+            "username": user_info["username"],
+            "email": user_info["email"],
+            "count_of_camera": user_info["count_of_camera"],
+            "current_cameras": camera_count["total_cameras"] if camera_count else 0,
+            "remaining_limit": max(0, user_info["count_of_camera"] - (camera_count["total_cameras"] if camera_count else 0)),
+            "role": user_info["role"],
+            "is_active": user_info["is_active"],
+            "is_subscribed": user_info["is_subscribed"],
+            "created_at": user_info["created_at"].isoformat() if user_info["created_at"] else None
+        }
+        
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Database error getting user camera limit: {db_err}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Database error occurred while retrieving camera limit."
+        )
+    except ValueError as ve:
+        logger.error(f"Invalid data in get_user_camera_limit: {ve}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Invalid data: {ve}")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Unexpected error in get_user_camera_limit: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while retrieving camera limit."
+        )

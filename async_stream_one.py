@@ -22,7 +22,9 @@ from async_config import config
 from async_session_manager import SessionManager 
 from async_user_manager import UserManager
 from shared_stream import VideoFileManager
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+import socket
+import re
 import os
 from starlette.websockets import WebSocketState
 from async_workspaces import check_workspace_membership_and_get_role
@@ -35,7 +37,129 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["stream"]) 
 
 # ThreadPoolExecutor for CPU-bound tasks like YOLO and cv2
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 2 + 4))
+thread_pool = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) * 2 + 4))
+
+class StreamValidator:
+    """Handle stream validation with proper timeout and retry logic"""
+    
+    @staticmethod
+    def check_rtsp_connectivity(source: str, timeout: int = 5) -> bool:
+        """Quick TCP connectivity check"""
+        import socket
+        import re
+        
+        match = re.search(r'@([\d\.]+):(\d+)', source)
+        if match:
+            host, port = match.groups()
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                result = sock.connect_ex((host, int(port)))
+                sock.close()
+                
+                if result == 0:
+                    logging.info(f"Network connectivity OK: {host}:{port}")
+                    return True
+                else:
+                    logging.error(f"Cannot connect to {host}:{port} (error code: {result})")
+                    return False
+            except Exception as e:
+                logging.error(f"Connectivity check failed: {e}")
+                return False
+        
+        # For non-RTSP sources, skip connectivity check
+        return True
+    
+    @staticmethod
+    async def validate_stream_source(source: str, timeout: int = 20) -> bool:
+        """Validate stream source with configurable timeout"""
+        
+        def _check_source():
+            test_cap = None
+            try:
+                # File validation
+                if not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and not source.isdigit():
+                    if not os.path.exists(source):
+                        logging.error(f"Video file does not exist: {source}")
+                        return False
+                    
+                    if not os.access(source, os.R_OK):
+                        logging.error(f"Video file is not readable: {source}")
+                        return False
+                    
+                    if os.path.getsize(source) == 0:
+                        logging.error(f"Video file is empty: {source}")
+                        return False
+                
+                # Set FFmpeg timeout options (most reliable method)
+                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = f'rtsp_transport;udp|timeout;{timeout * 1000000}'
+                
+                # Open with FFmpeg backend
+                test_cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+                
+                # Configure OpenCV timeouts
+                if source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')):
+                    test_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout * 1000)
+                    test_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout * 1000)
+                
+                if not test_cap.isOpened():
+                    logging.error(f"Cannot open video source: {source}")
+                    return False
+                
+                # Try to read one frame
+                ret, frame = test_cap.read()
+                
+                if not ret or frame is None:
+                    logging.error(f"Cannot read from video source: {source}")
+                    return False
+                
+                logging.info(f"Successfully validated source: {source}")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Error validating source {source}: {e}")
+                return False
+            finally:
+                if test_cap is not None:
+                    test_cap.release()
+        
+        loop = asyncio.get_event_loop()
+        
+        try:
+            future = loop.run_in_executor(thread_pool, _check_source)
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            logging.error(f"Validation timeout ({timeout}s) for source: {source}")
+            return False
+        except Exception as e:
+            logging.error(f"Unexpected error during validation: {e}")
+            return False
+    
+    @staticmethod
+    async def validate_with_retry(source: str, max_retries: int = 3, timeout: int = 20) -> bool:
+        """Validate with retry logic and exponential backoff"""
+        
+        # Quick connectivity check for RTSP streams
+        if source.startswith('rtsp://'):
+            if not StreamValidator.check_rtsp_connectivity(source, timeout=15):
+                logging.error(f"Network connectivity check failed for: {source}")
+                return False
+        
+        # Retry validation
+        for attempt in range(max_retries):
+            logging.info(f"Validation attempt {attempt + 1}/{max_retries} for: {source}")
+            
+            if await StreamValidator.validate_stream_source(source, timeout=timeout):
+                logging.info(f"✓ Stream validated successfully: {source}")
+                return True
+            
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # 1s, 2s, 4s
+                logging.warning(f"Validation attempt {attempt + 1} failed, retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+        
+        logging.error(f"All validation attempts failed for: {source}")
+        return False
 
 class StreamManager:
 
@@ -62,6 +186,7 @@ class StreamManager:
         self.last_healthcheck = datetime.now(timezone.utc)
         self.healthcheck_interval = config.get("stream_healthcheck_interval_seconds", 60)
         self.db_manager = DatabaseManager() # StreamManager's own instance
+        self.validator = StreamValidator()
         self.user_manager = UserManager() 
         self.qdrant_client = QdrantClient(
             url=config.get("qdrant_url", "localhost"), 
@@ -715,6 +840,63 @@ class StreamManager:
                 if not self.notification_subscribers[user_id]: del self.notification_subscribers[user_id]
         logging.info(f"WS client unsubscribed from notifications for user {user_id}")
 
+    # async def _stop_stream(self, stream_id_str: str, for_restart: bool = False):
+    #     async with self._lock:
+    #         stream_info = self.active_streams.pop(stream_id_str, None)
+        
+    #     if not stream_info:
+    #         if not for_restart: # If not for restart, ensure DB is updated if stream was missed by manager
+    #             await self.db_manager.execute_query(
+    #                 "UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', updated_at = NOW(), last_activity = NOW() WHERE stream_id = $1 AND is_streaming = TRUE",
+    #                 (UUID(stream_id_str),) 
+    #             )
+    #         return
+
+    #     stream_uuid = UUID(stream_id_str)
+    #     stop_event_obj: Optional[threading.Event] = stream_info.get('stop_event')
+    #     task_obj: Optional[asyncio.Task] = stream_info.get('task')
+
+    #     # NEW: Clean up fire notification cooldown tracking
+    #     # self.fire_notification_cooldowns.pop(stream_id_str, None)
+    #     # Only clean up in-memory state
+    #     self.fire_detection_states.pop(stream_id_str, None)
+    #     self.fire_detection_frame_counts.pop(stream_id_str, None)
+    #     self.people_count_notification_cooldowns.pop(stream_id_str, None)
+
+    #     try:
+    #         if stop_event_obj: stop_event_obj.set()
+    #         if task_obj and not task_obj.done():
+    #             task_obj.cancel()
+    #             try: 
+    #                 await asyncio.wait_for(task_obj, timeout=config.get("stream_stop_timeout_seconds", 10.0))
+    #             except asyncio.CancelledError: logging.debug(f"Stream task for {stream_id_str} cancelled as expected.")
+    #             except asyncio.TimeoutError: logging.warning(f"Timeout stopping stream task {stream_id_str}.")
+            
+    #         logging.info(f"Stream {stream_id_str} processing task signaled to stop locally.")
+    #         now_utc = datetime.now(timezone.utc)
+            
+    #         if for_restart:
+    #             # is_streaming remains TRUE, status indicates it's being restarted
+    #             await self.db_manager.execute_query( 
+    #                 "UPDATE video_stream SET status = 'processing', last_activity = $1, updated_at = $1 WHERE stream_id = $2 AND is_streaming = TRUE", 
+    #                 (now_utc, stream_uuid)
+    #             )
+    #             logging.info(f"Stream {stream_id_str} marked 'processing' for restart. is_streaming remains TRUE.")
+    #         else:
+    #             await self.db_manager.execute_query(
+    #                 "UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', last_activity = $1, updated_at = $1 WHERE stream_id = $2", 
+    #                 (now_utc, stream_uuid)
+    #             )   
+    #             owner_id = stream_info.get('user_id')
+    #             ws_id = stream_info.get('workspace_id')
+    #             cam_name = stream_info.get('camera_name', 'Unknown Camera')
+    #             if owner_id and ws_id:
+    #                 asyncio.create_task(self.add_notification(str(owner_id), str(ws_id), stream_id_str, cam_name, "inactive", f"Camera '{cam_name}' was stopped."))
+    #     except Exception as e:
+    #         logging.error(f"Error during _stop_stream for {stream_id_str}: {e}", exc_info=True)
+    #     finally:
+    #         self.stream_processing_stats.pop(stream_id_str, None)
+
     async def _stop_stream(self, stream_id_str: str, for_restart: bool = False):
         async with self._lock:
             stream_info = self.active_streams.pop(stream_id_str, None)
@@ -730,28 +912,44 @@ class StreamManager:
         stream_uuid = UUID(stream_id_str)
         stop_event_obj: Optional[threading.Event] = stream_info.get('stop_event')
         task_obj: Optional[asyncio.Task] = stream_info.get('task')
+        source = stream_info.get('source')
 
-        # NEW: Clean up fire notification cooldown tracking
-        # self.fire_notification_cooldowns.pop(stream_id_str, None)
-        # Only clean up in-memory state
+        # Clean up in-memory state
         self.fire_detection_states.pop(stream_id_str, None)
         self.fire_detection_frame_counts.pop(stream_id_str, None)
         self.people_count_notification_cooldowns.pop(stream_id_str, None)
 
         try:
-            if stop_event_obj: stop_event_obj.set()
+            # CRITICAL FIX: Unsubscribe from shared stream BEFORE stopping task
+            if source and hasattr(self, 'video_file_manager'):
+                shared_stream = self.video_file_manager.shared_streams.get(source)
+                if shared_stream:
+                    logging.info(f"Unsubscribing {stream_id_str} from shared stream: {source}")
+                    shared_stream.remove_subscriber(stream_id_str)
+                    
+                    # Give shared stream a moment to process unsubscription
+                    await asyncio.sleep(0.5)
+            
+            # Signal and cancel the processing task
+            if stop_event_obj: 
+                stop_event_obj.set()
+            
             if task_obj and not task_obj.done():
                 task_obj.cancel()
                 try: 
-                    await asyncio.wait_for(task_obj, timeout=config.get("stream_stop_timeout_seconds", 5.0))
-                except asyncio.CancelledError: logging.debug(f"Stream task for {stream_id_str} cancelled as expected.")
-                except asyncio.TimeoutError: logging.warning(f"Timeout stopping stream task {stream_id_str}.")
+                    await asyncio.wait_for(task_obj, timeout=config.get("stream_stop_timeout_seconds", 10.0))
+                except asyncio.CancelledError: 
+                    logging.debug(f"Stream task for {stream_id_str} cancelled as expected.")
+                except asyncio.TimeoutError: 
+                    logging.warning(f"Timeout stopping stream task {stream_id_str}. Task may still be running.")
+                    # Force kill the task if it's still running
+                    if not task_obj.done():
+                        logging.error(f"Forcefully terminating stuck task for {stream_id_str}")
             
             logging.info(f"Stream {stream_id_str} processing task signaled to stop locally.")
             now_utc = datetime.now(timezone.utc)
             
             if for_restart:
-                # is_streaming remains TRUE, status indicates it's being restarted
                 await self.db_manager.execute_query( 
                     "UPDATE video_stream SET status = 'processing', last_activity = $1, updated_at = $1 WHERE stream_id = $2 AND is_streaming = TRUE", 
                     (now_utc, stream_uuid)
@@ -771,6 +969,16 @@ class StreamManager:
             logging.error(f"Error during _stop_stream for {stream_id_str}: {e}", exc_info=True)
         finally:
             self.stream_processing_stats.pop(stream_id_str, None)
+            
+            # ADDITIONAL CLEANUP: Ensure shared stream is cleaned up even on error
+            if source and hasattr(self, 'video_file_manager'):
+                try:
+                    shared_stream = self.video_file_manager.shared_streams.get(source)
+                    if shared_stream and stream_id_str in shared_stream.subscribers:
+                        logging.warning(f"Final cleanup: removing {stream_id_str} from shared stream {source}")
+                        shared_stream.remove_subscriber(stream_id_str)
+                except Exception as cleanup_error:
+                    logging.error(f"Error in final shared stream cleanup for {stream_id_str}: {cleanup_error}")
 
     async def start_stream_background(self, stream_id: UUID, owner_id: UUID, owner_username: str, 
                                     camera_name: str, source: str, workspace_id: UUID, 
@@ -1222,51 +1430,55 @@ class StreamManager:
             logging.error(f"Error force restarting shared stream {source_path}: {e}", exc_info=True)
             return False
 
-    async def _validate_stream_source(self, source: str) -> bool:
-        """Validate stream source before processing"""
-        loop = asyncio.get_event_loop()
+    # async def _validate_stream_source(self, source: str) -> bool:
+    #     """Validate stream source before processing"""
+    #     loop = asyncio.get_event_loop()
         
-        def _check_source():
-            try:
-                # Check if it's a file
-                if not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and not source.isdigit():
-                    import os
-                    if not os.path.exists(source):
-                        logging.error(f"Video file does not exist: {source}")
-                        return False
+    #     def _check_source():
+    #         try:
+    #             # Check if it's a file
+    #             if not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and not source.isdigit():
+    #                 import os
+    #                 if not os.path.exists(source):
+    #                     logging.error(f"Video file does not exist: {source}")
+    #                     return False
                     
-                    if not os.access(source, os.R_OK):
-                        logging.error(f"Video file is not readable: {source}")
-                        return False
+    #                 if not os.access(source, os.R_OK):
+    #                     logging.error(f"Video file is not readable: {source}")
+    #                     return False
                     
-                    file_size = os.path.getsize(source)
-                    if file_size == 0:
-                        logging.error(f"Video file is empty: {source}")
-                        return False
+    #                 file_size = os.path.getsize(source)
+    #                 if file_size == 0:
+    #                     logging.error(f"Video file is empty: {source}")
+    #                     return False
                 
-                # Quick validation with OpenCV
-                test_cap = cv2.VideoCapture(source)
-                if not test_cap.isOpened():
-                    logging.error(f"Cannot open video source: {source}")
-                    test_cap.release()
-                    return False
+    #             # Quick validation with OpenCV
+    #             test_cap = cv2.VideoCapture(source)
+    #             if not test_cap.isOpened():
+    #                 logging.error(f"Cannot open video source: {source}")
+    #                 test_cap.release()
+    #                 return False
                 
-                # Try to read one frame
-                ret, frame = test_cap.read()
-                test_cap.release()
+    #             # Try to read one frame
+    #             ret, frame = test_cap.read()
+    #             test_cap.release()
                 
-                if not ret or frame is None:
-                    logging.error(f"Cannot read from video source: {source}")
-                    return False
+    #             if not ret or frame is None:
+    #                 logging.error(f"Cannot read from video source: {source}")
+    #                 return False
                 
-                return True
+    #             return True
                 
-            except Exception as e:
-                logging.error(f"Error validating source {source}: {e}")
-                return False
+    #         except Exception as e:
+    #             logging.error(f"Error validating source {source}: {e}")
+    #             return False
         
-        return await loop.run_in_executor(thread_pool, _check_source)
+    #     return await loop.run_in_executor(thread_pool, _check_source)
 
+    async def _validate_stream_source(self, source: str) -> bool:
+        """Validate stream source before processing - uses StreamValidator"""
+        return await self.validator.validate_with_retry(source, max_retries=2, timeout=20)
+        
     async def start_stream_background_with_sharing(self, stream_id: UUID, owner_id: UUID, owner_username: str, 
                                     camera_name: str, source: str, workspace_id: UUID, 
                                     location_info: Optional[Dict[str, Any]] = None):
@@ -3360,6 +3572,47 @@ async def debug_people_count_cooldown_status(
         logger.error(f"Error getting people count cooldown status for {stream_id}: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+@router.post("/debug/validate-stream")
+async def debug_validate_stream(
+    source: str = Query(..., description="Stream source URL or file path"),
+    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
+):
+    """Debug endpoint to test stream validation"""
+    try:
+        start_time = time.time()
+        
+        # Check connectivity first (for RTSP)
+        connectivity_ok = False
+        if source.startswith('rtsp://'):
+            connectivity_ok = StreamValidator.check_rtsp_connectivity(source, timeout=15)
+            if not connectivity_ok:
+                return {
+                    "status": "failed",
+                    "message": "Network connectivity check failed",
+                    "source": source,
+                    "duration": time.time() - start_time
+                }
+        
+        # Validate stream
+        is_valid = await StreamValidator.validate_with_retry(source, max_retries=2, timeout=8)
+        
+        duration = time.time() - start_time
+        
+        return {
+            "status": "success" if is_valid else "failed",
+            "valid": is_valid,
+            "source": source,
+            "duration": duration,
+            "connectivity_check": connectivity_ok if source.startswith('rtsp://') else "not applicable"
+        }
+        
+    except Exception as e:
+        logging.error(f"Error validating stream {source}: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": str(e),
+            "source": source
+        }
 
 # @router.websocket("/notify")
 # async def websocket_notify(websocket: WebSocket):

@@ -823,7 +823,7 @@ def use_fallback_prediction(df: pd.DataFrame) -> Dict[str, int]:
             "next_week": round(max(0, avg_count))
         }
 
-def make_prediction_defalut(camera_id: str, data: List[Dict[str, Any]]) -> Dict[str, int]:
+def make_prediction_default(camera_id: str, data: List[Dict[str, Any]]) -> Dict[str, int]:
     """ Placeholder function to simulate making a prediction. Matches utils.py. """
     if data and len(data) > 0:
         # Ensure metadata and person_count exist and are valid

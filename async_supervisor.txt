@@ -22,4 +22,3 @@ sudo supervisorctl status insighteye_async
 sudo supervisorctl stop insighteye_async
 
 sudo tail -f /home/ubuntu/insighteye/backend/logs/insighteye_async.out.log /home/ubuntu/insighteye/backend/logs/insighteye_async.err.log
-sudo tail -f /home/ubuntu/insighteye/backend/logs/insighinsighteye_asyncteye.out.log /home/ubuntu/insighteye/backend/logs/insighteye_async.err.log
