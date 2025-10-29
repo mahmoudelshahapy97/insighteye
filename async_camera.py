@@ -329,8 +329,8 @@ async def get_all_streams(
         logger.error(f"Unexpected error retrieving all streams (admin/scoped): {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
-@router.put("/source", status_code=status.HTTP_200_OK)
-async def update_streams(streams: List[StreamUpdate], request: Request, current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)):
+@router.put("/source1", status_code=status.HTTP_200_OK)
+async def update_streams1(streams: List[StreamUpdate], request: Request, current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)):
     user_id_obj = None
     username = "unknown"
     active_workspace_id_obj = None
@@ -545,6 +545,280 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
         return Response(
             content=json.dumps({"detail": response_detail_msg, "updated_ids": final_updated_ids, "failed_ids": final_failed_ids}),
             status_code=response_status_code, media_type="application/json"
+        )
+
+    except asyncpg.PostgresError as db_err: 
+        log_user_id = str(user_id_obj) if user_id_obj else "unknown"
+        logger.error(f"Database error in update_streams batch for user {log_user_id}: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error occurred during stream updates.")
+    except ValueError as ve: 
+        log_user_id = str(user_id_obj) if user_id_obj else "unknown"
+        logger.error(f"Invalid data in update_streams batch for user {log_user_id}: {ve}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Invalid data: {ve}")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        log_user_id = str(user_id_obj) if user_id_obj else "unknown"
+        logger.error(f"Unexpected error in update_streams batch for user {log_user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred during stream updates.")
+
+@router.put("/source", status_code=status.HTTP_200_OK)
+async def update_streams(streams: List[StreamUpdate], request: Request, current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)):
+    user_id_obj = None
+    username = "unknown"
+    active_workspace_id_obj = None
+    try:
+        user_id_obj = current_user_data["user_id"]
+        username = current_user_data["username"]
+        _user_id_from_ws_check, active_workspace_id_obj = await get_user_and_workspace(username) 
+
+        updated_ids, failed_ids, qdrant_sync_failures = [], [], []
+
+        for stream_update_data in streams:
+            stream_id_to_update_str = ensure_uuid_str(stream_update_data.id) 
+            
+            stream_info_query = "SELECT user_id, workspace_id FROM video_stream WHERE stream_id = $1"
+            stream_info = await db_manager.execute_query(stream_info_query, params=(UUID(stream_id_to_update_str),), fetch_one=True) 
+
+            if not stream_info:
+                logger.warning(f"Stream ID {stream_id_to_update_str} not found for update by {username}.")
+                failed_ids.append(stream_id_to_update_str)
+                continue
+            
+            stream_owner_id_obj = stream_info["user_id"] 
+            stream_workspace_id_obj = stream_info["workspace_id"]
+
+            can_update = False
+            if stream_owner_id_obj == user_id_obj:
+                can_update = True
+            else:
+                try:
+                    await check_workspace_membership_and_get_role(user_id_obj, stream_workspace_id_obj, required_role="admin") 
+                    can_update = True
+                except HTTPException: 
+                    pass 
+            
+            if not can_update and current_user_data.get("role") == "admin": 
+                can_update = True
+
+            if not can_update:
+                logger.warning(f"User {username} (ID: {user_id_obj}) unauthorized to update stream ID: {stream_id_to_update_str}")
+                failed_ids.append(stream_id_to_update_str)
+                continue
+            
+            set_clauses_list, update_params_list = [], []
+            param_idx = 1
+            
+            # Track fields for Qdrant update
+            qdrant_payload = {}
+            
+            if stream_update_data.name is not None: 
+                set_clauses_list.append(f"name = ${param_idx}"); 
+                update_params_list.append(stream_update_data.name); 
+                qdrant_payload["name"] = stream_update_data.name
+                param_idx += 1
+                
+            if stream_update_data.path is not None: 
+                set_clauses_list.append(f"path = ${param_idx}"); 
+                update_params_list.append(stream_update_data.path); 
+                param_idx += 1
+                
+            if stream_update_data.type is not None: 
+                set_clauses_list.append(f"type = ${param_idx}"); 
+                update_params_list.append(stream_update_data.type); 
+                param_idx += 1
+                
+            if stream_update_data.status is not None: 
+                set_clauses_list.append(f"status = ${param_idx}"); 
+                update_params_list.append(stream_update_data.status); 
+                param_idx += 1
+                
+            if stream_update_data.is_streaming is not None: 
+                set_clauses_list.append(f"is_streaming = ${param_idx}"); 
+                update_params_list.append(stream_update_data.is_streaming); 
+                param_idx += 1
+            
+            # Location fields
+            if hasattr(stream_update_data, 'location') and stream_update_data.location is not None:
+                set_clauses_list.append(f"location = ${param_idx}")
+                update_params_list.append(stream_update_data.location)
+                qdrant_payload["location"] = stream_update_data.location
+                param_idx += 1
+                
+            if hasattr(stream_update_data, 'area') and stream_update_data.area is not None:
+                set_clauses_list.append(f"area = ${param_idx}")
+                update_params_list.append(stream_update_data.area)
+                qdrant_payload["area"] = stream_update_data.area
+                param_idx += 1
+                
+            if hasattr(stream_update_data, 'building') and stream_update_data.building is not None:
+                set_clauses_list.append(f"building = ${param_idx}")
+                update_params_list.append(stream_update_data.building)
+                qdrant_payload["building"] = stream_update_data.building
+                param_idx += 1
+                
+            if hasattr(stream_update_data, 'floor_level') and stream_update_data.floor_level is not None:
+                set_clauses_list.append(f"floor_level = ${param_idx}")
+                update_params_list.append(stream_update_data.floor_level)
+                qdrant_payload["floor_level"] = stream_update_data.floor_level
+                param_idx += 1
+                
+            if hasattr(stream_update_data, 'zone') and stream_update_data.zone is not None:
+                set_clauses_list.append(f"zone = ${param_idx}")
+                update_params_list.append(stream_update_data.zone)
+                qdrant_payload["zone"] = stream_update_data.zone
+                param_idx += 1
+                
+            if hasattr(stream_update_data, 'latitude') and stream_update_data.latitude is not None:
+                set_clauses_list.append(f"latitude = ${param_idx}")
+                update_params_list.append(stream_update_data.latitude)
+                qdrant_payload["latitude"] = float(stream_update_data.latitude)
+                param_idx += 1
+                
+            if hasattr(stream_update_data, 'longitude') and stream_update_data.longitude is not None:
+                set_clauses_list.append(f"longitude = ${param_idx}")
+                update_params_list.append(stream_update_data.longitude)
+                qdrant_payload["longitude"] = float(stream_update_data.longitude)
+                param_idx += 1
+            
+            # Alert fields (these don't go to Qdrant typically, but included for completeness)
+            if hasattr(stream_update_data, 'count_threshold_greater') and stream_update_data.count_threshold_greater is not None:
+                set_clauses_list.append(f"count_threshold_greater = ${param_idx}")
+                update_params_list.append(stream_update_data.count_threshold_greater)
+                param_idx += 1
+                
+            if hasattr(stream_update_data, 'count_threshold_less') and stream_update_data.count_threshold_less is not None:
+                set_clauses_list.append(f"count_threshold_less = ${param_idx}")
+                update_params_list.append(stream_update_data.count_threshold_less)
+                param_idx += 1
+                
+            if hasattr(stream_update_data, 'alert_enabled') and stream_update_data.alert_enabled is not None:
+                set_clauses_list.append(f"alert_enabled = ${param_idx}")
+                update_params_list.append(stream_update_data.alert_enabled)
+                param_idx += 1
+            
+            if not set_clauses_list: 
+                logger.info(f"No update clauses for stream {stream_id_to_update_str}. Skipping.")
+                continue
+
+            set_clauses_list.append(f"updated_at = ${param_idx}"); 
+            update_params_list.append(datetime.now(ZoneInfo("Africa/Cairo"))); 
+            param_idx += 1
+            update_query_str = f"UPDATE video_stream SET {', '.join(set_clauses_list)} WHERE stream_id = ${param_idx}"
+            update_params_list.append(UUID(stream_id_to_update_str)) 
+
+            try:
+                # Update PostgreSQL
+                rows_affected = await db_manager.execute_query(update_query_str, params=tuple(update_params_list), return_rowcount=True) 
+                
+                if rows_affected > 0:
+                    # PostgreSQL update successful, now update Qdrant
+                    if qdrant_payload:  # Only update Qdrant if there are relevant fields
+                        try:
+                            qdrant_client = get_qdrant_client()
+                            collection_name = get_workspace_qdrant_collection_name(str(stream_workspace_id_obj))
+                            
+                            # Ensure collection exists
+                            await ensure_workspace_qdrant_collection_exists(qdrant_client, str(stream_workspace_id_obj))
+                            
+                            # Update all points with this camera_id
+                            update_result = qdrant_client.set_payload(
+                                collection_name=collection_name,
+                                payload=qdrant_payload,
+                                points=qdrant_models.Filter(
+                                    must=[
+                                        qdrant_models.FieldCondition(
+                                            key="camera_id", 
+                                            match=qdrant_models.MatchValue(value=stream_id_to_update_str)
+                                        )
+                                    ]
+                                ),
+                                wait=True  # Wait for operation to complete
+                            )
+                            
+                            # Check if Qdrant update was successful
+                            if hasattr(update_result, 'status') and update_result.status == qdrant_models.UpdateStatus.COMPLETED:
+                                updated_fields = list(qdrant_payload.keys())
+                                logger.info(f"Successfully synchronized {len(updated_fields)} field(s) in Qdrant for camera_id {stream_id_to_update_str}: {', '.join(updated_fields)}")
+                                updated_ids.append(stream_id_to_update_str)
+                            else:
+                                logger.warning(f"Qdrant update status unclear for camera_id {stream_id_to_update_str}: {update_result}")
+                                updated_ids.append(stream_id_to_update_str)
+                                qdrant_sync_failures.append({
+                                    "camera_id": stream_id_to_update_str,
+                                    "reason": f"Uncertain Qdrant status: {update_result.status if hasattr(update_result, 'status') else 'unknown'}"
+                                })
+                                
+                        except Exception as e_qdrant:
+                            logger.error(f"Failed to update Qdrant for camera_id {stream_id_to_update_str}: {e_qdrant}", exc_info=True)
+                            updated_ids.append(stream_id_to_update_str)
+                            qdrant_sync_failures.append({
+                                "camera_id": stream_id_to_update_str,
+                                "reason": str(e_qdrant),
+                                "fields_attempted": list(qdrant_payload.keys())
+                            })
+                    else:
+                        # No Qdrant-relevant fields were updated
+                        updated_ids.append(stream_id_to_update_str)
+                        logger.debug(f"Camera {stream_id_to_update_str} updated in PostgreSQL only (no Qdrant-relevant fields changed)")
+                else:
+                    logger.warning(f"PostgreSQL update for ID {stream_id_to_update_str} affected 0 rows.")
+                    failed_ids.append(stream_id_to_update_str)
+                    
+            except Exception as e_update:
+                logger.error(f"Error updating stream {stream_id_to_update_str}: {e_update}", exc_info=True)
+                failed_ids.append(stream_id_to_update_str)
+
+        # Prepare logging content
+        log_content = f"User '{username}' attempted to update {len(streams)} camera(s)."
+        if updated_ids: 
+            unique_updated = list(set(updated_ids))
+            log_content += f" Successfully updated: {', '.join(unique_updated)}."
+        if qdrant_sync_failures:
+            log_content += f" Qdrant sync issues for {len(qdrant_sync_failures)} camera(s)."
+        if failed_ids: 
+            unique_failed = list(set(failed_ids))
+            log_content += f" Failed/unauthorized: {', '.join(unique_failed)}."
+        
+        await session_manager.log_action(
+            content=log_content, 
+            user_id=str(user_id_obj),
+            workspace_id=str(active_workspace_id_obj) if active_workspace_id_obj else None,
+            action_type="Updated_Cameras_Batch",
+            ip_address=request.client.host if request.client else "Unknown",
+            user_agent=request.headers.get("user-agent", "Unknown")
+        )
+
+        final_updated_ids = list(set(updated_ids))
+        final_failed_ids = list(set(failed_ids))
+
+        # Determine response status
+        response_status_code = status.HTTP_200_OK
+        response_detail_msg = f"Streams update completed. Updated: {len(final_updated_ids)}."
+        
+        if qdrant_sync_failures:
+            response_status_code = status.HTTP_207_MULTI_STATUS
+            response_detail_msg += f" Warning: Qdrant sync issues for {len(qdrant_sync_failures)} camera(s)."
+            
+        if final_failed_ids:
+            response_status_code = status.HTTP_207_MULTI_STATUS if final_updated_ids else status.HTTP_400_BAD_REQUEST
+            response_detail_msg += f" Failed/unauthorized: {', '.join(final_failed_ids)}."
+        
+        return Response(
+            content=json.dumps({
+                "detail": response_detail_msg,
+                "updated_ids": final_updated_ids,
+                "failed_ids": final_failed_ids,
+                "qdrant_sync_failures": qdrant_sync_failures,
+                "summary": {
+                    "total_requested": len(streams),
+                    "postgres_success": len(final_updated_ids),
+                    "qdrant_sync_issues": len(qdrant_sync_failures),
+                    "failed": len(final_failed_ids)
+                }
+            }),
+            status_code=response_status_code,
+            media_type="application/json"
         )
 
     except asyncpg.PostgresError as db_err: 
