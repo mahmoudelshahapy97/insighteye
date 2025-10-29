@@ -12,9 +12,11 @@ import threading
 import uuid 
 from uuid import UUID, uuid4
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Set, Any, Union
 from ultralytics import YOLO
-from async_utils import send_people_count_alert_email, send_fire_alert_email, frame_to_base64, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists
+from async_utils import send_people_count_alert_email, send_fire_alert_email, frame_to_base64, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists, parse_string_or_list, encoded_string
 from async_database import DatabaseManager
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
@@ -183,7 +185,7 @@ class StreamManager:
         self.fire_detection_frame_counts: Dict[str, int] = {}  # Track frame counts per stream
         self.global_fire_states: Dict[str, Dict[str, Any]] = {}
         self.frame_buffer_size = config.get("cv_frame_buffer_size", 3)
-        self.last_healthcheck = datetime.now(timezone.utc)
+        self.last_healthcheck = datetime.now(ZoneInfo("Africa/Cairo"))
         self.healthcheck_interval = config.get("stream_healthcheck_interval_seconds", 60)
         self.db_manager = DatabaseManager() # StreamManager's own instance
         self.validator = StreamValidator()
@@ -309,7 +311,7 @@ class StreamManager:
     async def _periodic_cleanup(self):
         while True:
             try:
-                current_time_ts = datetime.now(timezone.utc).timestamp()
+                current_time_ts = datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
                 async with self._lock: 
                     expired_keys = [
                         key for key, update_time in self.param_cache_last_updated.items()
@@ -375,10 +377,10 @@ class StreamManager:
 
     async def _check_stream_health(self):
         async with self._health_lock: # Ensure only one health check runs at a time
-            if (datetime.now(timezone.utc) - self.last_healthcheck).total_seconds() <= self.healthcheck_interval / 2: # Avoid too frequent checks
+            if (datetime.now(ZoneInfo("Africa/Cairo")) - self.last_healthcheck).total_seconds() <= self.healthcheck_interval / 2: # Avoid too frequent checks
                 return
 
-            current_time_utc = datetime.now(timezone.utc)
+            current_time_utc = datetime.now(ZoneInfo("Africa/Cairo"))
             streams_to_restart_ids = []
             
             async with self._lock: 
@@ -422,7 +424,7 @@ class StreamManager:
             for stream_id_to_restart_str in streams_to_restart_ids:
                 logging.info(f"Health check: Restarting frozen stream: {stream_id_to_restart_str}")
                 await self._stop_stream(stream_id_to_restart_str, for_restart=True) 
-            self.last_healthcheck = datetime.now(timezone.utc)
+            self.last_healthcheck = datetime.now(ZoneInfo("Africa/Cairo"))
     
     def _initialize_model(self): # Stays sync
         people_model_path = config.get("people_model_path", "yolov8n.pt")
@@ -479,7 +481,7 @@ class StreamManager:
     async def get_stream_parameters(self, workspace_id: Union[str, UUID]) -> Dict[str, Any]:
         workspace_id_str = str(workspace_id)
         cache_key = f"params_workspace_{workspace_id_str}"
-        current_time_ts = datetime.now(timezone.utc).timestamp()
+        current_time_ts = datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
         
         async with self._lock: 
             if cache_key in self.param_cache and \
@@ -547,7 +549,7 @@ class StreamManager:
         }
 
     async def add_notification1(self, user_id: str, workspace_id: str, stream_id: str, camera_name: str, status: str, message: str):
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(ZoneInfo("Africa/Cairo"))
         notif_id = uuid4()
         # Timestamp as float for JSON, datetime object for DB
         notification_data_json = { 
@@ -576,7 +578,7 @@ class StreamManager:
         return notification_data_json # Return the JSON version
 
     async def add_notification(self, user_id: str, workspace_id: str, stream_id: str, camera_name: str, status: str, message: str):
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(ZoneInfo("Africa/Cairo"))
         notif_id = uuid4()
         
         # Timestamp as float for JSON, datetime object for DB
@@ -626,7 +628,7 @@ class StreamManager:
 
         if not subscribers_for_user_copy: return
         
-        notif_payload = {"type": "notification", "notification": notification, "server_time": datetime.now(timezone.utc).timestamp()}
+        notif_payload = {"type": "notification", "notification": notification, "server_time": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()}
         
         tasks = []
         valid_subscribers_for_gather = []
@@ -656,7 +658,7 @@ class StreamManager:
         base_payload = {
             "type": "notification", 
             "notification": notification, 
-            "server_time": datetime.now(timezone.utc).timestamp()
+            "server_time": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
         }
         
         # For fire alerts, send additional emergency data that your frontend expects
@@ -725,7 +727,7 @@ class StreamManager:
         base_payload = {
             "type": "notification", 
             "notification": notification, 
-            "server_time": datetime.now(timezone.utc).timestamp()
+            "server_time": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
         }
         
         # For fire alerts, send additional emergency data
@@ -827,7 +829,7 @@ class StreamManager:
         logging.info(f"WS client subscribed to notifications for user {user_id}")
         try:
             # Match payload of stream_one.py
-            await websocket.send_json({"type": "subscription_confirmed", "for_user_id": user_id, "timestamp": datetime.now(timezone.utc).timestamp()})
+            await websocket.send_json({"type": "subscription_confirmed", "for_user_id": user_id, "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()})
             return True
         except Exception: # Covers WebSocketClosed, ConnectionClosed, etc.
             await self.unsubscribe_from_notifications(user_id, websocket) 
@@ -873,7 +875,7 @@ class StreamManager:
     #             except asyncio.TimeoutError: logging.warning(f"Timeout stopping stream task {stream_id_str}.")
             
     #         logging.info(f"Stream {stream_id_str} processing task signaled to stop locally.")
-    #         now_utc = datetime.now(timezone.utc)
+    #         now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
             
     #         if for_restart:
     #             # is_streaming remains TRUE, status indicates it's being restarted
@@ -947,7 +949,7 @@ class StreamManager:
                         logging.error(f"Forcefully terminating stuck task for {stream_id_str}")
             
             logging.info(f"Stream {stream_id_str} processing task signaled to stop locally.")
-            now_utc = datetime.now(timezone.utc)
+            now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
             
             if for_restart:
                 await self.db_manager.execute_query( 
@@ -992,7 +994,7 @@ class StreamManager:
             self.active_streams[stream_id_str] = {
                 'status': 'starting', 
                 'task': None, 
-                'start_time': datetime.now(timezone.utc),
+                'start_time': datetime.now(ZoneInfo("Africa/Cairo")),
                 'location_info': location_info or {}  # NEW: Store location info
             } 
 
@@ -1000,7 +1002,7 @@ class StreamManager:
             await self.db_manager.execute_query("UPDATE video_stream SET status = 'processing', last_activity = NOW(), updated_at = NOW() WHERE stream_id = $1", (stream_id,))
             
             stop_event = threading.Event() # For sync parts within the async task
-            self.stream_processing_stats[stream_id_str] = {"frames_processed": 0, "detection_count": 0, "avg_processing_time": 0.0, "last_updated": datetime.now(timezone.utc)}
+            self.stream_processing_stats[stream_id_str] = {"frames_processed": 0, "detection_count": 0, "avg_processing_time": 0.0, "last_updated": datetime.now(ZoneInfo("Africa/Cairo"))}
 
             # UPDATED: Pass location info to _process_stream
             task = asyncio.create_task(
@@ -1015,7 +1017,7 @@ class StreamManager:
                 self.active_streams[stream_id_str] = {
                     'source': source, 'stop_event': stop_event, 'camera_name': camera_name,
                     'username': owner_username, 'user_id': owner_id, 'workspace_id': workspace_id,
-                    'clients': set(), 'latest_frame': None, 'last_frame_time': datetime.now(timezone.utc),
+                    'clients': set(), 'latest_frame': None, 'last_frame_time': datetime.now(ZoneInfo("Africa/Cairo")),
                     'task': task, 'start_time': self.active_streams[stream_id_str]['start_time'], # Keep original start time
                     'status': 'active_pending', # Indicates task created, _process_stream will set to 'active'
                     'location_info': location_info or {}  # NEW: Store location info
@@ -1076,7 +1078,7 @@ class StreamManager:
         if count == 0: return
 
         target_collection_name = get_workspace_qdrant_collection_name(workspace_id)
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
         point_id_str = str(uuid4())
         
         # Base payload
@@ -1373,7 +1375,7 @@ class StreamManager:
                     self.video_file_manager.cleanup_empty_streams()
 
                 # Health check
-                if (datetime.now(timezone.utc) - self.last_healthcheck).total_seconds() > self.healthcheck_interval:
+                if (datetime.now(ZoneInfo("Africa/Cairo")) - self.last_healthcheck).total_seconds() > self.healthcheck_interval:
                     await self._check_stream_health()
                 
             except asyncio.CancelledError:
@@ -1430,51 +1432,6 @@ class StreamManager:
             logging.error(f"Error force restarting shared stream {source_path}: {e}", exc_info=True)
             return False
 
-    # async def _validate_stream_source(self, source: str) -> bool:
-    #     """Validate stream source before processing"""
-    #     loop = asyncio.get_event_loop()
-        
-    #     def _check_source():
-    #         try:
-    #             # Check if it's a file
-    #             if not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and not source.isdigit():
-    #                 import os
-    #                 if not os.path.exists(source):
-    #                     logging.error(f"Video file does not exist: {source}")
-    #                     return False
-                    
-    #                 if not os.access(source, os.R_OK):
-    #                     logging.error(f"Video file is not readable: {source}")
-    #                     return False
-                    
-    #                 file_size = os.path.getsize(source)
-    #                 if file_size == 0:
-    #                     logging.error(f"Video file is empty: {source}")
-    #                     return False
-                
-    #             # Quick validation with OpenCV
-    #             test_cap = cv2.VideoCapture(source)
-    #             if not test_cap.isOpened():
-    #                 logging.error(f"Cannot open video source: {source}")
-    #                 test_cap.release()
-    #                 return False
-                
-    #             # Try to read one frame
-    #             ret, frame = test_cap.read()
-    #             test_cap.release()
-                
-    #             if not ret or frame is None:
-    #                 logging.error(f"Cannot read from video source: {source}")
-    #                 return False
-                
-    #             return True
-                
-    #         except Exception as e:
-    #             logging.error(f"Error validating source {source}: {e}")
-    #             return False
-        
-    #     return await loop.run_in_executor(thread_pool, _check_source)
-
     async def _validate_stream_source(self, source: str) -> bool:
         """Validate stream source before processing - uses StreamValidator"""
         return await self.validator.validate_with_retry(source, max_retries=2, timeout=20)
@@ -1493,7 +1450,7 @@ class StreamManager:
                 # Check if existing entry is stale
                 if existing.get('status') == 'starting':
                     start_time = existing.get('start_time')
-                    if start_time and (datetime.now(timezone.utc) - start_time).total_seconds() > 30:
+                    if start_time and (datetime.now(ZoneInfo("Africa/Cairo")) - start_time).total_seconds() > 30:
                         logging.warning(f"Cleaning up stale 'starting' entry for {stream_id_str}")
                         self.active_streams.pop(stream_id_str, None)
                     else:
@@ -1506,7 +1463,7 @@ class StreamManager:
             # Mark as starting
             self.active_streams[stream_id_str] = {
                 'status': 'starting', 
-                'start_time': datetime.now(timezone.utc),
+                'start_time': datetime.now(ZoneInfo("Africa/Cairo")),
                 'location_info': location_info or {}
             }
 
@@ -1525,7 +1482,7 @@ class StreamManager:
                 "frames_processed": 0, 
                 "detection_count": 0, 
                 "avg_processing_time": 0.0, 
-                "last_updated": datetime.now(timezone.utc)
+                "last_updated": datetime.now(ZoneInfo("Africa/Cairo"))
             }
             
             logging.info(f"Created processing stats and stop event for stream {stream_id_str}")
@@ -1558,7 +1515,7 @@ class StreamManager:
                     self.active_streams[stream_id_str] = {
                         'source': source, 'stop_event': stop_event, 'camera_name': camera_name,
                         'username': owner_username, 'user_id': owner_id, 'workspace_id': workspace_id,
-                        'clients': set(), 'latest_frame': None, 'last_frame_time': datetime.now(timezone.utc),
+                        'clients': set(), 'latest_frame': None, 'last_frame_time': datetime.now(ZoneInfo("Africa/Cairo")),
                         'task': task, 'start_time': self.active_streams[stream_id_str]['start_time'],
                         'status': 'active_pending',
                         'location_info': location_info or {}
@@ -1605,10 +1562,10 @@ class StreamManager:
                 (UUID(stream_id_str),)
             )
 
-    def detect_objects_with_threshold(self, frame: np.ndarray, conf_threshold: float = 0.4, 
+    def detect_objects_with_threshold(self, frame: np.ndarray, conf_threshold: float = 0.45, 
                                     threshold_settings: Dict[str, Any] = None,
                                     stream_id_str: str = None) -> tuple[np.ndarray, int, bool, int, int, str]:
-        """FIXED: Object detection with stream-specific fire detection tracking"""
+        """Object detection with stream-specific fire detection tracking"""
         if frame is None or frame.size == 0: 
             return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
 
@@ -1661,7 +1618,7 @@ class StreamManager:
             # Gender detection (every 3rd frame when people detected)
             if person_count > 0 and frame_count % 3 == 0:
                 try:
-                    gender_results = self.gender_model(source=input_frame, conf=0.3, verbose=False)
+                    gender_results = self.gender_model(source=input_frame, conf=0.5, verbose=False)
                     if gender_results and gender_results[0].boxes is not None:
                         male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
                         female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
@@ -1675,7 +1632,7 @@ class StreamManager:
             # CRITICAL FIX: Fire detection with proper state management
             if frame_count % 10 == 0:  # Run fire detection every 10th frame
                 try:
-                    fire_results = self.fire_model(source=input_frame, conf=0.3, verbose=False)
+                    fire_results = self.fire_model(source=input_frame, conf=0.8, verbose=False)
                     
                     # Determine current fire status
                     current_fire_status = "no detection"
@@ -1790,7 +1747,7 @@ class StreamManager:
     async def send_fire_alert_as_array(self, user_id: str, workspace_id: str, stream_id: str, camera_name: str, message: str):
         """Send fire alert in array format that triggers frontend popup"""
         
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(ZoneInfo("Africa/Cairo"))
         notif_id = uuid4()
         
         # Save to database first
@@ -1850,7 +1807,7 @@ class StreamManager:
         """Fixed stream processing with proper frame acquisition and fire notification logic"""
         
         frame_count = 0
-        last_db_update_activity = datetime.now(timezone.utc)
+        last_db_update_activity = datetime.now(ZoneInfo("Africa/Cairo"))
         stream_id_str = str(stream_id)
         loop = asyncio.get_event_loop()
         shared_stream = None
@@ -2010,12 +1967,12 @@ class StreamManager:
                         continue
 
                     # Process frame with object detection
-                    processing_start_time = datetime.now(timezone.utc)
+                    processing_start_time = datetime.now(ZoneInfo("Africa/Cairo"))
                     
                     processed_frame, person_count, alert_triggered, male_count, female_count, fire_status = await loop.run_in_executor(
                         thread_pool, self.detect_objects_with_threshold, frame, conf_threshold, threshold_settings, stream_id_str
                     )
-                    detection_duration = (datetime.now(timezone.utc) - processing_start_time).total_seconds()
+                    detection_duration = (datetime.now(ZoneInfo("Africa/Cairo")) - processing_start_time).total_seconds()
 
                     # Update processing stats
                     async with self._lock: 
@@ -2025,13 +1982,13 @@ class StreamManager:
                             if person_count > 0: 
                                 stats["detection_count"] += 1
                             stats["avg_processing_time"] = (stats.get("avg_processing_time", 0.0) * 0.95) + (detection_duration * 0.05)
-                            stats["last_updated"] = datetime.now(timezone.utc)
+                            stats["last_updated"] = datetime.now(ZoneInfo("Africa/Cairo"))
                         
                         # Update stream info
                         stream_info_active = self.active_streams.get(stream_id_str)
                         if stream_info_active: 
                             stream_info_active['latest_frame'] = processed_frame
-                            stream_info_active['last_frame_time'] = datetime.now(timezone.utc)
+                            stream_info_active['last_frame_time'] = datetime.now(ZoneInfo("Africa/Cairo"))
                     
                                         # Send notifications for people threshold alerts with cooldown and email
                     if alert_triggered:
@@ -2089,7 +2046,7 @@ class StreamManager:
                         db_last_notification = persistent_state['last_notification_time']
                         
                         # Check current cooldown status
-                        current_time = datetime.now(timezone.utc)
+                        current_time = datetime.now(ZoneInfo("Africa/Cairo"))
                         cooldown_active = False
                         time_since_last_notification = float('inf')
                         
@@ -2156,7 +2113,7 @@ class StreamManager:
                                 #         "fire_status": fire_status,
                                 #         "stream_id": stream_id_str,
                                 #         "location_info": location_info,
-                                #         "timestamp": datetime.now(timezone.utc).timestamp(),
+                                #         "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).timestamp(),
                                 #         "severity": "high"
                                 #     }
                                 # )
@@ -2219,13 +2176,13 @@ class StreamManager:
                         )
 
                     # Periodic database activity update
-                    now_utc_loop = datetime.now(timezone.utc)
+                    now_utc_loop = datetime.now(ZoneInfo("Africa/Cairo"))
                     if (now_utc_loop - last_db_update_activity).total_seconds() > 10.0:
                         await self.db_manager.execute_query("UPDATE video_stream SET last_activity = NOW() WHERE stream_id = $1", (stream_id,))
                         last_db_update_activity = now_utc_loop
                     
                     # Frame rate control
-                    current_iteration_duration = (datetime.now(timezone.utc) - processing_start_time).total_seconds()
+                    current_iteration_duration = (datetime.now(ZoneInfo("Africa/Cairo")) - processing_start_time).total_seconds()
                     sleep_duration = max(0, frame_delay_target - current_iteration_duration)
                     await asyncio.sleep(sleep_duration if sleep_duration > 0 else 0.001)
                     
@@ -2343,7 +2300,7 @@ class StreamManager:
             """
             
             # Look back 2 hours to catch any recent fire notifications
-            lookback_time = datetime.now(timezone.utc) - timedelta(hours=2)
+            lookback_time = datetime.now(ZoneInfo("Africa/Cairo")) - timedelta(hours=2)
             
             result = await self.db_manager.execute_query(
                 recent_fire_query, 
@@ -2448,7 +2405,7 @@ class StreamManager:
         """Send fire alert in the format that frontend expects"""
         
         # First add to database
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(ZoneInfo("Africa/Cairo"))
         notif_id = UUID(notification["id"])
         
         try: 
@@ -2602,7 +2559,7 @@ class StreamManager:
                 return False
             
             # Check cooldown - this is the ONLY condition that matters
-            current_time = datetime.now(timezone.utc)
+            current_time = datetime.now(ZoneInfo("Africa/Cairo"))
             
             if last_notification_time is None:
                 # Never sent a notification before - send it
@@ -2645,7 +2602,7 @@ class StreamManager:
         # Also check database as backup
         persistent_state = await self.get_persistent_fire_state(stream_id)
         if persistent_state['last_notification_time']:
-            time_since_db = (datetime.now(timezone.utc) - persistent_state['last_notification_time']).total_seconds()
+            time_since_db = (datetime.now(ZoneInfo("Africa/Cairo")) - persistent_state['last_notification_time']).total_seconds()
             time_since_last = min(time_since_last, time_since_db)
         
         return time_since_last >= self.fire_cooldown_duration
@@ -2655,7 +2612,7 @@ class StreamManager:
                                         notification_time: datetime = None):
         """Update persistent fire state in database with proper UPSERT"""
         try:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(ZoneInfo("Africa/Cairo"))
             detection_time = detection_time or now
             
             # Use UPSERT to handle both insert and update cases
@@ -2729,7 +2686,7 @@ class StreamManager:
             
             # Clean up very old notification states (older than 24 hours)
             # This preserves the 10-minute cooldown while cleaning up old data
-            day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+            day_ago = datetime.now(ZoneInfo("Africa/Cairo")) - timedelta(days=1)
             await self.db_manager.execute_query(
                 """UPDATE fire_detection_state 
                 SET last_notification_time = NULL 
@@ -2770,7 +2727,7 @@ class StreamManager:
                     fire_alert_payload = {
                         "type": "fire_emergency",
                         "alert": alert_data,
-                        "server_time": datetime.now(timezone.utc).timestamp()
+                        "server_time": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
                     }
                     
                     # Send to all websockets
@@ -2809,7 +2766,7 @@ async def send_ping(websocket: WebSocket):
                 try:
                     await websocket.send_json({
                         "type": "ping", 
-                        "timestamp": datetime.now(timezone.utc).timestamp()
+                        "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
                     })
                 except RuntimeError as e:
                     if "close message has been sent" in str(e).lower():
@@ -2899,7 +2856,7 @@ async def stop_workspace_stream_endpoint( # Renamed
 
         updated_rows = await db_manager_global.execute_query(
             "UPDATE video_stream SET is_streaming = FALSE, status = 'inactive', updated_at = $1 WHERE stream_id = $2 AND is_streaming = TRUE",
-            (datetime.now(timezone.utc), stream_id_uuid), return_rowcount=True
+            (datetime.now(ZoneInfo("Africa/Cairo")), stream_id_uuid), return_rowcount=True
         )
         
         if updated_rows and updated_rows > 0:
@@ -3079,7 +3036,7 @@ async def websocket_workspace_stream(websocket: WebSocket):
                     await websocket.send_json({
                         "stream_id": stream_id_str, 
                         "frame": latest_frame_b64,
-                        "timestamp": datetime.now(timezone.utc).timestamp()
+                        "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
                     })
                 except RuntimeError as e:
                     if "close message has been sent" in str(e).lower():
@@ -3169,7 +3126,7 @@ async def websocket_notify(websocket: WebSocket):
         await websocket.send_json({
             "status": "connected", 
             "message": "Connected to notification stream",
-            "server_time": datetime.now(timezone.utc).timestamp()
+            "server_time": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
         })
         
         # Get initial notifications with error handling
@@ -3248,7 +3205,7 @@ async def websocket_notify(websocket: WebSocket):
                     try:
                         await websocket.send_json({
                             "type": "keepalive", 
-                            "server_time": datetime.now(timezone.utc).timestamp()
+                            "server_time": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
                         })
                     except Exception:
                         break
@@ -3313,7 +3270,7 @@ async def send_ping_with_stability_check(websocket: WebSocket, username_for_log:
                 try:
                     await websocket.send_json({
                         "type": "ping", 
-                        "timestamp": datetime.now(timezone.utc).timestamp()
+                        "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
                     })
                     consecutive_ping_failures = 0  # Reset on success
                 except Exception as e:
@@ -3345,7 +3302,7 @@ async def handle_mark_read_message(message: dict, user_id_str: str, username_for
                     try:
                         res = await db_manager_global.execute_query(
                             "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3 AND is_read = FALSE",
-                            (datetime.now(timezone.utc), nid_uuid, UUID(user_id_str)), 
+                            (datetime.now(ZoneInfo("Africa/Cairo")), nid_uuid, UUID(user_id_str)), 
                             return_rowcount=True
                         )
                         if res and res > 0:
@@ -3378,7 +3335,7 @@ async def get_http_notifications(
         notifications = await stream_manager.get_notifications(user_id_str, workspace_id, since, limit, include_read)
         return { # Match stream_one.py payload
             "status": "success", "count": len(notifications),
-            "notifications": notifications, "server_time": datetime.now(timezone.utc).timestamp()
+            "notifications": notifications, "server_time": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
         }
     except Exception as e:
         logging.error(f"Error getting HTTP notifications for user {username_for_log}: {e}", exc_info=True)
@@ -3395,7 +3352,7 @@ async def mark_notification_read_endpoint(
         notification_id_uuid = UUID(notification_id_str)
         updated_rows = await db_manager_global.execute_query(
             "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3",
-            (datetime.now(timezone.utc), notification_id_uuid, UUID(user_id_str)), return_rowcount=True
+            (datetime.now(ZoneInfo("Africa/Cairo")), notification_id_uuid, UUID(user_id_str)), return_rowcount=True
         )
         
         if updated_rows and updated_rows > 0:
@@ -3412,6 +3369,212 @@ async def mark_notification_read_endpoint(
         logging.error(f"Error marking notification {notification_id_str} as read for {username_for_log}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to mark notification as read: {str(e)}")
 
+
+@router.get("/streams/locations/search")
+async def search_streams_by_location_filters(
+    q: Optional[str] = Query(None, description="Search query for location names"),
+    location_type: Optional[Union[str, List[str]]] = Query(None, description="Filter by location type(s): building, floor_level, zone, area, location"),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by specific zone(s)"),
+    workspace_id: Optional[str] = Query(None),
+    current_user_data: Dict = Depends(session_manager_global.get_current_user_full_data_dependency)
+):
+    """Search for streams using location-based filters and text search."""
+    
+    # Parse all the filter parameters
+    location_type = parse_string_or_list(location_type)
+    locations = parse_string_or_list(locations)
+    areas = parse_string_or_list(areas)
+    buildings = parse_string_or_list(buildings)
+    floor_levels = parse_string_or_list(floor_levels)
+    zones = parse_string_or_list(zones)
+    
+    user_id_str = str(current_user_data["user_id"])
+    username = current_user_data.get("username", "unknown")
+    
+    try:
+        # Complete query to match /source/user fields
+        base_query = """
+            SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path, 
+                   vs.type, vs.status, vs.is_streaming, vs.created_at, vs.updated_at,
+                   vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
+                   vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
+                   w.name as workspace_name, vs.workspace_id
+            FROM video_stream vs
+            JOIN users u ON vs.user_id = u.user_id
+            LEFT JOIN workspaces w ON vs.workspace_id = w.workspace_id
+            JOIN workspace_members wm ON vs.workspace_id = wm.workspace_id
+            WHERE wm.user_id = $1
+        """
+        
+        params = [UUID(user_id_str)]
+        param_count = 1
+        
+        if workspace_id:
+            param_count += 1
+            base_query += f" AND vs.workspace_id = ${param_count}"
+            params.append(UUID(workspace_id))
+        
+        # Add text search with special handling for location_type + q combination
+        if q:
+            # Check if q contains comma-separated values and we have a specific location_type
+            q_values = parse_string_or_list(q)
+            
+            if location_type and len(location_type) == 1 and q_values and len(q_values) > 1:
+                # Handle specific case: location_type=areas&q=Area 1,Area 2
+                location_field_map = {
+                    "area": "vs.area",
+                    "areas": "vs.area", 
+                    "building": "vs.building",
+                    "buildings": "vs.building",
+                    "floor_level": "vs.floor_level",
+                    "floor_levels": "vs.floor_level",
+                    "zone": "vs.zone",
+                    "zones": "vs.zone",
+                    "location": "vs.location",
+                    "locations": "vs.location"
+                }
+                
+                field_name = location_field_map.get(location_type[0])
+                if field_name:
+                    # Use exact match for specific values
+                    param_count += 1
+                    q_placeholders = ", ".join([f"${param_count + i}" for i in range(len(q_values))])
+                    base_query += f" AND {field_name} IN ({q_placeholders})"
+                    params.extend(q_values)
+                    param_count += len(q_values) - 1
+                else:
+                    # Fallback to general text search
+                    param_count += 1
+                    search_condition = f"""
+                        AND (
+                            vs.name ILIKE ${param_count} OR 
+                            vs.building ILIKE ${param_count} OR 
+                            vs.floor_level ILIKE ${param_count} OR 
+                            vs.zone ILIKE ${param_count} OR 
+                            vs.area ILIKE ${param_count} OR 
+                            vs.location ILIKE ${param_count}
+                        )
+                    """
+                    base_query += search_condition
+                    params.append(f"%{q}%")
+            else:
+                # Regular text search
+                param_count += 1
+                search_condition = f"""
+                    AND (
+                        vs.name ILIKE ${param_count} OR 
+                        vs.building ILIKE ${param_count} OR 
+                        vs.floor_level ILIKE ${param_count} OR 
+                        vs.zone ILIKE ${param_count} OR 
+                        vs.area ILIKE ${param_count} OR 
+                        vs.location ILIKE ${param_count}
+                    )
+                """
+                base_query += search_condition
+                params.append(f"%{q}%")
+        
+        # Add location type filter (now supports multiple types)
+        if location_type:
+            type_conditions = []
+            for loc_type in location_type:
+                if loc_type == "building":
+                    type_conditions.append("(vs.building IS NOT NULL AND vs.building != '')")
+                elif loc_type == "floor_level":
+                    type_conditions.append("(vs.floor_level IS NOT NULL AND vs.floor_level != '')")
+                elif loc_type == "zone":
+                    type_conditions.append("(vs.zone IS NOT NULL AND vs.zone != '')")
+                elif loc_type == "area":
+                    type_conditions.append("(vs.area IS NOT NULL AND vs.area != '')")
+                elif loc_type == "location":
+                    type_conditions.append("(vs.location IS NOT NULL AND vs.location != '')")
+            
+            if type_conditions:
+                base_query += f" AND ({' OR '.join(type_conditions)})"
+        
+        # Add specific location filters
+        if locations:
+            param_count += 1
+            location_placeholders = ", ".join([f"${param_count + i}" for i in range(len(locations))])
+            base_query += f" AND vs.location IN ({location_placeholders})"
+            params.extend(locations)
+            param_count += len(locations) - 1
+        
+        if areas:
+            param_count += 1
+            area_placeholders = ", ".join([f"${param_count + i}" for i in range(len(areas))])
+            base_query += f" AND vs.area IN ({area_placeholders})"
+            params.extend(areas)
+            param_count += len(areas) - 1
+        
+        if buildings:
+            param_count += 1
+            building_placeholders = ", ".join([f"${param_count + i}" for i in range(len(buildings))])
+            base_query += f" AND vs.building IN ({building_placeholders})"
+            params.extend(buildings)
+            param_count += len(buildings) - 1
+        
+        if floor_levels:
+            param_count += 1
+            floor_placeholders = ", ".join([f"${param_count + i}" for i in range(len(floor_levels))])
+            base_query += f" AND vs.floor_level IN ({floor_placeholders})"
+            params.extend(floor_levels)
+            param_count += len(floor_levels) - 1
+        
+        if zones:
+            param_count += 1
+            zone_placeholders = ", ".join([f"${param_count + i}" for i in range(len(zones))])
+            base_query += f" AND vs.zone IN ({zone_placeholders})"
+            params.extend(zones)
+        
+        base_query += " ORDER BY u.username, vs.created_at DESC"
+        
+        # Rest of the function remains the same...
+        results = await db_manager_global.execute_query(base_query, tuple(params), fetch_all=True)
+        results = results or []
+        
+        # Format results to match /source/user response structure exactly
+        formatted_results = [
+            {
+                "id": str(r["stream_id"]),
+                "user_id": str(r["user_id"]),
+                "owner_username": r["owner_username"],
+                "name": r["name"],
+                "path": r["path"],
+                "type": r["type"],
+                "status": r["status"],
+                "is_streaming": r["is_streaming"],
+                "location": r["location"],
+                "area": r["area"],
+                "building": r["building"],
+                "floor_level": r["floor_level"],
+                "zone": r["zone"],
+                "latitude": float(r["latitude"]) if r["latitude"] else None,
+                "longitude": float(r["longitude"]) if r["longitude"] else None,
+                "count_threshold_greater": r["count_threshold_greater"],
+                "count_threshold_less": r["count_threshold_less"],
+                "alert_enabled": r["alert_enabled"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                "workspace_id": str(r["workspace_id"]) if r["workspace_id"] else None,
+                "workspace_name": r["workspace_name"],
+                "static_base64": encoded_string
+            } for r in results
+        ]
+        
+        return formatted_results
+        
+    except ValueError as ve:
+        logger.error(f"Invalid data for location search for user {username}: {ve}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Invalid data: {ve}")
+    except Exception as e:
+        logger.error(f"Error searching streams by location for user {username}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while searching streams.")
+
+
 @router.get("/debug/fire-cooldown/{stream_id}")
 async def debug_fire_cooldown_status(
     stream_id: str,
@@ -3424,7 +3587,7 @@ async def debug_fire_cooldown_status(
             "status": "success",
             "cooldown_info": status,
             "current_time": time.time(),
-            "server_time": datetime.now(timezone.utc).isoformat()
+            "server_time": datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
         })
     except Exception as e:
         logger.error(f"Error getting fire cooldown status for {stream_id}: {e}")
@@ -3442,7 +3605,7 @@ async def debug_fire_state(
         
         cooldown_info = {}
         if persistent_state['last_notification_time']:
-            time_since_last = (datetime.now(timezone.utc) - persistent_state['last_notification_time']).total_seconds()
+            time_since_last = (datetime.now(ZoneInfo("Africa/Cairo")) - persistent_state['last_notification_time']).total_seconds()
             cooldown_info = {
                 'time_since_last_notification': time_since_last,
                 'cooldown_remaining': max(0, stream_manager.fire_cooldown_duration - time_since_last),
@@ -3457,7 +3620,7 @@ async def debug_fire_state(
                 "last_notification_time": persistent_state['last_notification_time'].isoformat() if persistent_state['last_notification_time'] else None
             },
             "cooldown_info": cooldown_info,
-            "server_time": datetime.now(timezone.utc).isoformat()
+            "server_time": datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -3471,7 +3634,7 @@ async def test_fire_cooldown_system(
     """Test endpoint for fire cooldown system"""
     try:
         stream_uuid = UUID(stream_id)
-        current_time = datetime.now(timezone.utc)
+        current_time = datetime.now(ZoneInfo("Africa/Cairo"))
         
         if action == "status":
             # Get comprehensive status
@@ -3566,7 +3729,7 @@ async def debug_people_count_cooldown_status(
             "status": "success",
             "cooldown_info": status,
             "current_time": current_time,
-            "server_time": datetime.now(timezone.utc).isoformat()
+            "server_time": datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
         })
     except Exception as e:
         logger.error(f"Error getting people count cooldown status for {stream_id}: {e}")
@@ -3651,7 +3814,7 @@ async def debug_validate_stream(
 #         await websocket.send_json({
 #             "status": "connected", 
 #             "message": "Connected to notification stream",
-#             "server_time": datetime.now(timezone.utc).timestamp()
+#             "server_time": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
 #         })
         
 #         # Get initial notifications
@@ -3718,7 +3881,7 @@ async def debug_validate_stream(
 #                                 try:
 #                                     res = await db_manager_global.execute_query(
 #                                         "UPDATE notifications SET is_read = TRUE, updated_at = $1 WHERE notification_id = $2 AND user_id = $3 AND is_read = FALSE",
-#                                         (datetime.now(timezone.utc), nid_uuid, UUID(user_id_str)), 
+#                                         (datetime.now(ZoneInfo("Africa/Cairo")), nid_uuid, UUID(user_id_str)), 
 #                                         return_rowcount=True
 #                                     )
 #                                     if res and res > 0:

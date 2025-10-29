@@ -16,6 +16,7 @@ import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, time as dt_time, timezone, date as dt_date # Added timezone, date
+from zoneinfo import ZoneInfo
 from uuid import UUID
 import re # Added for validate_prompt
 
@@ -486,7 +487,7 @@ async def send_fire_alert_email(user_email: str, camera_name: str, fire_status: 
                 location_text = f"\nLocation Details:\n" + "\n".join(f"  • {part}" for part in location_parts)
         
         # Create timestamp
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        timestamp = datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d %H:%M:%S UTC")
         
         # Email content
         alert_type = "FIRE" if fire_status == "fire" else "SMOKE"
@@ -579,7 +580,7 @@ async def send_people_count_alert_email(user_email: str, camera_name: str,
                 location_text = f"\nLocation Details:\n" + "\n".join(f"  • {part}" for part in location_parts)
         
         # Create timestamp
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        timestamp = datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d %H:%M:%S UTC")
         
         # Determine alert type and message
         greater_than = threshold_settings.get("greater_than")

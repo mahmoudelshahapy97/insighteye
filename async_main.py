@@ -26,6 +26,7 @@ from async_workspaces import router as workspace_router
 from admin_router import router as admin_utils_router
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 # Assuming DatabaseManager is designed for asyncpg and correctly handles transactions
 from async_database import DatabaseManager # For scheduler task
 from async_database import (init_db_pool as async_init_db_pool,
@@ -266,7 +267,7 @@ async def health_check(): # Adapted for asyncpg
 
     return {
         "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).isoformat(),
         "database_status": conn_info,
         "db_connection_ok": db_healthy
     }

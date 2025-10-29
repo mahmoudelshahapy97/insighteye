@@ -37,6 +37,7 @@ from async_video_streaming_qdrant import get_timestamp_range_, get_qdrant_client
 from qdrant_client.http import models as qdrant_models # For Qdrant integration
 from async_workspaces import get_user_and_workspace, check_workspace_membership_and_get_role 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from async_utils import parse_string_or_list, encoded_string
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,7 @@ async def create_stream(stream: StreamCreate, request: Request, current_user_dat
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         """
         
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
         
         # Execute insert with all fields
         await db_manager.execute_query( 
@@ -495,7 +496,7 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
                 continue
 
             set_clauses_list.append(f"updated_at = ${param_idx}"); 
-            update_params_list.append(datetime.now(timezone.utc)); 
+            update_params_list.append(datetime.now(ZoneInfo("Africa/Cairo"))); 
             param_idx += 1
             update_query_str = f"UPDATE video_stream SET {', '.join(set_clauses_list)} WHERE stream_id = ${param_idx}"
             update_params_list.append(UUID(stream_id_to_update_str)) 
@@ -781,7 +782,7 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
 
             # Add updated_at timestamp
             set_clauses_list.append(f"updated_at = ${param_idx}"); 
-            update_params_list.append(datetime.now(timezone.utc)); 
+            update_params_list.append(datetime.now(ZoneInfo("Africa/Cairo"))); 
             param_idx += 1
             
             # Execute database update
@@ -1293,7 +1294,7 @@ async def create_or_update_workspace_camera_params_post(
             await check_workspace_membership_and_get_role(user_id_obj, workspace_id_obj, required_role=None)
         
         param_id = uuid4()
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
 
         query = """
             INSERT INTO param_stream (param_id, user_id, workspace_id, frame_delay, frame_skip, conf, created_at, updated_at) 
@@ -1365,7 +1366,7 @@ async def create_or_update_workspace_camera_params_put(
             await check_workspace_membership_and_get_role(user_id_obj, workspace_id_obj)
         
         param_id = uuid4() 
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
 
         query = """
             INSERT INTO param_stream (param_id, user_id, workspace_id, frame_delay, frame_skip, conf, created_at, updated_at) 
@@ -1556,7 +1557,7 @@ async def update_all_workspace_params(
                 RETURNING param_id
             """
             param_id_new = uuid4()
-            now_utc = datetime.now(timezone.utc)
+            now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
             
             try:
                 result = await db_manager.execute_query(
@@ -1786,7 +1787,7 @@ async def get_current_user_info(current_user_data_dep: Dict = Depends(session_ma
             stream_count_for_active_ws = sc_res['count'] if sc_res else 0
         
         token_count_q_sql = "SELECT COUNT(*) as count FROM user_tokens WHERE user_id = $1 AND is_active = TRUE AND refresh_expires_at > $2"
-        tc_res = await db_manager.execute_query(token_count_q_sql, params=(user_id_obj, datetime.now(timezone.utc)), fetch_one=True)
+        tc_res = await db_manager.execute_query(token_count_q_sql, params=(user_id_obj, datetime.now(ZoneInfo("Africa/Cairo"))), fetch_one=True)
         active_token_count = tc_res['count'] if tc_res else 0
 
         timestamp_range_result = {}
@@ -2140,7 +2141,7 @@ async def bulk_upload_cameras_with_location(
 
                 # Insert camera with location data and alert thresholds
                 stream_id = uuid4()
-                now_utc = datetime.now(timezone.utc)
+                now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
                 
                 insert_query = """
                     INSERT INTO video_stream 
@@ -2331,7 +2332,7 @@ async def bulk_assign_camera_locations(
                 # Add updated_at
                 param_count += 1
                 update_fields.append(f"updated_at = ${param_count}")
-                params.append(datetime.now(timezone.utc))
+                params.append(datetime.now(ZoneInfo("Africa/Cairo")))
                 
                 # Add WHERE clause parameters
                 param_count += 1
@@ -2729,7 +2730,7 @@ async def update_camera_alert_settings(
             WHERE stream_id = $5 AND workspace_id = $6
         """
         
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
         
         rows_affected = await db_manager.execute_query(
             update_query,

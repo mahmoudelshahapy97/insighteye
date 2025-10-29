@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Depends, status, Request, Query
 from typing import List, Optional, Dict
 from uuid import UUID, uuid4
 from datetime import datetime, timezone 
+from zoneinfo import ZoneInfo
 import logging
 from async_session_manager import SessionManager # Methods will be async
 from async_database import DatabaseManager # Assuming this is AsyncDatabaseManager
@@ -188,7 +189,7 @@ async def create_workspace(
     current_user_data: Dict = Depends(get_current_user_id_dependency)
 ):
     workspace_id = uuid4()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(ZoneInfo("Africa/Cairo"))
     current_user_id = current_user_data['user_id']
     username_for_log = current_user_data['username']
     
@@ -322,7 +323,7 @@ async def update_workspace(
         if not update_fields_clauses:
             return {"message": "No update data provided."}
 
-        update_fields_clauses.append(f"updated_at = ${param_idx}"); params_list.append(datetime.now(timezone.utc)); param_idx +=1
+        update_fields_clauses.append(f"updated_at = ${param_idx}"); params_list.append(datetime.now(ZoneInfo("Africa/Cairo"))); param_idx +=1
         params_list.append(workspace_id) 
         
         query = f"UPDATE workspaces SET {', '.join(update_fields_clauses)} WHERE workspace_id = ${param_idx}"
@@ -415,7 +416,7 @@ async def add_workspace_member(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User is already a member of this workspace.")
             
         membership_id = uuid4()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(ZoneInfo("Africa/Cairo"))
         await db_manager.execute_query(
             "INSERT INTO workspace_members (membership_id, workspace_id, user_id, role, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
             (membership_id, workspace_id, target_user_id_obj, member_data.role, now, now)
@@ -473,7 +474,7 @@ async def update_workspace_member_role(
 
         rows_affected = await db_manager.execute_query(
             "UPDATE workspace_members SET role = $1, updated_at = $2 WHERE workspace_id = $3 AND user_id = $4",
-            (member_update_data.role, datetime.now(timezone.utc), workspace_id, target_user_id), return_rowcount=True
+            (member_update_data.role, datetime.now(ZoneInfo("Africa/Cairo")), workspace_id, target_user_id), return_rowcount=True
         )
         if rows_affected == 0:
             if not await db_manager.execute_query(
@@ -568,7 +569,7 @@ async def activate_workspace(
 
         await db_manager.execute_query(
             "UPDATE user_tokens SET workspace_id = $1, updated_at = $2 WHERE user_id = $3 AND is_active = TRUE",
-            (workspace_id, datetime.now(timezone.utc), current_user_id)
+            (workspace_id, datetime.now(ZoneInfo("Africa/Cairo")), current_user_id)
         )
 
         await session_manager.log_action(

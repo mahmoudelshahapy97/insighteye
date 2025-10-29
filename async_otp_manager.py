@@ -7,6 +7,7 @@ from async_utils import send_email
 from async_database import DatabaseManager
 import hashlib
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class OTPManager:
 
     async def is_rate_limited(self, email: str, purpose: str = 'login') -> Tuple[bool, str]:
         otp_data = await self._get_otp_data_from_db(email, purpose)
-        current_time_dt = datetime.now(timezone.utc)
+        current_time_dt = datetime.now(ZoneInfo("Africa/Cairo"))
 
         if otp_data and otp_data["last_request_at"]:
             last_request_at_dt = otp_data["last_request_at"]
@@ -57,7 +58,7 @@ class OTPManager:
             otp_value = ''.join(secrets.choice('0123456789') for _ in range(length))
             otp_hash = self._hash_otp(otp_value)
 
-            now_dt = datetime.now(timezone.utc)
+            now_dt = datetime.now(ZoneInfo("Africa/Cairo"))
             expiration_seconds = expiration if expiration is not None else self.otp_expiration_seconds
             expires_at_dt = now_dt + timedelta(seconds=expiration_seconds)
 
@@ -91,7 +92,7 @@ class OTPManager:
             stored_otp_hash = otp_data["otp_hash"]
             expires_at_dt = otp_data["expires_at"]
 
-            current_time_dt = datetime.now(timezone.utc)
+            current_time_dt = datetime.now(ZoneInfo("Africa/Cairo"))
             if current_time_dt > expires_at_dt:
                 logger.warning(f"Verification failed: OTP expired for {email}, purpose: {purpose} at {expires_at_dt.isoformat()}")
                 await self.delete_otp(email, purpose)

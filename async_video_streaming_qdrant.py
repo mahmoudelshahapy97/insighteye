@@ -9,6 +9,7 @@ from async_config import config
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models 
 from datetime import datetime, time as dt_time, timezone 
+from zoneinfo import ZoneInfo
 import logging
 
 # Updated imports for asynchronous managers
@@ -894,6 +895,58 @@ async def delete_data_from_workspace_collection(
         logger.error(f"Failed to delete data from {target_collection_name}: {e_del_data}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete data: {str(e_del_data)}")
 
+@router.delete("/delete_full_data") 
+async def delete_full_data_from_workspace_collection(  # Changed function name to avoid duplicate
+    workspace_id_to_target: str = Query(..., description="The ID of the workspace whose data should be targeted."),
+    current_user_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency) 
+):
+    client = get_qdrant_client()
+    requesting_user_id_obj = current_user_data["user_id"]
+    requesting_user_system_role = current_user_data["role"]
+    username = current_user_data["username"]
+
+    try: target_ws_id_obj = UUID(workspace_id_to_target)
+    except ValueError: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspace_id_to_target format.")
+
+    workspace_specific_role_for_deleter = None
+    if requesting_user_system_role != "admin":
+        try:
+            member_info = await check_workspace_membership_and_get_role_async(requesting_user_id_obj, target_ws_id_obj, db_manager_global_qdrant, required_role="admin")
+            workspace_specific_role_for_deleter = member_info.get("role")
+        except HTTPException as e_perm:
+            raise e_perm
+
+    target_collection_name = get_workspace_qdrant_collection_name(target_ws_id_obj)
+    await ensure_workspace_qdrant_collection_exists(client, target_ws_id_obj)
+
+    try:
+        count_before_result = client.count(collection_name=target_collection_name)
+        count_before = count_before_result.count
+        if count_before == 0:
+            return JSONResponse(content={"status": "info", "message": "No data found to delete.", "deleted_count": 0})
+
+        # Option 1: Use FilterSelector with must=[] to match all points
+        delete_op_result = client.delete(
+            collection_name=target_collection_name,
+            points_selector=qdrant_models.FilterSelector(
+                filter=qdrant_models.Filter(must=[])
+            )
+        )
+        
+        log_status_qdrant = "success" if delete_op_result.status == qdrant_models.UpdateStatus.COMPLETED else "failure"
+        await session_manager_global_qdrant.log_action(
+            content=f"User '{username}' deleted ALL data from workspace '{target_ws_id_obj}'. Targeted {count_before} points. Qdrant status: {delete_op_result.status}",
+            user_id=requesting_user_id_obj, workspace_id=target_ws_id_obj,
+            action_type="Qdrant_Full_Data_Deleted", status=log_status_qdrant
+        )
+        if delete_op_result.status != qdrant_models.UpdateStatus.COMPLETED:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Qdrant delete operation status: {delete_op_result.status}")
+        return JSONResponse(content={"status": "success", "message": f"Successfully deleted all {count_before} data points.", "deleted_count": count_before})
+    except HTTPException as e: raise e
+    except Exception as e_del_data:
+        logger.error(f"Failed to delete data from {target_collection_name}: {e_del_data}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete data: {str(e_del_data)}")
+
 @router.get("/collections") 
 async def list_collections(current_admin_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency)): 
     if current_admin_data.get("role") != "admin":
@@ -1766,7 +1819,7 @@ async def export_location_data(
             return JSONResponse(
                 content={
                     "workspace_id": str(workspace_id_obj),
-                    "export_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "export_timestamp": datetime.now(ZoneInfo("Africa/Cairo")).isoformat(),
                     "total_cameras": len(export_data),
                     "cameras": export_data
                 }

@@ -9,6 +9,7 @@ from fastapi import HTTPException, status
 import re
 import pyotp 
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import json
 import hashlib
 import requests
@@ -87,7 +88,7 @@ class UserManager:
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         """
         event_id = uuid.uuid4()
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(ZoneInfo("Africa/Cairo"))
         
         # Ensure UUID objects for DB
         db_user_id = UUID(str(user_id)) if user_id and not isinstance(user_id, UUID) else (user_id if isinstance(user_id, UUID) else None)
@@ -117,7 +118,7 @@ class UserManager:
         hashed_password = self.get_password_hash(password)
         user_id_obj = uuid.uuid4() # This is a UUID object
 
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(ZoneInfo("Africa/Cairo"))
         subscription_date = created_at + timedelta(days=90) 
         is_active = True 
 
@@ -162,7 +163,7 @@ class UserManager:
         is_valid = self.verify_password(password, hashed_password)
         
         if is_valid:
-            await self.db_manager.execute_query("UPDATE users SET last_login = $1 WHERE user_id = $2", (datetime.now(timezone.utc), user_id_obj))
+            await self.db_manager.execute_query("UPDATE users SET last_login = $1 WHERE user_id = $2", (datetime.now(ZoneInfo("Africa/Cairo")), user_id_obj))
             await self._log_security_event(user_id=user_id_obj,event_type="successful_login",severity="low",event_data={"username": username})
         else:
             await self._log_security_event(user_id=user_id_obj,event_type="failed_login",severity="medium",event_data={"username": username})
@@ -206,7 +207,7 @@ class UserManager:
 
         hashed_password = self.get_password_hash(new_password)
         query = "UPDATE user_accounts SET password_hash = $1, updated_at = $2 WHERE user_id = $3"
-        await self.db_manager.execute_query(query, (hashed_password, datetime.now(timezone.utc), user_id)) # user_id is UUID
+        await self.db_manager.execute_query(query, (hashed_password, datetime.now(ZoneInfo("Africa/Cairo")), user_id)) # user_id is UUID
         await self._log_security_event(user_id=user_id, event_type="password_reset", severity="medium", event_data={"username": username})
         return True
         
@@ -234,7 +235,7 @@ class UserManager:
         
         is_valid = self.verify_password(password, hashed_password)
         if is_valid:
-            await self.db_manager.execute_query("UPDATE users SET last_login = $1 WHERE user_id = $2", (datetime.now(timezone.utc), user_id_obj))
+            await self.db_manager.execute_query("UPDATE users SET last_login = $1 WHERE user_id = $2", (datetime.now(ZoneInfo("Africa/Cairo")), user_id_obj))
             await self._log_security_event(user_id=user_id_obj,event_type="successful_login",severity="low",event_data={"username": db_username})
             return True, db_username
         else:
@@ -283,7 +284,7 @@ class UserManager:
         rows_affected = 0
         subscription_date_val: Optional[datetime] = None 
         if is_subscribed:
-            subscription_date_val = datetime.now(timezone.utc) + timedelta(days=30*months)
+            subscription_date_val = datetime.now(ZoneInfo("Africa/Cairo")) + timedelta(days=30*months)
             query = "UPDATE users SET is_subscribed = $1, subscription_date = $2 WHERE user_id = $3"
             rows_affected = await self.db_manager.execute_query(query, (is_subscribed, subscription_date_val, user_id), return_rowcount=True)
         else: 
@@ -362,7 +363,7 @@ class UserManager:
 
         hashed_password = self.get_password_hash(new_password)
         query = "UPDATE user_accounts SET password_hash = $1, updated_at = $2 WHERE user_id = $3"
-        rows_affected = await self.db_manager.execute_query(query, (hashed_password, datetime.now(timezone.utc), user_id), return_rowcount=True)
+        rows_affected = await self.db_manager.execute_query(query, (hashed_password, datetime.now(ZoneInfo("Africa/Cairo")), user_id), return_rowcount=True)
         
         if rows_affected is not None and rows_affected > 0:
             await self._log_security_event(user_id=user_id, event_type="password_changed", severity="medium", event_data={"username": username})
@@ -414,7 +415,7 @@ class UserManager:
 
             hashed_password = self.get_password_hash(password)
             user_id_obj = uuid.uuid4() # UUID object
-            created_at = datetime.now(timezone.utc)
+            created_at = datetime.now(ZoneInfo("Africa/Cairo"))
             subscription_date = created_at + timedelta(days=90)
             
             user_query = """
@@ -496,7 +497,7 @@ class UserManager:
             if not workspace or not workspace.get("is_active"):
                 return False, "Workspace is not active or not found."
                 
-            now_utc = datetime.now(timezone.utc)
+            now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
             token_update_q = "UPDATE user_tokens SET workspace_id = $1, updated_at = $2 WHERE user_id = $3 AND is_active = TRUE"
             await self.db_manager.execute_query(token_update_q, (workspace_id_obj, now_utc, user_id_obj), connection=conn)
         

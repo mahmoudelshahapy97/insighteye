@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, status, Depends, Response, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from uuid import UUID 
 from async_user_manager import UserManager 
 from async_session_manager import SessionManager 
@@ -758,7 +759,7 @@ async def create_message_route(message_request: MessageRequest, request_obj: Fas
         elif message_request.level == "warning": logger.warning(log_message_str)
         else: logger.info(log_message_str) # Default to info for "info" or other levels
 
-        message_id = f"msg_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        message_id = f"msg_{datetime.now(ZoneInfo('Africa/Cairo')).strftime('%Y%m%d%H%M%S%f')}"
 
         # Log to system logs via SessionManager if it's an error reported by client
         if message_request.level == "error":
@@ -775,7 +776,7 @@ async def create_message_route(message_request: MessageRequest, request_obj: Fas
             message=message_request.message, 
             title=message_request.title,
             level=message_request.level, 
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(ZoneInfo("Africa/Cairo"))
         )
     except asyncpg.PostgresError as db_err: # If log_action fails
         logger.error(f"Database error processing POST /message: {db_err}", exc_info=True)
@@ -792,14 +793,14 @@ async def get_message_route(request_obj: FastAPIRequest):
         level = "info"
         
         logger.info(f"Default GET /message accessed by {request_obj.client.host if request_obj.client else 'N/A'}")
-        message_id = f"msg_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        message_id = f"msg_{datetime.now(ZoneInfo('Africa/Cairo')).strftime('%Y%m%d%H%M%S%f')}"
         
         return MessageResponse(
             id=message_id, 
             message=message_content,
             title=title, 
             level=level, 
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(ZoneInfo("Africa/Cairo"))
         )
     except Exception as e: # Should be very unlikely for this simple GET
         logger.error(f"Unexpected error processing GET /message: {e}", exc_info=True)

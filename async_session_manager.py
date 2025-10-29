@@ -9,6 +9,7 @@ import uuid
 from uuid import UUID, uuid4
 import secrets 
 from datetime import datetime, timedelta, timezone 
+from zoneinfo import ZoneInfo
 from schemas_models import TokenPair, TokenData
 import jwt
 from jwt import DecodeError, PyJWTError
@@ -56,7 +57,7 @@ class SessionManager:
     async def blacklist_token(self, token: str, user_id: Union[str, UUID], expires_at_iso: Union[str, datetime], reason: Optional[str] = None) -> str:
         """Add a token to the blacklist."""
         blacklist_id = uuid4()
-        blacklisted_at = datetime.now(timezone.utc)
+        blacklisted_at = datetime.now(ZoneInfo("Africa/Cairo"))
         
         try:
             if isinstance(expires_at_iso, str):
@@ -99,11 +100,11 @@ class SessionManager:
         else:
             raise ValueError("Invalid token_type specified")
 
-        expire = datetime.now(timezone.utc) + expires_delta
+        expire = datetime.now(ZoneInfo("Africa/Cairo")) + expires_delta
         to_encode.update({
             "exp": expire, 
             "token_type": token_type, 
-            "iat": datetime.now(timezone.utc),
+            "iat": datetime.now(ZoneInfo("Africa/Cairo")),
             "jti": jti
         })
         
@@ -157,7 +158,7 @@ class SessionManager:
             expires_at_dt = datetime.fromtimestamp(expires_at_timestamp, tz=timezone.utc)
         except PyJWTError as e: 
             logger.error(f"Error decoding newly created access token to get exp: {e}")
-            expires_at_dt = datetime.now(timezone.utc) + timedelta(minutes=self.ACCESS_TOKEN_EXPIRE_MINUTES)
+            expires_at_dt = datetime.now(ZoneInfo("Africa/Cairo")) + timedelta(minutes=self.ACCESS_TOKEN_EXPIRE_MINUTES)
 
         return TokenPair(
             access_token=access_token,
@@ -243,7 +244,7 @@ class SessionManager:
 
             await self.db_manager.execute_query(
                 "UPDATE user_tokens SET is_active = FALSE, updated_at = $1 WHERE user_id = $2",
-                (datetime.now(timezone.utc), user_id_uuid)
+                (datetime.now(ZoneInfo("Africa/Cairo")), user_id_uuid)
             )
             
             # Ensure user_manager is initialized if this can be called early
@@ -292,7 +293,7 @@ class SessionManager:
             SET access_token = $1, access_expires_at = $2, updated_at = $3
             WHERE user_id = $4 AND refresh_token = $5 AND is_active = TRUE 
             """,
-            (new_access_token, access_expires_dt, datetime.now(timezone.utc), UUID(user_id_str), refresh_token)
+            (new_access_token, access_expires_dt, datetime.now(ZoneInfo("Africa/Cairo")), UUID(user_id_str), refresh_token)
         )
         
         return TokenPair(
@@ -315,7 +316,7 @@ class SessionManager:
             SET access_token = $1, access_expires_at = $2, updated_at = $3
             WHERE user_id = $4 AND refresh_token = $5 AND is_active = TRUE
             """,
-            (new_access_token, access_expires_dt, datetime.now(timezone.utc), UUID(str(user_id)), refresh_token)
+            (new_access_token, access_expires_dt, datetime.now(ZoneInfo("Africa/Cairo")), UUID(str(user_id)), refresh_token)
         )
 
     async def revoke_token(self, token: str, reason: Optional[str] = None) -> bool:
@@ -354,7 +355,7 @@ class SessionManager:
     async def store_token_pair(self, user_id: Union[str, UUID], access_token: str, refresh_token: str, workspace_id: Optional[Union[str, UUID]] = None) -> str:
         """Store a token pair in the database."""
         token_id = uuid4()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(ZoneInfo("Africa/Cairo"))
         
         access_token_payload = jwt.decode(access_token, self.SECRET_KEY, algorithms=[self.ALGORITHM], options={"verify_exp": False})
         refresh_token_payload = jwt.decode(refresh_token, self.SECRET_KEY, algorithms=[self.ALGORITHM], options={"verify_exp": False})
@@ -381,7 +382,7 @@ class SessionManager:
         Get all active tokens for a user by user_id (string).
         Corresponds to original's get_tokens_by_user_id_fixed.
         """
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
         user_id_uuid = UUID(user_id_str)
         
         results = await self.db_manager.execute_query(
@@ -441,7 +442,7 @@ class SessionManager:
         # Mark the token pair as inactive in the database
         updated_rows = await self.db_manager.execute_query(
             "UPDATE user_tokens SET is_active = FALSE, updated_at = $1 WHERE access_token = $2 AND user_id = $3",
-            (datetime.now(timezone.utc), access_token, user_id_uuid),
+            (datetime.now(ZoneInfo("Africa/Cairo")), access_token, user_id_uuid),
             return_rowcount=True
         )
 
@@ -482,7 +483,7 @@ class SessionManager:
         """
         Get all active tokens in the database.
         """
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
         results = await self.db_manager.execute_query(
             """
             SELECT token_id, user_id, access_token, refresh_token, access_expires_at, refresh_expires_at, created_at, updated_at, workspace_id
@@ -512,7 +513,7 @@ class SessionManager:
     async def get_all_tokens_for_user_async(self, user_id_str: str) -> List[Dict]: # Corresponds to original's get_all_tokens_for_user_async
         """ Get all active tokens for a specific user. """
         user_id_uuid = UUID(user_id_str)
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
         query = """
             SELECT token_id, access_token, refresh_token, access_expires_at, refresh_expires_at, created_at, workspace_id
             FROM user_tokens 
@@ -552,7 +553,7 @@ class SessionManager:
 
             await self.db_manager.execute_query(
                 "UPDATE user_tokens SET is_active = FALSE, updated_at = $1 WHERE user_id = $2",
-                (datetime.now(timezone.utc), user_id_uuid)
+                (datetime.now(ZoneInfo("Africa/Cairo")), user_id_uuid)
             )
             
             if hasattr(self, 'user_manager') and self.user_manager:
@@ -571,7 +572,7 @@ class SessionManager:
             SELECT user_id FROM user_tokens 
             WHERE access_token = $1 AND is_active = TRUE AND access_expires_at > $2
         """
-        result = await self.db_manager.execute_query(query, (access_token, datetime.now(timezone.utc)), fetch_one=True)
+        result = await self.db_manager.execute_query(query, (access_token, datetime.now(ZoneInfo("Africa/Cairo"))), fetch_one=True)
         return str(result["user_id"]) if result and result.get("user_id") else None
 
     async def get_user_id_by_refresh_token(self, refresh_token: str) -> Optional[str]:
@@ -580,7 +581,7 @@ class SessionManager:
             SELECT user_id FROM user_tokens 
             WHERE refresh_token = $1 AND is_active = TRUE AND refresh_expires_at > $2
         """
-        result = await self.db_manager.execute_query(query, (refresh_token, datetime.now(timezone.utc)), fetch_one=True)
+        result = await self.db_manager.execute_query(query, (refresh_token, datetime.now(ZoneInfo("Africa/Cairo"))), fetch_one=True)
         return str(result["user_id"]) if result and result.get("user_id") else None
 
     async def get_token_from_websocket(self, websocket: WebSocket) -> Optional[str]: # No DB access, logic is sync
@@ -662,7 +663,7 @@ class SessionManager:
     
     async def clean_expired_tokens(self) -> int:
         """Clean expired tokens from user_tokens table."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(ZoneInfo("Africa/Cairo"))
         deleted_user_tokens = await self.db_manager.execute_query(
             "DELETE FROM user_tokens WHERE refresh_expires_at < $1", (now,), return_rowcount=True
         )
@@ -674,7 +675,7 @@ class SessionManager:
     
     async def clean_expired_blacklist(self) -> int:
         """Remove expired tokens from the blacklist."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(ZoneInfo("Africa/Cairo"))
         deleted_count = await self.db_manager.execute_query(
             "DELETE FROM token_blacklist WHERE expires_at < $1", (now,), return_rowcount=True
         )
@@ -688,7 +689,7 @@ class SessionManager:
                    user_agent: Optional[str] = None, status: str ="success"):
         """Log an action in the system."""
         log_id = uuid4()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(ZoneInfo("Africa/Cairo"))
 
         log_user_id_uuid = UUID(str(user_id)) if user_id else None
         log_workspace_id_uuid = UUID(str(workspace_id)) if workspace_id else None
