@@ -144,6 +144,12 @@ Enable config:
 sudo ln -sf /etc/nginx/sites-available/insighteye /etc/nginx/sites-enabled/
 ```
 
+YOUR_PUBLIC_IP==dig +short myip.opendns.com @resolver1.opendns.com
+or
+YOUR_PUBLIC_IP==curl ifconfig.me
+or
+YOUR_PUBLIC_IP==curl checkip.amazonaws.com
+
 ---
 
 # ✅ STEP-9 — Create SSL Certificate (Self-signed for IP)

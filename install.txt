@@ -10,6 +10,11 @@ git clone https://github.com/mahmoudelshahapy97/insighteye.git --recursive
 git lfs track "models/*"
 git add .gitattributes
 
+git add --force models/*.pt
+git commit -m "Move models to Git LFS"
+git push
+
+
 #############################
 
 sudo apt update && sudo apt upgrade -y
