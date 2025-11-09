@@ -101,7 +101,7 @@ class CacheControlMiddleware(BaseHTTPMiddleware):
         return response
 
 app = FastAPI(
-    root_path=config.get("fastapi_root_path", "/insighteye-1"),
+    # root_path=config.get("fastapi_root_path", "/insighteye-1"),
     lifespan=lifespan,
     title=config.get("fastapi_title", "InsightEye API"),
     description=config.get("fastapi_description", "API for managing cameras, users, and insights."),

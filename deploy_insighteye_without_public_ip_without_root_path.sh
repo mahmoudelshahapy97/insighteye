@@ -55,7 +55,23 @@ server {
     listen 80;
     server_name _;
 
-    # Root path for ALB health checks
+    # Health check endpoint - CRITICAL for ALB
+    location /health {
+        proxy_pass http://127.0.0.1:8000/health;
+        access_log off;
+    }
+
+    # Root path - redirect to docs
+    location = / {
+        proxy_pass http://127.0.0.1:8000/docs;
+        
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Main application
     location / {
         proxy_pass http://127.0.0.1:8000;
         
