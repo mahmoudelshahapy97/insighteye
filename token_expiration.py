@@ -2,7 +2,7 @@
 from datetime import datetime, timedelta
 from typing import Dict, Tuple
 import logging
-from async_config import config
+from config import config
 
 logger = logging.getLogger(__name__)
 

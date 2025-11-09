@@ -1,11 +1,11 @@
-# async_llm_model.py
+# llm_model.py
 import logging
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from schemas_models import BaseChatRequest, ChatRequest
-from async_utils import generate_chat_response
-from async_config import config
-from async_session_manager import SessionManager
+from utils import generate_chat_response
+from config import config
+from session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 

@@ -1,10 +1,10 @@
-# async_session_manager.py
+# session_manager.py
 from fastapi import Request, Form, Depends, WebSocket, WebSocketDisconnect, HTTPException, status, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import time 
 from typing import Dict, Optional, List, Union
-from async_config import config
-from async_database import DatabaseManager 
+from config import config
+from database import DatabaseManager 
 import uuid 
 from uuid import UUID, uuid4
 import secrets 
@@ -16,8 +16,8 @@ from jwt import DecodeError, PyJWTError
 import logging
 import hashlib
 # import json 
-from async_token_expiration import TokenExpirationStrategy
-from async_user_manager import UserManager 
+from token_expiration import TokenExpirationStrategy
+from user_manager import UserManager 
 
 logger = logging.getLogger(__name__)
 security = HTTPBearer()

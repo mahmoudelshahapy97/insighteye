@@ -1,10 +1,10 @@
-# async_otp_manager.py
+# otp_manager.py
 import secrets
 import logging
 from typing import Dict, Tuple, Optional
-from async_config import config
-from async_utils import send_email  
-from async_database import DatabaseManager
+from config import config
+from utils import send_email  
+from database import DatabaseManager
 import hashlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo

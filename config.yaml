@@ -41,8 +41,6 @@ ALGORITHM: HS256 #seconds
 session_timeout: 600 #seconds
 # secrets.token_urlsafe(32)
 SECRET_KEY: e20d4027c260b6452f7607db8e7e4d02994d65a67d245665ba597e1d374cc2b4
-# model_path: "yolov8n.pt"
-# model_path: "yolov9c_80_ultralitics_second_train.pt"
 people_model_path: "people.pt"
 gender_model_path: "gender.pt"
 fire_model_path: "fire.pt"
@@ -61,15 +59,11 @@ otp_sender_email: "Insighteye@gateworx.net"
 insert_batch_size: 5
 insert_interval: 60 #seconds
 
-qdrant_url: "localhost"
+qdrant_url: "172.31.25.133"
 qdrant_port: 6333
 qdrant_collection_name: "person_counts"
 query_timeout: 50
 qdrant_fetch_limit: 50
-
-
-milvus_uri: "http://localhost:19530"
-milvus_token: "root:Milvus"
 
 session_id: "2gXz1vQjW7-M6XsHwZp9D1BEXyL3oAqVfJbYK9t5U2c"
 
@@ -77,8 +71,11 @@ database:
   dbname: "insighteye_db"
   user: "insighteye_user"
   password: "insighteye*+#@"
-  host: "localhost"
-  port: "5432"
+  host: "172.31.25.133"
+  port: 5432
+
+# # Use the database server's private IP instead of 'postgres' hostname
+# DATABASE_URL=postgresql+asyncpg://insighteye_user:insighteye*+#@@172.31.25.133:5432/insighteye_db
 
 server_host: "127.0.0.1"
 server_port: 8000

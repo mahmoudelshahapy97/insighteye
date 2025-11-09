@@ -1,4 +1,4 @@
-# async_sessions_2.py
+# sessions_2.py
 from fastapi import APIRouter, Depends, HTTPException, Query, Path, status, Response
 from typing import Optional, Dict, Any, List # Added List for type hinting if needed
 from datetime import datetime, timezone
@@ -12,8 +12,8 @@ from schemas_models import (LogListResponse, # LogEntry not used directly here
                             TokenIdResponse, TokenMessageResponse,
                             BlacklistCheckResponse, MaintenanceResponse, TokenStats,
                             TokenInfo, TokenListResponse)
-from async_session_manager import SessionManager # Assuming SessionManager has async methods or is wrapped
-from async_user_manager import UserManager     # Assuming UserManager has async methods or is wrapped
+from session_manager import SessionManager # Assuming SessionManager has async methods or is wrapped
+from user_manager import UserManager     # Assuming UserManager has async methods or is wrapped
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])

@@ -1,4 +1,4 @@
-# async_camera.py 
+# camera.py 
 ################################
 from fastapi import APIRouter, HTTPException, Depends, status, Request, Response, Query
 from fastapi import UploadFile, File
@@ -14,7 +14,7 @@ import base64
 import json
 from schemas_models import (
     CameraStreamQueryParams, StreamCreate, StreamUpdate, StreamDelete, CameraState, 
-    CamerasStateResponse, CameraBulkUploadResult, CameraCSVRecord
+    CamerasStateResponse, CameraBulkUploadResult, CameraCSVRecord, UserCameraCountUpdate, UserCameraCountResponse
 )
 from schemas_models import (
     LocationCreate, LocationUpdate, LocationResponse, 
@@ -30,15 +30,15 @@ from schemas_models import (
     LocationStatsResponseWithAlerts, CameraDetailedResponse,
     AlertSummaryResponse, CameraAlertUpdateResponse
 )
-from async_session_manager import SessionManager
-from async_user_manager import UserManager
-from async_database import DatabaseManager 
-from async_video_streaming_qdrant import get_timestamp_range_, get_qdrant_client, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists
+from session_manager import SessionManager
+from user_manager import UserManager
+from database import DatabaseManager 
+from video_streaming_qdrant import get_timestamp_range_, get_qdrant_client, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists
 from qdrant_client.http import models as qdrant_models # For Qdrant integration
-from async_workspaces import get_user_and_workspace, check_workspace_membership_and_get_role 
+from workspaces import get_user_and_workspace, check_workspace_membership_and_get_role 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from async_utils import parse_string_or_list, encoded_string
+from utils import parse_string_or_list, encoded_string
 
 logger = logging.getLogger(__name__)
 
@@ -62,16 +62,6 @@ def ensure_uuid_str(id_value: Any) -> Optional[str]:
             raise HTTPException(status_code=500, detail="An unexpected error occurred during ID validation.")
     raise HTTPException(status_code=400, detail=f"Unsupported ID type: {type(id_value)}")
 
-def validate_alert_thresholds(greater_threshold: Optional[int], less_threshold: Optional[int]) -> tuple[bool, Optional[str]]:
-    """
-    Validate alert threshold logic.
-    Returns (is_valid, error_message)
-    """
-    if greater_threshold is not None and less_threshold is not None:
-        if less_threshold >= greater_threshold:
-            return False, "count_threshold_less must be less than count_threshold_greater"
-    return True, None
-
 @router.post("/source", status_code=status.HTTP_201_CREATED)
 async def create_stream(stream: StreamCreate, request: Request, current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)):
     user_id_obj = None 
@@ -90,17 +80,6 @@ async def create_stream(stream: StreamCreate, request: Request, current_user_dat
         user_db_details = await user_manager.get_user_by_id(str(user_id_obj)) 
         allowed_camera_count = user_db_details.get("count_of_camera", 5)
         user_system_role = user_db_details.get("role", "user")
-
-        # VALIDATE ALERT THRESHOLDS BEFORE CREATING
-        greater_threshold = getattr(stream, 'count_threshold_greater', None)
-        less_threshold = getattr(stream, 'count_threshold_less', None)
-        
-        is_valid, error_msg = validate_alert_thresholds(greater_threshold, less_threshold)
-        if not is_valid:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid alert thresholds: {error_msg}"
-            )
 
         if user_system_role != 'admin':
             count_query = "SELECT COUNT(*) as stream_count FROM video_stream WHERE user_id = $1 AND workspace_id = $2"
@@ -162,9 +141,6 @@ async def create_stream(stream: StreamCreate, request: Request, current_user_dat
                 ip_address=request.client.host if request.client else "Unknown",
                 user_agent=request.headers.get("user-agent", "Unknown")
         )
-        if greater_threshold is not None and less_threshold is not None:
-            if less_threshold >= greater_threshold:
-                return {"message": "count_threshold_less must be less than count_threshold_greater", "id": str(stream_id)} 
         
         return {"message": "Stream created successfully", "id": str(stream_id)}
 
@@ -353,8 +329,8 @@ async def get_all_streams(
         logger.error(f"Unexpected error retrieving all streams (admin/scoped): {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
-@router.put("/source", status_code=status.HTTP_200_OK)
-async def update_streams(streams: List[StreamUpdate], request: Request, current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)):
+@router.put("/source1", status_code=status.HTTP_200_OK)
+async def update_streams1(streams: List[StreamUpdate], request: Request, current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)):
     user_id_obj = None
     username = "unknown"
     active_workspace_id_obj = None
@@ -364,36 +340,9 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
         _user_id_from_ws_check, active_workspace_id_obj = await get_user_and_workspace(username) 
 
         updated_ids, failed_ids = [], []
-        validation_errors = []  # Track validation errors separately
 
         for stream_update_data in streams:
             stream_id_to_update_str = ensure_uuid_str(stream_update_data.id) 
-
-            # VALIDATE ALERT THRESHOLDS FIRST
-            greater_threshold = getattr(stream_update_data, 'count_threshold_greater', None)
-            less_threshold = getattr(stream_update_data, 'count_threshold_less', None)
-            
-            # If updating thresholds, validate the new values
-            if greater_threshold is not None or less_threshold is not None:
-                # Get current values if only updating one threshold
-                if greater_threshold is None or less_threshold is None:
-                    current_threshold_query = "SELECT count_threshold_greater, count_threshold_less FROM video_stream WHERE stream_id = $1"
-                    current_thresholds = await db_manager.execute_query(
-                        current_threshold_query, 
-                        params=(UUID(stream_id_to_update_str),), 
-                        fetch_one=True
-                    )
-                    if current_thresholds:
-                        if greater_threshold is None:
-                            greater_threshold = current_thresholds['count_threshold_greater']
-                        if less_threshold is None:
-                            less_threshold = current_thresholds['count_threshold_less']
-                
-                is_valid, error_msg = validate_alert_thresholds(greater_threshold, less_threshold)
-                if not is_valid:
-                    validation_errors.append(f"Camera {stream_id_to_update_str}: {error_msg}")
-                    failed_ids.append(stream_id_to_update_str)
-                    continue
             
             stream_info_query = "SELECT user_id, workspace_id FROM video_stream WHERE stream_id = $1"
             stream_info = await db_manager.execute_query(stream_info_query, params=(UUID(stream_id_to_update_str),), fetch_one=True) 
@@ -575,7 +524,6 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
         log_content = f"User '{username}' attempted to update {len(streams)} camera(s)."
         if updated_ids: log_content += f" Successfully updated: {', '.join(list(set(updated_ids)))}." 
         if failed_ids: log_content += f" Failed/unauthorized for IDs: {', '.join(list(set(failed_ids)))}."
-        if validation_errors: log_content += f" Validation errors: {'; '.join(validation_errors)}."
         
         await session_manager.log_action( 
             content=log_content, user_id=str(user_id_obj),
@@ -590,25 +538,13 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
 
         response_status_code = status.HTTP_200_OK
         response_detail_msg = f"Streams update attempt finished. Updated: {len(final_updated_ids)}."
-        if final_failed_ids or validation_errors:
+        if final_failed_ids:
             response_status_code = status.HTTP_207_MULTI_STATUS if final_updated_ids else status.HTTP_400_BAD_REQUEST
-            if final_failed_ids: response_detail_msg += f" Failed/unauthorized for IDs: {', '.join(final_failed_ids)}."
-            if validation_errors: response_detail_msg += f" Validation errors: {'; '.join(validation_errors)}."
-        
-        response_data = {
-            "detail": response_detail_msg, 
-            "updated_ids": final_updated_ids, 
-            "failed_ids": final_failed_ids
-        }
-        
-        # Add validation errors to response for frontend handling
-        if validation_errors:
-            response_data["validation_errors"] = validation_errors
+            response_detail_msg += f" Failed/unauthorized for IDs: {', '.join(final_failed_ids)}."
         
         return Response(
-            content=json.dumps(response_data),
-            status_code=response_status_code, 
-            media_type="application/json"
+            content=json.dumps({"detail": response_detail_msg, "updated_ids": final_updated_ids, "failed_ids": final_failed_ids}),
+            status_code=response_status_code, media_type="application/json"
         )
 
     except asyncpg.PostgresError as db_err: 
@@ -636,38 +572,11 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
         username = current_user_data["username"]
         _user_id_from_ws_check, active_workspace_id_obj = await get_user_and_workspace(username) 
 
-        updated_ids, failed_ids = [], []
-        validation_errors = []
-        qdrant_update_failures = []  # Track Qdrant-specific failures
+        updated_ids, failed_ids, qdrant_sync_failures = [], [], []
 
         for stream_update_data in streams:
             stream_id_to_update_str = ensure_uuid_str(stream_update_data.id) 
-
-            # VALIDATE ALERT THRESHOLDS FIRST
-            greater_threshold = getattr(stream_update_data, 'count_threshold_greater', None)
-            less_threshold = getattr(stream_update_data, 'count_threshold_less', None)
             
-            if greater_threshold is not None or less_threshold is not None:
-                if greater_threshold is None or less_threshold is None:
-                    current_threshold_query = "SELECT count_threshold_greater, count_threshold_less FROM video_stream WHERE stream_id = $1"
-                    current_thresholds = await db_manager.execute_query(
-                        current_threshold_query, 
-                        params=(UUID(stream_id_to_update_str),), 
-                        fetch_one=True
-                    )
-                    if current_thresholds:
-                        if greater_threshold is None:
-                            greater_threshold = current_thresholds['count_threshold_greater']
-                        if less_threshold is None:
-                            less_threshold = current_thresholds['count_threshold_less']
-                
-                is_valid, error_msg = validate_alert_thresholds(greater_threshold, less_threshold)
-                if not is_valid:
-                    validation_errors.append(f"Camera {stream_id_to_update_str}: {error_msg}")
-                    failed_ids.append(stream_id_to_update_str)
-                    continue
-            
-            # Get stream info and check permissions
             stream_info_query = "SELECT user_id, workspace_id FROM video_stream WHERE stream_id = $1"
             stream_info = await db_manager.execute_query(stream_info_query, params=(UUID(stream_id_to_update_str),), fetch_one=True) 
 
@@ -679,7 +588,6 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
             stream_owner_id_obj = stream_info["user_id"] 
             stream_workspace_id_obj = stream_info["workspace_id"]
 
-            # Check permissions
             can_update = False
             if stream_owner_id_obj == user_id_obj:
                 can_update = True
@@ -698,128 +606,183 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
                 failed_ids.append(stream_id_to_update_str)
                 continue
             
-            # Build update query
             set_clauses_list, update_params_list = [], []
             param_idx = 1
             
-            # Basic fields
+            # Track fields for Qdrant update
+            qdrant_payload = {}
+            
             if stream_update_data.name is not None: 
                 set_clauses_list.append(f"name = ${param_idx}"); 
                 update_params_list.append(stream_update_data.name); 
+                qdrant_payload["name"] = stream_update_data.name
                 param_idx += 1
+                
             if stream_update_data.path is not None: 
                 set_clauses_list.append(f"path = ${param_idx}"); 
                 update_params_list.append(stream_update_data.path); 
                 param_idx += 1
+                
             if stream_update_data.type is not None: 
                 set_clauses_list.append(f"type = ${param_idx}"); 
                 update_params_list.append(stream_update_data.type); 
                 param_idx += 1
+                
             if stream_update_data.status is not None: 
                 set_clauses_list.append(f"status = ${param_idx}"); 
                 update_params_list.append(stream_update_data.status); 
                 param_idx += 1
+                
             if stream_update_data.is_streaming is not None: 
                 set_clauses_list.append(f"is_streaming = ${param_idx}"); 
                 update_params_list.append(stream_update_data.is_streaming); 
                 param_idx += 1
             
             # Location fields
-            location_fields_to_update = {}
             if hasattr(stream_update_data, 'location') and stream_update_data.location is not None:
                 set_clauses_list.append(f"location = ${param_idx}")
                 update_params_list.append(stream_update_data.location)
-                location_fields_to_update["location"] = stream_update_data.location
+                qdrant_payload["location"] = stream_update_data.location
                 param_idx += 1
+                
             if hasattr(stream_update_data, 'area') and stream_update_data.area is not None:
                 set_clauses_list.append(f"area = ${param_idx}")
                 update_params_list.append(stream_update_data.area)
-                location_fields_to_update["area"] = stream_update_data.area
+                qdrant_payload["area"] = stream_update_data.area
                 param_idx += 1
+                
             if hasattr(stream_update_data, 'building') and stream_update_data.building is not None:
                 set_clauses_list.append(f"building = ${param_idx}")
                 update_params_list.append(stream_update_data.building)
-                location_fields_to_update["building"] = stream_update_data.building
+                qdrant_payload["building"] = stream_update_data.building
                 param_idx += 1
+                
             if hasattr(stream_update_data, 'floor_level') and stream_update_data.floor_level is not None:
                 set_clauses_list.append(f"floor_level = ${param_idx}")
                 update_params_list.append(stream_update_data.floor_level)
-                location_fields_to_update["floor_level"] = stream_update_data.floor_level
+                qdrant_payload["floor_level"] = stream_update_data.floor_level
                 param_idx += 1
+                
             if hasattr(stream_update_data, 'zone') and stream_update_data.zone is not None:
                 set_clauses_list.append(f"zone = ${param_idx}")
                 update_params_list.append(stream_update_data.zone)
-                location_fields_to_update["zone"] = stream_update_data.zone
+                qdrant_payload["zone"] = stream_update_data.zone
                 param_idx += 1
+                
             if hasattr(stream_update_data, 'latitude') and stream_update_data.latitude is not None:
                 set_clauses_list.append(f"latitude = ${param_idx}")
                 update_params_list.append(stream_update_data.latitude)
-                location_fields_to_update["latitude"] = float(stream_update_data.latitude)
+                qdrant_payload["latitude"] = float(stream_update_data.latitude)
                 param_idx += 1
+                
             if hasattr(stream_update_data, 'longitude') and stream_update_data.longitude is not None:
                 set_clauses_list.append(f"longitude = ${param_idx}")
                 update_params_list.append(stream_update_data.longitude)
-                location_fields_to_update["longitude"] = float(stream_update_data.longitude)
+                qdrant_payload["longitude"] = float(stream_update_data.longitude)
                 param_idx += 1
             
-            # Alert fields
+            # Alert fields (these don't go to Qdrant typically, but included for completeness)
             if hasattr(stream_update_data, 'count_threshold_greater') and stream_update_data.count_threshold_greater is not None:
                 set_clauses_list.append(f"count_threshold_greater = ${param_idx}")
                 update_params_list.append(stream_update_data.count_threshold_greater)
                 param_idx += 1
+                
             if hasattr(stream_update_data, 'count_threshold_less') and stream_update_data.count_threshold_less is not None:
                 set_clauses_list.append(f"count_threshold_less = ${param_idx}")
                 update_params_list.append(stream_update_data.count_threshold_less)
                 param_idx += 1
+                
             if hasattr(stream_update_data, 'alert_enabled') and stream_update_data.alert_enabled is not None:
                 set_clauses_list.append(f"alert_enabled = ${param_idx}")
                 update_params_list.append(stream_update_data.alert_enabled)
                 param_idx += 1
             
             if not set_clauses_list: 
-                logger.info(f"No update clauses for stream {stream_id_to_update_str}. Skipping DB update.")
+                logger.info(f"No update clauses for stream {stream_id_to_update_str}. Skipping.")
                 continue
 
-            # Add updated_at timestamp
             set_clauses_list.append(f"updated_at = ${param_idx}"); 
             update_params_list.append(datetime.now(ZoneInfo("Africa/Cairo"))); 
             param_idx += 1
-            
-            # Execute database update
             update_query_str = f"UPDATE video_stream SET {', '.join(set_clauses_list)} WHERE stream_id = ${param_idx}"
             update_params_list.append(UUID(stream_id_to_update_str)) 
 
             try:
+                # Update PostgreSQL
                 rows_affected = await db_manager.execute_query(update_query_str, params=tuple(update_params_list), return_rowcount=True) 
                 
-                if rows_affected > 0: 
-                    updated_ids.append(stream_id_to_update_str)
-
-                    # UPDATE QDRANT WITH IMPROVED ERROR HANDLING
-                    await update_qdrant_with_timeout_handling(
-                        stream_id_to_update_str, 
-                        stream_workspace_id_obj, 
-                        stream_update_data, 
-                        location_fields_to_update,
-                        qdrant_update_failures
-                    )
-                else: 
-                    logger.warning(f"Update to video_stream for ID {stream_id_to_update_str} affected 0 rows.")
+                if rows_affected > 0:
+                    # PostgreSQL update successful, now update Qdrant
+                    if qdrant_payload:  # Only update Qdrant if there are relevant fields
+                        try:
+                            qdrant_client = get_qdrant_client()
+                            collection_name = get_workspace_qdrant_collection_name(str(stream_workspace_id_obj))
+                            
+                            # Ensure collection exists
+                            await ensure_workspace_qdrant_collection_exists(qdrant_client, str(stream_workspace_id_obj))
+                            
+                            # Update all points with this camera_id
+                            update_result = qdrant_client.set_payload(
+                                collection_name=collection_name,
+                                payload=qdrant_payload,
+                                points=qdrant_models.Filter(
+                                    must=[
+                                        qdrant_models.FieldCondition(
+                                            key="camera_id", 
+                                            match=qdrant_models.MatchValue(value=stream_id_to_update_str)
+                                        )
+                                    ]
+                                ),
+                                wait=True  # Wait for operation to complete
+                            )
+                            
+                            # Check if Qdrant update was successful
+                            if hasattr(update_result, 'status') and update_result.status == qdrant_models.UpdateStatus.COMPLETED:
+                                updated_fields = list(qdrant_payload.keys())
+                                logger.info(f"Successfully synchronized {len(updated_fields)} field(s) in Qdrant for camera_id {stream_id_to_update_str}: {', '.join(updated_fields)}")
+                                updated_ids.append(stream_id_to_update_str)
+                            else:
+                                logger.warning(f"Qdrant update status unclear for camera_id {stream_id_to_update_str}: {update_result}")
+                                updated_ids.append(stream_id_to_update_str)
+                                qdrant_sync_failures.append({
+                                    "camera_id": stream_id_to_update_str,
+                                    "reason": f"Uncertain Qdrant status: {update_result.status if hasattr(update_result, 'status') else 'unknown'}"
+                                })
+                                
+                        except Exception as e_qdrant:
+                            logger.error(f"Failed to update Qdrant for camera_id {stream_id_to_update_str}: {e_qdrant}", exc_info=True)
+                            updated_ids.append(stream_id_to_update_str)
+                            qdrant_sync_failures.append({
+                                "camera_id": stream_id_to_update_str,
+                                "reason": str(e_qdrant),
+                                "fields_attempted": list(qdrant_payload.keys())
+                            })
+                    else:
+                        # No Qdrant-relevant fields were updated
+                        updated_ids.append(stream_id_to_update_str)
+                        logger.debug(f"Camera {stream_id_to_update_str} updated in PostgreSQL only (no Qdrant-relevant fields changed)")
+                else:
+                    logger.warning(f"PostgreSQL update for ID {stream_id_to_update_str} affected 0 rows.")
                     failed_ids.append(stream_id_to_update_str)
                     
-            except Exception as e_update: 
-                logger.error(f"Error updating stream {stream_id_to_update_str} in DB: {e_update}", exc_info=True)
+            except Exception as e_update:
+                logger.error(f"Error updating stream {stream_id_to_update_str}: {e_update}", exc_info=True)
                 failed_ids.append(stream_id_to_update_str)
 
-        # Log the results
+        # Prepare logging content
         log_content = f"User '{username}' attempted to update {len(streams)} camera(s)."
-        if updated_ids: log_content += f" Successfully updated: {', '.join(list(set(updated_ids)))}." 
-        if failed_ids: log_content += f" Failed/unauthorized for IDs: {', '.join(list(set(failed_ids)))}."
-        if validation_errors: log_content += f" Validation errors: {'; '.join(validation_errors)}."
-        if qdrant_update_failures: log_content += f" Qdrant update failures: {', '.join(qdrant_update_failures)}."
+        if updated_ids: 
+            unique_updated = list(set(updated_ids))
+            log_content += f" Successfully updated: {', '.join(unique_updated)}."
+        if qdrant_sync_failures:
+            log_content += f" Qdrant sync issues for {len(qdrant_sync_failures)} camera(s)."
+        if failed_ids: 
+            unique_failed = list(set(failed_ids))
+            log_content += f" Failed/unauthorized: {', '.join(unique_failed)}."
         
-        await session_manager.log_action( 
-            content=log_content, user_id=str(user_id_obj),
+        await session_manager.log_action(
+            content=log_content, 
+            user_id=str(user_id_obj),
             workspace_id=str(active_workspace_id_obj) if active_workspace_id_obj else None,
             action_type="Updated_Cameras_Batch",
             ip_address=request.client.host if request.client else "Unknown",
@@ -831,121 +794,47 @@ async def update_streams(streams: List[StreamUpdate], request: Request, current_
 
         # Determine response status
         response_status_code = status.HTTP_200_OK
-        response_detail_msg = f"Streams update attempt finished. Updated: {len(final_updated_ids)}."
+        response_detail_msg = f"Streams update completed. Updated: {len(final_updated_ids)}."
         
-        if final_failed_ids or validation_errors or qdrant_update_failures:
+        if qdrant_sync_failures:
+            response_status_code = status.HTTP_207_MULTI_STATUS
+            response_detail_msg += f" Warning: Qdrant sync issues for {len(qdrant_sync_failures)} camera(s)."
+            
+        if final_failed_ids:
             response_status_code = status.HTTP_207_MULTI_STATUS if final_updated_ids else status.HTTP_400_BAD_REQUEST
-            if final_failed_ids: response_detail_msg += f" Failed/unauthorized for IDs: {', '.join(final_failed_ids)}."
-            if validation_errors: response_detail_msg += f" Validation errors: {'; '.join(validation_errors)}."
-            if qdrant_update_failures: response_detail_msg += f" Qdrant sync warnings: {len(qdrant_update_failures)} camera(s)."
-        
-        response_data = {
-            "detail": response_detail_msg, 
-            "updated_ids": final_updated_ids, 
-            "failed_ids": final_failed_ids
-        }
-        
-        if validation_errors:
-            response_data["validation_errors"] = validation_errors
-        if qdrant_update_failures:
-            response_data["qdrant_update_failures"] = qdrant_update_failures
+            response_detail_msg += f" Failed/unauthorized: {', '.join(final_failed_ids)}."
         
         return Response(
-            content=json.dumps(response_data),
-            status_code=response_status_code, 
+            content=json.dumps({
+                "detail": response_detail_msg,
+                "updated_ids": final_updated_ids,
+                "failed_ids": final_failed_ids,
+                "qdrant_sync_failures": qdrant_sync_failures,
+                "summary": {
+                    "total_requested": len(streams),
+                    "postgres_success": len(final_updated_ids),
+                    "qdrant_sync_issues": len(qdrant_sync_failures),
+                    "failed": len(final_failed_ids)
+                }
+            }),
+            status_code=response_status_code,
             media_type="application/json"
         )
 
+    except asyncpg.PostgresError as db_err: 
+        log_user_id = str(user_id_obj) if user_id_obj else "unknown"
+        logger.error(f"Database error in update_streams batch for user {log_user_id}: {db_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error occurred during stream updates.")
+    except ValueError as ve: 
+        log_user_id = str(user_id_obj) if user_id_obj else "unknown"
+        logger.error(f"Invalid data in update_streams batch for user {log_user_id}: {ve}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Invalid data: {ve}")
+    except HTTPException as he:
+        raise he
     except Exception as e:
         log_user_id = str(user_id_obj) if user_id_obj else "unknown"
         logger.error(f"Unexpected error in update_streams batch for user {log_user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred during stream updates.")
-
-async def update_qdrant_with_timeout_handling(
-    stream_id: str, 
-    workspace_id_obj, 
-    stream_update_data, 
-    location_fields_to_update: dict,
-    qdrant_update_failures: list
-):
-    """
-    Handle Qdrant updates with proper timeout and error handling.
-    """
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    
-    # Build payload for Qdrant update
-    qdrant_payload = {}
-    qdrant_update_needed = False
-    
-    # Check for name update
-    if stream_update_data.name is not None:
-        qdrant_payload["name"] = stream_update_data.name
-        qdrant_update_needed = True
-    
-    # Add location fields
-    qdrant_payload.update(location_fields_to_update)
-    if location_fields_to_update:
-        qdrant_update_needed = True
-    
-    if not qdrant_update_needed:
-        return
-    
-    try:
-        # Use asyncio timeout for the entire Qdrant operation
-        await asyncio.wait_for(
-            update_qdrant_payload(stream_id, workspace_id_obj, qdrant_payload),
-            timeout=30.0  # 30 second timeout
-        )
-        
-        updated_fields = list(qdrant_payload.keys())
-        logger.info(f"Successfully synchronized fields {updated_fields} in Qdrant for camera_id {stream_id}.")
-        
-    except asyncio.TimeoutError:
-        logger.error(f"Qdrant update timed out for stream {stream_id}")
-        qdrant_update_failures.append(stream_id)
-    except Exception as e_qdrant:
-        logger.error(f"Failed to update Qdrant collection for stream {stream_id}: {e_qdrant}", exc_info=True)
-        qdrant_update_failures.append(stream_id)
-
-async def update_qdrant_payload(stream_id: str, workspace_id_obj, payload: dict):
-    """
-    Execute the actual Qdrant update operation in a thread pool to avoid blocking.
-    """
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    
-    def sync_qdrant_update():
-        try:
-            qdrant_client = get_qdrant_client()
-            collection_name = get_workspace_qdrant_collection_name(str(workspace_id_obj))
-            
-            # Ensure collection exists (this should be fast)
-            ensure_workspace_qdrant_collection_exists(qdrant_client, str(workspace_id_obj))
-            
-            # Perform the update with a shorter client timeout
-            qdrant_client.set_payload(
-                collection_name=collection_name,
-                payload=payload, 
-                points=qdrant_models.Filter(
-                    must=[
-                        qdrant_models.FieldCondition(
-                            key="camera_id", 
-                            match=qdrant_models.MatchValue(value=stream_id)
-                        )
-                    ]
-                ),
-                wait=False  # Don't wait for the operation to complete on Qdrant side
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Sync Qdrant update failed for {stream_id}: {e}")
-            raise
-    
-    # Run the synchronous Qdrant operation in a thread pool
-    loop = asyncio.get_event_loop()
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        await loop.run_in_executor(executor, sync_qdrant_update)
 
 @router.delete("/source", status_code=status.HTTP_200_OK)
 async def delete_streams(stream_ids_payload: StreamDelete, request: Request, current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)):
@@ -1837,32 +1726,6 @@ async def get_current_user_info(current_user_data_dep: Dict = Depends(session_ma
         log_username = username if username != "unknown" else current_user_data_dep.get("username", "unknown")
         logger.error(f"Unexpected error retrieving user info for {log_username}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error while retrieving user information.")
-                
-@router.delete("/drop_tables", status_code=status.HTTP_200_OK) 
-async def drop_all_tables_endpoint(request: Request, current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)): 
-    user_id_str_for_log = "unknown_admin"
-    username_for_log = "unknown_admin_user"
-    try:
-        if current_admin_data.get("role") != 'admin':
-           logger.warning(f"Unauthorized attempt to drop tables by user: {current_admin_data.get('username', 'unknown_user')}")
-           raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin privileges required.")
-    
-        user_id_str_for_log = str(current_admin_data["user_id"])
-        username_for_log = current_admin_data["username"]
-        logger.critical(f"ADMIN ACTION: User '{username_for_log}' (ID: {user_id_str_for_log}) initiated DROP ALL TABLES.")
-    
-        from async_database import drop_all_tables as db_drop_all_tables_func 
-        result = await db_drop_all_tables_func() 
-        return result
-
-    except asyncpg.PostgresError as db_err: 
-        logger.error(f"Database error during drop_all_tables for admin {username_for_log}: {db_err}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error during table drop.")
-    except HTTPException as e: 
-        raise e
-    except Exception as e:
-        logger.error(f"Error during drop_all_tables endpoint operation by {username_for_log}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error during table drop.")
 
 @router.get("/param_stream/workspace/status") 
 async def get_workspace_param_sync_status(current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)): 
@@ -3200,3 +3063,362 @@ async def get_zones(
     except Exception as e:
         logger.error(f"Error getting zones: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve zones.")
+
+
+@router.put("/admin/user-camera-limit", status_code=status.HTTP_200_OK)
+async def update_user_camera_limit(
+    update_data: UserCameraCountUpdate,
+    request: Request,
+    current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Update the camera count limit for a specific user.
+    Only system admins can update camera limits.
+    """
+    admin_user_id = None
+    admin_username = "unknown"
+    
+    try:
+        # Verify admin privileges
+        admin_user_id = current_admin_data["user_id"]
+        admin_username = current_admin_data["username"]
+        
+        if current_admin_data.get("role") != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="System admin privileges required to update camera limits."
+            )
+        
+        # Validate and convert user_id
+        target_user_id = ensure_uuid_str(update_data.user_id)
+        
+        # Get current user information
+        user_query = """
+            SELECT user_id, username, count_of_camera, role
+            FROM users
+            WHERE user_id = $1
+        """
+        user_info = await db_manager.execute_query(
+            user_query,
+            params=(UUID(target_user_id),),
+            fetch_one=True
+        )
+        
+        if not user_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with ID {target_user_id} not found."
+            )
+        
+        previous_count = user_info["count_of_camera"]
+        target_username = user_info["username"]
+        
+        # Prevent modifying another admin's camera count (optional security check)
+        if user_info["role"] == "admin" and str(admin_user_id) != target_user_id:
+            logger.warning(
+                f"Admin {admin_username} attempted to modify camera limit for another admin {target_username}"
+            )
+            # You can uncomment this to prevent admins from modifying other admins
+            # raise HTTPException(
+            #     status_code=status.HTTP_403_FORBIDDEN,
+            #     detail="Cannot modify camera limits for other admin users."
+            # )
+        
+        # Update the camera count
+        update_query = """
+            UPDATE users
+            SET count_of_camera = $1
+            WHERE user_id = $2
+            RETURNING count_of_camera
+        """
+        
+        result = await db_manager.execute_query(
+            update_query,
+            params=(update_data.count_of_camera, UUID(target_user_id)),
+            fetch_one=True
+        )
+        
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update camera count."
+            )
+        
+        # Log the action
+        await session_manager.log_action(
+            content=f"Admin '{admin_username}' updated camera limit for user '{target_username}' (ID: {target_user_id}) from {previous_count} to {update_data.count_of_camera}",
+            user_id=str(admin_user_id),
+            action_type="Updated_User_Camera_Limit",
+            ip_address=request.client.host if request.client else "Unknown",
+            user_agent=request.headers.get("user-agent", "Unknown"),
+            status="info"
+        )
+        
+        return UserCameraCountResponse(
+            user_id=target_user_id,
+            username=target_username,
+            count_of_camera=result["count_of_camera"],
+            previous_count=previous_count,
+            message=f"Camera limit updated successfully from {previous_count} to {result['count_of_camera']}"
+        )
+        
+    except asyncpg.PostgresError as db_err:
+        logger.error(
+            f"Database error updating camera limit by admin {admin_username}: {db_err}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Database error occurred while updating camera limit."
+        )
+    except ValueError as ve:
+        logger.error(
+            f"Invalid data in update_user_camera_limit by admin {admin_username}: {ve}",
+            exc_info=True
+        )
+        raise HTTPException(status_code=400, detail=f"Invalid data: {ve}")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(
+            f"Unexpected error in update_user_camera_limit by admin {admin_username}: {e}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while updating camera limit."
+        )
+
+
+@router.put("/admin/batch-user-camera-limit", status_code=status.HTTP_200_OK)
+async def batch_update_user_camera_limits(
+    updates: List[UserCameraCountUpdate],
+    request: Request,
+    current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Update camera count limits for multiple users in batch.
+    Only system admins can update camera limits.
+    """
+    admin_user_id = None
+    admin_username = "unknown"
+    
+    try:
+        # Verify admin privileges
+        admin_user_id = current_admin_data["user_id"]
+        admin_username = current_admin_data["username"]
+        
+        if current_admin_data.get("role") != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="System admin privileges required to update camera limits."
+            )
+        
+        if not updates:
+            return {
+                "message": "No updates provided.",
+                "updated_users": [],
+                "failed_users": []
+            }
+        
+        updated_users = []
+        failed_users = []
+        
+        for update_data in updates:
+            try:
+                # Validate user_id
+                target_user_id = ensure_uuid_str(update_data.user_id)
+                
+                # Get current user info
+                user_query = """
+                    SELECT user_id, username, count_of_camera
+                    FROM users
+                    WHERE user_id = $1
+                """
+                user_info = await db_manager.execute_query(
+                    user_query,
+                    params=(UUID(target_user_id),),
+                    fetch_one=True
+                )
+                
+                if not user_info:
+                    failed_users.append({
+                        "user_id": target_user_id,
+                        "reason": "User not found"
+                    })
+                    continue
+                
+                previous_count = user_info["count_of_camera"]
+                
+                # Update camera count
+                update_query = """
+                    UPDATE users
+                    SET count_of_camera = $1
+                    WHERE user_id = $2
+                    RETURNING count_of_camera
+                """
+                
+                result = await db_manager.execute_query(
+                    update_query,
+                    params=(update_data.count_of_camera, UUID(target_user_id)),
+                    fetch_one=True
+                )
+                
+                if result:
+                    updated_users.append({
+                        "user_id": target_user_id,
+                        "username": user_info["username"],
+                        "previous_count": previous_count,
+                        "new_count": result["count_of_camera"]
+                    })
+                else:
+                    failed_users.append({
+                        "user_id": target_user_id,
+                        "reason": "Update failed"
+                    })
+                    
+            except Exception as e_user:
+                logger.error(
+                    f"Error updating camera limit for user {update_data.user_id}: {e_user}",
+                    exc_info=True
+                )
+                failed_users.append({
+                    "user_id": update_data.user_id,
+                    "reason": str(e_user)
+                })
+        
+        # Log the batch action
+        log_content = f"Admin '{admin_username}' batch updated camera limits for {len(updates)} user(s). "
+        log_content += f"Successful: {len(updated_users)}, Failed: {len(failed_users)}."
+        
+        await session_manager.log_action(
+            content=log_content,
+            user_id=str(admin_user_id),
+            action_type="Batch_Updated_User_Camera_Limits",
+            ip_address=request.client.host if request.client else "Unknown",
+            user_agent=request.headers.get("user-agent", "Unknown"),
+            status="info" if not failed_users else "warning"
+        )
+        
+        response_status = status.HTTP_200_OK
+        if failed_users and not updated_users:
+            response_status = status.HTTP_400_BAD_REQUEST
+        elif failed_users:
+            response_status = status.HTTP_207_MULTI_STATUS
+        
+        return Response(
+            content=json.dumps({
+                "message": f"Batch update completed. Updated: {len(updated_users)}, Failed: {len(failed_users)}",
+                "updated_users": updated_users,
+                "failed_users": failed_users
+            }),
+            status_code=response_status,
+            media_type="application/json"
+        )
+        
+    except asyncpg.PostgresError as db_err:
+        logger.error(
+            f"Database error in batch camera limit update by admin {admin_username}: {db_err}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Database error occurred during batch update."
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(
+            f"Unexpected error in batch camera limit update by admin {admin_username}: {e}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred during batch update."
+        )
+
+
+@router.get("/admin/user-camera-limit/{user_id}", status_code=status.HTTP_200_OK)
+async def get_user_camera_limit(
+    user_id: str,
+    current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get the current camera count limit for a specific user.
+    System admins can view any user's limit. Regular users can only view their own.
+    """
+    try:
+        requesting_user_id = current_admin_data["user_id"]
+        requesting_user_role = current_admin_data.get("role")
+        
+        # Validate user_id
+        target_user_id = ensure_uuid_str(user_id)
+        
+        # Check permissions
+        if requesting_user_role != "admin" and str(requesting_user_id) != target_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only view your own camera limit."
+            )
+        
+        # Get user information
+        query = """
+            SELECT user_id, username, email, count_of_camera, role, 
+                   is_active, is_subscribed, created_at
+            FROM users
+            WHERE user_id = $1
+        """
+        user_info = await db_manager.execute_query(
+            query,
+            params=(UUID(target_user_id),),
+            fetch_one=True
+        )
+        
+        if not user_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with ID {target_user_id} not found."
+            )
+        
+        # Get current camera count across all workspaces
+        camera_count_query = """
+            SELECT COUNT(*) as total_cameras
+            FROM video_stream
+            WHERE user_id = $1
+        """
+        camera_count = await db_manager.execute_query(
+            camera_count_query,
+            params=(UUID(target_user_id),),
+            fetch_one=True
+        )
+        
+        return {
+            "user_id": str(user_info["user_id"]),
+            "username": user_info["username"],
+            "email": user_info["email"],
+            "count_of_camera": user_info["count_of_camera"],
+            "current_cameras": camera_count["total_cameras"] if camera_count else 0,
+            "remaining_limit": max(0, user_info["count_of_camera"] - (camera_count["total_cameras"] if camera_count else 0)),
+            "role": user_info["role"],
+            "is_active": user_info["is_active"],
+            "is_subscribed": user_info["is_subscribed"],
+            "created_at": user_info["created_at"].isoformat() if user_info["created_at"] else None
+        }
+        
+    except asyncpg.PostgresError as db_err:
+        logger.error(f"Database error getting user camera limit: {db_err}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Database error occurred while retrieving camera limit."
+        )
+    except ValueError as ve:
+        logger.error(f"Invalid data in get_user_camera_limit: {ve}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Invalid data: {ve}")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Unexpected error in get_user_camera_limit: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while retrieving camera limit."
+        )

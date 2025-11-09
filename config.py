@@ -1,7 +1,7 @@
-#async_config.py
+#config.py
 import yaml
 
-def load_config(config_path="async_config.yaml"):
+def load_config(config_path="config.yaml"):
     """Load configuration settings from a YAML file."""
     try:
         with open(config_path, 'r') as file:

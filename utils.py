@@ -1,7 +1,7 @@
-# async_utils.py
+# utils.py
 from fastapi import HTTPException, status
 import json
-from async_config import config
+from config import config
 import logging
 import os
 import asyncio

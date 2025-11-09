@@ -1,46 +1,19 @@
-# version: '3.8'
-
 services:
-  postgres:
-    image: postgres:15
-    container_name: postgres_container
+  app:
+    build: .
+    container_name: insighteye_app
     restart: always
-    environment:
-      POSTGRES_DB: insighteye_db
-      POSTGRES_USER: insighteye_user
-      POSTGRES_PASSWORD: insighteye*+#@
+    env_file:
+      - .env
     ports:
-      - "5432:5432"
+      - "${APP_PORT:-8000}:8000"
     volumes:
-      - ./postgres_data:/var/lib/postgresql/data
-    deploy:
-      resources:
-        limits:
-          cpus: '2'  # Limit to 2 CPUs
-          memory: 4G # Limit to 4GB RAM
+      - .:/app
+      - ./app.log:/app/app.log 
+    networks:
+      - insighteye_network
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-  qdrant:
-    restart: always
-    image: qdrant/qdrant:v1.14.0  
-    container_name: qdrant_container
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - ./qdrant_storage:/qdrant/storage
-    environment:
-      QDRANT__STORAGE__OPTIMIZERS__NUM_SEGMENTS_THREADS: 4  # Number of threads for optimization
-      QDRANT__STORAGE__OPTIMIZERS__MAX_OPTIMIZATION_THREADS: 4  # Maximum threads for optimization
-      QDRANT__STORAGE__PERFORMANCE__DEFAULT_SEGMENT_NUMBER: 8  # Default number of segments
-    deploy:
-      resources:
-        limits:
-          cpus: '6'  # Allocate 4 CPU cores
-          memory: 12G  # Allocate 8GB RAM
-        reservations:
-          cpus: '4'  # Ensure at least 2 CPU cores
-
-volumes:
-  postgres_data:
-  qdrant_storage:
-  
+networks:
+  insighteye_network:
+    driver: bridge

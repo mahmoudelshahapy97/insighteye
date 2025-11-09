@@ -1,13 +1,13 @@
-# async_workspaces.py
+# workspaces.py
 from fastapi import APIRouter, HTTPException, Depends, status, Request, Query
 from typing import List, Optional, Dict
 from uuid import UUID, uuid4
 from datetime import datetime, timezone 
 from zoneinfo import ZoneInfo
 import logging
-from async_session_manager import SessionManager # Methods will be async
-from async_database import DatabaseManager # Assuming this is AsyncDatabaseManager
-from async_user_manager import UserManager # Methods will be async
+from session_manager import SessionManager # Methods will be async
+from database import DatabaseManager # Assuming this is AsyncDatabaseManager
+from user_manager import UserManager # Methods will be async
 from schemas_models import WorkspaceCreate, WorkspaceUpdate, WorkspaceMemberCreate, WorkspaceMemberUpdate, WorkspaceResponse, WorkspaceMemberResponse, UserResponse
 
 logger = logging.getLogger(__name__)

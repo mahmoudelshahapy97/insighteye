@@ -1,4 +1,4 @@
-# async_qdrant_chat.py
+# qdrant_chat.py
 
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -8,19 +8,19 @@ import json
 import asyncio
 
 from langchain_ollama import ChatOllama
-from langchain.tools import StructuredTool
-# from langchain.schema import HumanMessage, SystemMessage # Not directly used here for message construction
+from langchain_core.tools import StructuredTool
+# from langchain_core.schema import HumanMessage, SystemMessage # Not directly used here for message construction
 
-from async_config import config
-from async_session_manager import SessionManager
+from config import config
+from session_manager import SessionManager
 from schemas_models import ChatRequest, SearchQuery # SearchQuery is key for the tool
-from async_video_streaming_qdrant import perform_search, get_qdrant_client # Import the actual search function and client getter
-from async_utils import (
+from video_streaming_qdrant import perform_search, get_qdrant_client # Import the actual search function and client getter
+from utils import (
     get_workspace_qdrant_collection_name,
     ensure_workspace_qdrant_collection_exists,
     parse_camera_ids # For the wrapper to prepare args for perform_search
 )
-from async_workspaces import get_user_and_workspace
+from workspaces import get_user_and_workspace
 
 logger = logging.getLogger(__name__)
 

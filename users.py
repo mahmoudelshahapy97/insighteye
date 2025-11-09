@@ -1,6 +1,6 @@
-# async_user.py
+# user.py
 from fastapi import APIRouter, HTTPException, status
-from async_user_manager import UserManager
+from user_manager import UserManager
 from schemas_models import CreateUserRequest, VerifyPasswordRequest, ResetPasswordRequest, EmailRequest, UserRequest 
 import logging
 

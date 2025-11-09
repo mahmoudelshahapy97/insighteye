@@ -1,10 +1,10 @@
-# async_otp.py
+# otp.py
 from fastapi import APIRouter, HTTPException, status, BackgroundTasks
 import logging
 from schemas_models import OTPRequest, OTPVerification, OTPDeletion, OTPSendEmail # Removed EmailRequest as it's not used in otp.py router
-from async_otp_manager import OTPManager
-from async_user_manager import UserManager
-from typing import Dict, Any, Optional # Optional from original async_otp.py is fine for create_response
+from otp_manager import OTPManager
+from user_manager import UserManager
+from typing import Dict, Any, Optional # Optional from original otp.py is fine for create_response
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/otp", tags=["otp"])

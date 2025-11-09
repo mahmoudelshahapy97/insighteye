@@ -1,11 +1,11 @@
-# async_video_streaming_qdrant.py
+# video_streaming_qdrant.py
 from fastapi import APIRouter, HTTPException, Query, Request, Depends, status
 from fastapi.responses import JSONResponse
 from collections import defaultdict
 from typing import Optional, List, Union, Dict, Any, Tuple, Set
 from uuid import UUID, uuid4
 import asyncio
-from async_config import config
+from config import config
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models 
 from datetime import datetime, time as dt_time, timezone 
@@ -13,16 +13,16 @@ from zoneinfo import ZoneInfo
 import logging
 
 # Updated imports for asynchronous managers
-from async_user_manager import UserManager as AsyncUserManager
-from async_session_manager import SessionManager as AsyncSessionManager
-from async_database import DatabaseManager as AsyncDatabaseManager
+from user_manager import UserManager as AsyncUserManager
+from session_manager import SessionManager as AsyncSessionManager
+from database import DatabaseManager as AsyncDatabaseManager
 
 from schemas_models import CreateCollectionRequest, SearchQuery, TimestampRangeResponse, CameraIdsResponse, DeleteDataRequest, LocationSearchQuery, CameraLocationGroup
-from async_utils import (
+from utils import (
     parse_camera_ids, make_prediction, parse_date_format, parse_time_string,
     get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists
 )
-from async_utils import parse_string_or_list
+from utils import parse_string_or_list
 
 logger = logging.getLogger(__name__)
 BASE_QDRANT_COLLECTION_NAME = config.get("qdrant_collection_name", "person_counts")
@@ -50,13 +50,13 @@ def get_qdrant_client() -> QdrantClient:
 async def on_startup_qdrant_router():
     """
     Initializes the Qdrant client.
-    Note: Database pool initialization (init_db_pool from async_database.py)
+    Note: Database pool initialization (init_db_pool from database.py)
     should be handled by the main FastAPI application's startup event
     to resolve warnings like "DB pool not available".
     """
     get_qdrant_client()
 
-async def get_user_and_workspace_async_refined(username: str, 
+async def get_user_and_workspace_refined(username: str, 
                                          user_manager: AsyncUserManager
                                          ) -> Tuple[Optional[Dict], Optional[UUID]]:
     """
@@ -65,10 +65,10 @@ async def get_user_and_workspace_async_refined(username: str,
     """
     user_details = await user_manager.get_user_by_username(username)
     if not user_details:
-        logger.debug(f"User '{username}' not found by get_user_and_workspace_async_refined.")
+        logger.debug(f"User '{username}' not found by get_user_and_workspace_refined.")
         return None, None
     
-    user_id_obj = user_details.get("user_id") # Should be UUID from async_user_manager
+    user_id_obj = user_details.get("user_id") # Should be UUID from user_manager
     if not user_id_obj:
         logger.error(f"User details for '{username}' missing user_id.")
         return user_details, None
@@ -202,7 +202,7 @@ async def workspace_search_results_v2(
     client = get_qdrant_client()
     final_workspace_id_obj: Optional[UUID] = None
     try:
-        requesting_user_id_obj = current_user_data["user_id"] # This is UUID from async_session_manager
+        requesting_user_id_obj = current_user_data["user_id"] # This is UUID from session_manager
         username = current_user_data["username"]
         user_db_info = await user_manager_global_qdrant.get_user_by_id(requesting_user_id_obj) # Pass UUID
         if not user_db_info: raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
@@ -214,7 +214,7 @@ async def workspace_search_results_v2(
             try: final_workspace_id_obj = UUID(workspace_id_query)
             except ValueError: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
         else:
-            _, active_ws_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+            _, active_ws_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
             if not active_ws_id_obj:
                  raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found. Please specify workspaceId or activate one.")
             final_workspace_id_obj = active_ws_id_obj
@@ -381,7 +381,7 @@ async def workspace_search_results_v2_ordered(
             except ValueError: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
         else:
             # Using the refined async helper function
-            _, active_ws_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+            _, active_ws_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
             if not active_ws_id_obj:
                  raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found. Please specify workspaceId or activate one.")
             final_workspace_id_obj = active_ws_id_obj
@@ -554,7 +554,7 @@ async def get_timestamp_range_(
         try: final_workspace_id_obj = UUID(str(workspace_id_for_search))
         except ValueError: raise HTTPException(status_code=400, detail="Invalid workspace_id_for_search format.")
     elif username_context:
-        _, active_ws_id_obj = await get_user_and_workspace_async_refined(username_context, user_manager_global_qdrant)
+        _, active_ws_id_obj = await get_user_and_workspace_refined(username_context, user_manager_global_qdrant)
         if not active_ws_id_obj:
             logger.warning(f"Timestamp range: User {username_context} has no active workspace. Returning empty range.")
             return TimestampRangeResponse() # Return empty if no active workspace and none specified
@@ -685,7 +685,7 @@ async def workspace_prediction_endpoint(
             try: final_workspace_id_obj = UUID(workspace_id_query)
             except ValueError: raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
         else:
-            _, active_ws_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+            _, active_ws_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
             if not active_ws_id_obj: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
             final_workspace_id_obj = active_ws_id_obj
         
@@ -752,7 +752,7 @@ async def search_results_user_active_workspace(
     current_user_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency) 
 ):
     username = current_user_data["username"]
-    _, active_workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+    _, active_workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
     if not active_workspace_id_obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found for user.")
     return await workspace_search_results_v2(workspace_id_query=str(active_workspace_id_obj), camera_id_param=camera_id, start_date=start_date, end_date=end_date, start_time=start_time, end_time=end_time, page=page, per_page=per_page, current_user_data=current_user_data, base64=base64)
@@ -765,7 +765,7 @@ async def prediction_data_user_active_workspace(
     current_user_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency) 
 ):
     username = current_user_data["username"]
-    _, active_workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+    _, active_workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
     if not active_workspace_id_obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found for user.")
     return await workspace_prediction_endpoint(workspace_id_query=str(active_workspace_id_obj), camera_id_param=camera_id, start_date=start_date, end_date=end_date, start_time=start_time, end_time=end_time, current_user_data=current_user_data)
@@ -791,7 +791,7 @@ async def get_timestamp_range_endpoint(
 async def get_all_camera_ids_for_active_workspace(current_user_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency)): 
     try:
         username = current_user_data["username"]
-        _, active_workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant) # active_workspace_id_obj is UUID
+        _, active_workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant) # active_workspace_id_obj is UUID
         if not active_workspace_id_obj:
             return CameraIdsResponse(camera_ids=[], count=0)
 
@@ -1243,7 +1243,7 @@ async def workspace_search_results_with_location(
             except ValueError: 
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
         else:
-            _, active_ws_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+            _, active_ws_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
             if not active_ws_id_obj:
                  raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
             final_workspace_id_obj = active_ws_id_obj
@@ -1481,7 +1481,7 @@ async def search_cameras_by_location_criteria(
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"cameras": [], "groups": [], "total_count": 0, "group_type": group_by}
         
@@ -1675,7 +1675,7 @@ async def get_cameras_in_location(
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return []
         
@@ -1743,7 +1743,7 @@ async def export_location_data(
         username = current_user_data["username"]
         user_id_obj = current_user_data["user_id"]
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             raise HTTPException(status_code=404, detail="No active workspace found")
         
@@ -2009,7 +2009,7 @@ async def get_qdrant_locations(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"locations": [], "total_count": 0}
         
@@ -2073,7 +2073,7 @@ async def get_qdrant_areas(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"areas": [], "total_count": 0, "filtered_by_locations": locations}
         
@@ -2147,7 +2147,7 @@ async def get_qdrant_buildings(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"buildings": [], "total_count": 0, "filtered_by_areas": areas}
         
@@ -2222,7 +2222,7 @@ async def get_qdrant_floor_levels(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"floor_levels": [], "total_count": 0, "filtered_by_buildings": buildings}
         
@@ -2298,7 +2298,7 @@ async def get_qdrant_zones(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"zones": [], "total_count": 0, "filtered_by_floor_levels": floor_levels}
         
@@ -2379,7 +2379,7 @@ async def get_qdrant_location_analytics(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"analytics": [], "total_count": 0, "group_by": group_by}
         
@@ -2526,7 +2526,7 @@ async def get_qdrant_location_summary(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {
                 "summary": {
@@ -2707,7 +2707,7 @@ async def get_qdrant_cameras_in_location(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"cameras": [], "location": location_name}
         
@@ -2869,7 +2869,7 @@ async def search_qdrant_location_data(
         
         system_role = user_db_info.get("role")
         
-        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+        _user_id_from_ws_check, workspace_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
         if not workspace_id_obj:
             return {"results": [], "search_term": search_term}
         

@@ -1,7 +1,7 @@
-# async_user_manager.py
+# user_manager.py
 from typing import Dict, List, Optional, Tuple, Union
 from passlib.context import CryptContext
-from async_database import DatabaseManager
+from database import DatabaseManager
 import uuid
 from uuid import UUID 
 import logging

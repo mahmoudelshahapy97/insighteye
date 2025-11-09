@@ -1,17 +1,17 @@
 ############################
-# async_login_user.py
+# login_user.py
 from fastapi import APIRouter, HTTPException, status, Depends, Response, Request as FastAPIRequest
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from uuid import UUID 
-from async_user_manager import UserManager 
-from async_session_manager import SessionManager 
+from user_manager import UserManager 
+from session_manager import SessionManager 
 from schemas_models import CreateUserRequest, UpdatePasswordRequest, LoginRequest, TokenPair, MessageRequest, MessageResponse, ContactCreate 
-from async_utils import send_email_from_client_to_admin, send_email
+from utils import send_email_from_client_to_admin, send_email
 from typing import Dict, Any, Optional 
-from async_config import config
+from config import config
 import asyncpg
 
 logger = logging.getLogger(__name__) 

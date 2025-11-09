@@ -1,4 +1,4 @@
-# async_stream_two.py
+# stream_two.py
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Response, Depends, Query
 from fastapi.responses import JSONResponse
 import time
@@ -15,18 +15,18 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Set, Any, Union
 from ultralytics import YOLO
-from async_utils import send_fire_alert_email, frame_to_base64, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists, parse_string_or_list, encoded_string # ensure_... is async
-from async_database import DatabaseManager
+from utils import send_fire_alert_email, frame_to_base64, get_workspace_qdrant_collection_name, ensure_workspace_qdrant_collection_exists, parse_string_or_list, encoded_string # ensure_... is async
+from database import DatabaseManager
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
-from async_config import config
-from async_session_manager import SessionManager 
-from async_user_manager import UserManager
+from config import config
+from session_manager import SessionManager 
+from user_manager import UserManager
 from shared_stream import VideoFileManager
 import concurrent.futures
 import os
 from starlette.websockets import WebSocketState
-from async_workspaces import check_workspace_membership_and_get_role
+from workspaces import check_workspace_membership_and_get_role
 from schemas_models import ThresholdSettings
 
 session_manager_global = SessionManager()
@@ -2296,7 +2296,7 @@ async def get_streams_by_location(
         return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
 
 @router.websocket("/stream1") # Path changed
-async def websocket_workspace_stream(websocket: WebSocket): # Name kept from async_stream
+async def websocket_workspace_stream(websocket: WebSocket): # Name kept from stream
     stream_id_str: Optional[str] = None
     ping_task: Optional[asyncio.Task] = None
     user_id_for_log: Optional[str] = None
