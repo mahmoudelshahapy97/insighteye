@@ -1,7 +1,5 @@
 *.pdf
-*.png
-*.jpg
-*.jpeg
+
 
 .pytest_cache/
 htmlcov/
