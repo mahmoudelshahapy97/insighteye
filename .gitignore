@@ -4,26 +4,9 @@
 *.jpeg
 *.env
 
-data/
-denoise/
-input/
-model_cache/
 models/
-models/*
-nemo_msdd_configs/
-uploads/
-videos/
-volumes/
-chromadb/
 .pytest_cache/
 htmlcov/
-logs/
-logs/*
-qdrant_storage/
-qdrant_storage/*
-postgres_data/
-postgres_data/*
-insighteye/
 
 # Ignore system files
 .DS_Store
@@ -36,7 +19,6 @@ Thumbs.db
 *.swo
 
 # Ignore dependency directories
-node_modules/
 vendor/
 venv/
 */__pycache__/
@@ -85,7 +67,3 @@ coverage/
 
 *.pt
 ###############
-
-test.py
-test0.py
-test1.py
