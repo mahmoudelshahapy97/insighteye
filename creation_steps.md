@@ -8,6 +8,7 @@ Perfect — I will give you a **clean, official deployment guide** for your repo
 🔹 Requirements: Fresh EC2 Ubuntu instance + Public IP
 🔹 Stack: Docker + Docker Compose + Nginx SSL reverse proxy
 🔹 App repo: [https://github.com/mahmoudelshahapy97/insighteye.git](https://github.com/mahmoudelshahapy97/insighteye.git)
+🔹 App repo: [https://github.com/mahmoudelshahapy97/insighteye.git](https://github.com/mahmoudelshahapy97/insighteye.git)
 
 ---
 
@@ -51,38 +52,15 @@ cd /home/ubuntu
 sudo apt-get install git-lfs -y
 git lfs install
 
-git clone https://github.com/mahmoudelshahapy97/insighteye.git
-cd insighteye/backend
+git clone https://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@github.com/mahmoudelshahapy97/insighteye.git
+cd insighteye
 git lfs pull
 ```
 
 ---
 
-# ✅ STEP-4 — Create Storage Folders
-
-```bash
-mkdir -p postgres_data qdrant_storage
-sudo chown 999:999 postgres_data
-sudo chown 1000:1000 qdrant_storage
-```
-
 ---
 
-# ✅ STEP-5 — Create `.env` file inside backend
-
-```bash
-cd backend
-nano .env
-```
-
-Paste the actual environment variables you use:
-
-```
-APP_PORT=8000
-POSTGRES_DB=insighteye_db
-POSTGRES_USER=insighteye_user
-POSTGRES_PASSWORD=your_password
-QDRANT_URL=http://qdrant:6333
 ```
 
 Save → CTRL+O → ENTER → CTRL+X
