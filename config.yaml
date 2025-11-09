@@ -41,9 +41,9 @@ ALGORITHM: HS256 #seconds
 session_timeout: 600 #seconds
 # secrets.token_urlsafe(32)
 SECRET_KEY: e20d4027c260b6452f7607db8e7e4d02994d65a67d245665ba597e1d374cc2b4
-people_model_path: "people.pt"
-gender_model_path: "gender.pt"
-fire_model_path: "fire.pt"
+people_model_path: "./models/people.pt"
+gender_model_path: "./models/gender.pt"
+fire_model_path: "./models/fire.pt"
 max_workers: 4
 
 sender_email: "Insighteye@gateworx.net"

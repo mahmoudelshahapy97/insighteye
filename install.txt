@@ -1,3 +1,11 @@
+sudo apt-get install git-lfs -y
+git lfs install
+
+git lfs track "models/*"
+git add .gitattributes
+
+#############################
+
 sudo apt update && sudo apt upgrade -y
 sudo apt install nginx -y
 sudo apt install supervisor -y
