@@ -9,7 +9,6 @@ htmlcov/
 Thumbs.db
 
 # Ignore log files and temp files
-*.log
 *.tmp
 *.swp
 *.swo
