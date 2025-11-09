@@ -9,7 +9,6 @@ services:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - .:/app
-      - ./app.log:/app/app.log 
     networks:
       - insighteye_network
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
