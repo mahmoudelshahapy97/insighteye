@@ -2,7 +2,7 @@ server {
     listen 80 default_server;
     listen [::]:80 default_server;
     
-    server_name 16.170.216.227;
+    server_name _;
     
     # Redirect all HTTP requests to HTTPS
     location / {
@@ -16,7 +16,7 @@ server {
     
     root /var/www/html;
     index index.html index.htm index.nginx-debian.html;
-    server_name 16.170.216.227;
+    server_name _;
     
     # Self-signed certificate for IP address
     ssl_certificate /etc/ssl/certs/nginx-ip-cert.crt;

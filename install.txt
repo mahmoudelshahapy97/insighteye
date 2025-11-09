@@ -1,5 +1,11 @@
 sudo apt-get install git-lfs -y
 git lfs install
+git clone https://github.com/mahmoudelshahapy97/insighteye.git
+cd insighteye
+git lfs pull
+###or 
+git clone https://github.com/mahmoudelshahapy97/insighteye.git --recursive
+
 
 git lfs track "models/*"
 git add .gitattributes
