@@ -2,7 +2,6 @@
 *.png
 *.jpg
 *.jpeg
-*.env
 
 models/
 .pytest_cache/
@@ -43,7 +42,6 @@ target/
 *.sublime-workspace
 
 # Ignore environment and config files
-.env
 *.bak
 #config.yaml
 secrets.json
