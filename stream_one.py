@@ -143,7 +143,7 @@ class StreamValidator:
         
         # Quick connectivity check for RTSP streams
         if source.startswith('rtsp://'):
-            if not StreamValidator.check_rtsp_connectivity(source, timeout=15):
+            if not StreamValidator.check_rtsp_connectivity(source, timeout=150):
                 logging.error(f"Network connectivity check failed for: {source}")
                 return False
         
@@ -1434,7 +1434,7 @@ class StreamManager:
 
     async def _validate_stream_source(self, source: str) -> bool:
         """Validate stream source before processing - uses StreamValidator"""
-        return await self.validator.validate_with_retry(source, max_retries=2, timeout=20)
+        return await self.validator.validate_with_retry(source, max_retries=2, timeout=200)
         
     async def start_stream_background_with_sharing(self, stream_id: UUID, owner_id: UUID, owner_username: str, 
                                     camera_name: str, source: str, workspace_id: UUID, 
@@ -3747,7 +3747,7 @@ async def debug_validate_stream(
         # Check connectivity first (for RTSP)
         connectivity_ok = False
         if source.startswith('rtsp://'):
-            connectivity_ok = StreamValidator.check_rtsp_connectivity(source, timeout=15)
+            connectivity_ok = StreamValidator.check_rtsp_connectivity(source, timeout=150)
             if not connectivity_ok:
                 return {
                     "status": "failed",
