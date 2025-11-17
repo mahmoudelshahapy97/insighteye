@@ -1632,7 +1632,7 @@ class StreamManager:
             # CRITICAL FIX: Fire detection with proper state management
             if frame_count % 10 == 0:  # Run fire detection every 10th frame
                 try:
-                    fire_results = self.fire_model(source=input_frame, conf=0.8, verbose=False)
+                    fire_results = self.fire_model(source=input_frame, conf=0.85, verbose=False)
                     
                     # Determine current fire status
                     current_fire_status = "no detection"
