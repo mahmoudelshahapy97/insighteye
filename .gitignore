@@ -1,5 +1,16 @@
 *.pdf
 
+# Logs
+logs/
+*.log
+
+# Local runtime / generated folders
+insighteye/
+
+# Python
+__pycache__/
+*.pyc
+
 
 .pytest_cache/
 htmlcov/
