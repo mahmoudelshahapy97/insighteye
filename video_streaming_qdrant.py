@@ -1201,6 +1201,724 @@ def build_filter_from_query_with_location(
         return None
     return qdrant_models.Filter(must=must_conditions)
 
+# @router.get("/workspace/search_results_with_location")
+# async def workspace_search_results_with_location(
+#     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
+#     camera_id_param: Optional[str] = Query(None, alias="camera_id"),
+#     # Date/time filters
+#     start_date: Optional[str] = Query(None), 
+#     end_date: Optional[str] = Query(None),
+#     start_time: Optional[str] = Query(None), 
+#     end_time: Optional[str] = Query(None),
+#     # Location filters
+#     location: Optional[str] = Query(None, description="Filter by location"),
+#     area: Optional[str] = Query(None, description="Filter by area"),
+#     building: Optional[str] = Query(None, description="Filter by building"),
+#     floor_level: Optional[str] = Query(None, description="Filter by floor_level"),
+#     zone: Optional[str] = Query(None, description="Filter by zone"),
+#     # Pagination
+#     page: int = Query(1, ge=1), 
+#     per_page: Optional[str] = Query(None),  # Changed to Optional[str] like v2
+#     base64: bool = Query(True),  # New parameter with default True
+#     current_user_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency) 
+# ):
+#     """Enhanced search with location-based filtering."""
+#     client = get_qdrant_client()
+#     final_workspace_id_obj: Optional[UUID] = None
+    
+#     try:
+#         requesting_user_id_obj = current_user_data["user_id"]
+#         username = current_user_data["username"]
+#         user_db_info = await user_manager_global_qdrant.get_user_by_id(requesting_user_id_obj)
+#         if not user_db_info: 
+#             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+#         system_role = user_db_info.get("role")
+#         is_system_admin = (system_role == "admin")
+
+#         # Determine workspace
+#         if workspace_id_query:
+#             try: 
+#                 final_workspace_id_obj = UUID(workspace_id_query)
+#             except ValueError: 
+#                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
+#         else:
+#             _, active_ws_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+#             if not active_ws_id_obj:
+#                  raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+#             final_workspace_id_obj = active_ws_id_obj
+
+#         # Check permissions
+#         workspace_specific_role = None
+#         if not is_system_admin:
+#             try:
+#                 member_info = await check_workspace_membership_and_get_role_async(requesting_user_id_obj, final_workspace_id_obj, db_manager_global_qdrant)
+#                 workspace_specific_role = member_info.get("role")
+#             except HTTPException as e_ws_access:
+#                 raise e_ws_access
+#         else:
+#             try:
+#                 ws_member_info = await db_manager_global_qdrant.execute_query(
+#                     "SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2",
+#                     (requesting_user_id_obj, final_workspace_id_obj), fetch_one=True
+#                 )
+#                 if ws_member_info: 
+#                     workspace_specific_role = ws_member_info['role']
+#             except Exception: 
+#                 pass
+
+#         # Handle per_page parameter - convert string to int or None (same logic as v2)
+#         processed_per_page: Optional[int] = None
+#         if per_page is not None and per_page.lower() not in ["none", "null", ""]:
+#             try:
+#                 processed_per_page = int(per_page)
+#                 if processed_per_page < 1 or processed_per_page > 100:
+#                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="per_page must be between 1 and 100")
+#             except ValueError:
+#                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="per_page must be a valid integer or 'none'")
+#         elif per_page is None:
+#             # Default to 10 if no per_page parameter is provided
+#             processed_per_page = 10
+
+#         # Check search permissions
+#         can_search_feature = user_db_info.get("is_search", False) or \
+#                              is_system_admin or \
+#                              (workspace_specific_role in ["admin", "owner"])
+#         if not can_search_feature:
+#             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Search feature unavailable.")
+
+#         target_collection_name = get_workspace_qdrant_collection_name(final_workspace_id_obj)
+#         await ensure_workspace_qdrant_collection_exists(client, final_workspace_id_obj)
+        
+#         # Build enhanced search query with location
+#         search_query_model = LocationSearchQuery(
+#             camera_id=parse_camera_ids(camera_id_param) if camera_id_param else None,
+#             start_date=start_date, end_date=end_date,
+#             start_time=start_time, end_time=end_time,
+#             location=location, area=area, building=building, floor_level=floor_level, zone=zone
+#         )
+        
+#         filter_obj = build_filter_from_query_with_location(
+#             search_query_model, system_role, workspace_specific_role, username
+#         )
+
+#         # Get count
+#         count_result = client.count(collection_name=target_collection_name, count_filter=filter_obj)
+#         total_count = count_result.count
+
+#         paginated_data: List[Dict[str, Any]] = []
+#         num_of_pages = 0
+#         points_for_current_page = []  # Initialize outside the conditional
+        
+#         if total_count > 0:
+#             if processed_per_page is None:
+#                 # Return all results without pagination - handle Qdrant limitations (same as v2)
+#                 num_of_pages = 1
+                
+#                 # Qdrant scroll has limitations, so we need to batch the requests
+#                 batch_size = 1000  # Qdrant's typical safe limit
+#                 offset = 0
+                
+#                 while offset < total_count:
+#                     current_limit = min(batch_size, total_count - offset)
+#                     batch_points, _ = client.scroll(
+#                         collection_name=target_collection_name, 
+#                         scroll_filter=filter_obj,
+#                         limit=current_limit, 
+#                         offset=offset, 
+#                         with_payload=True, 
+#                         with_vectors=False
+#                     )
+#                     points_for_current_page.extend(batch_points)
+#                     offset += current_limit
+                    
+#                     # Break if we got fewer results than expected (end of data)
+#                     if len(batch_points) < current_limit:
+#                         break
+#             else:
+#                 # Use pagination
+#                 num_of_pages = (total_count + processed_per_page - 1) // processed_per_page
+#                 if page <= num_of_pages:
+#                     offset = (page - 1) * processed_per_page
+#                     points_for_current_page, _ = client.scroll(
+#                         collection_name=target_collection_name, 
+#                         scroll_filter=filter_obj,
+#                         limit=processed_per_page, 
+#                         offset=offset, 
+#                         with_payload=True, 
+#                         with_vectors=False
+#                     )
+#                 else:
+#                     points_for_current_page = []
+            
+#             # start_idx = (page - 1) * processed_per_page
+#             # end_idx = start_idx + processed_per_page
+#             # points_for_current_page = points_for_current_page[start_idx:end_idx]
+
+#             # Process the points data (moved outside the pagination conditional)
+#             for point_item in points_for_current_page:
+#                 if point_item.payload: 
+#                     # Conditionally include frame based on base64 parameter
+#                     frame_data = point_item.payload.get("frame_base64") if base64 else None
+                    
+#                     paginated_data.append({
+#                         "id": str(point_item.id), 
+#                         "frame": frame_data,  # Will be None when base64=False
+#                         "metadata": {
+#                             "camera_id": point_item.payload.get("camera_id"),
+#                             "name": point_item.payload.get("name", "Unknown Camera"),
+#                             "timestamp": point_item.payload.get("timestamp"),
+#                             "date": point_item.payload.get("date"), 
+#                             "time": point_item.payload.get("time"),
+#                             "person_count": point_item.payload.get("person_count", 0),
+#                             "male_count": point_item.payload.get("male_count", 0),
+#                             "female_count": point_item.payload.get("female_count", 0),
+#                             "fire_status": point_item.payload.get("fire_status", "no detection"),
+#                             "owner_username": point_item.payload.get("username"),
+#                             # Location metadata
+#                             "location": point_item.payload.get("location"),
+#                             "area": point_item.payload.get("area"),
+#                             "building": point_item.payload.get("building"),
+#                             "floor_level": point_item.payload.get("floor_level"),
+#                             "zone": point_item.payload.get("zone")
+#                         }
+#                     })
+        
+#         return JSONResponse(content={
+#             "data": paginated_data, 
+#             "current_page": page if processed_per_page is not None else 1, 
+#             "num_of_pages": num_of_pages,
+#             "total_count": total_count, 
+#             "per_page": processed_per_page,
+#             "search_scope": {
+#                 "workspace_id": str(final_workspace_id_obj), 
+#                 "collection_queried": target_collection_name, 
+#                 "filters_applied": search_query_model.model_dump(exclude_none=True),
+#                 "access_level": "system_admin" if is_system_admin else (workspace_specific_role or "member_or_undefined"),
+#                 "base64_frames_included": base64,  # Added to show what was requested
+#                 "pagination_disabled": processed_per_page is None  # Added to show if pagination was disabled
+#             }
+#         })
+        
+#     except HTTPException as e:
+#         raise e
+#     except Exception as e_search:
+#         final_ws_id_log = str(final_workspace_id_obj) if final_workspace_id_obj else 'unknown_workspace'
+#         logger.error(f"Location-based search error in {final_ws_id_log}: {e_search}", exc_info=True)
+#         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error during location-based search.")
+
+# @router.get("/workspace/search_results_with_location")
+# async def workspace_search_results_with_location(
+#     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
+#     camera_id_param: Optional[str] = Query(None, alias="camera_id"),
+#     # Date/time filters
+#     start_date: Optional[str] = Query(None), 
+#     end_date: Optional[str] = Query(None),
+#     start_time: Optional[str] = Query(None), 
+#     end_time: Optional[str] = Query(None),
+#     # Location filters
+#     location: Optional[str] = Query(None, description="Filter by location"),
+#     area: Optional[str] = Query(None, description="Filter by area"),
+#     building: Optional[str] = Query(None, description="Filter by building"),
+#     floor_level: Optional[str] = Query(None, description="Filter by floor_level"),
+#     zone: Optional[str] = Query(None, description="Filter by zone"),
+#     # Pagination
+#     page: int = Query(1, ge=1), 
+#     per_page: Optional[str] = Query(None),
+#     base64: bool = Query(True),
+#     current_user_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency) 
+# ):
+#     """Enhanced search with location-based filtering and optimized pagination using search API."""
+#     client = get_qdrant_client()
+#     final_workspace_id_obj: Optional[UUID] = None
+    
+#     try:
+#         requesting_user_id_obj = current_user_data["user_id"]
+#         username = current_user_data["username"]
+#         user_db_info = await user_manager_global_qdrant.get_user_by_id(requesting_user_id_obj)
+#         if not user_db_info: 
+#             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+#         system_role = user_db_info.get("role")
+#         is_system_admin = (system_role == "admin")
+
+#         # Determine workspace
+#         if workspace_id_query:
+#             try: 
+#                 final_workspace_id_obj = UUID(workspace_id_query)
+#             except ValueError: 
+#                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
+#         else:
+#             _, active_ws_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+#             if not active_ws_id_obj:
+#                  raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+#             final_workspace_id_obj = active_ws_id_obj
+
+#         # Check permissions
+#         workspace_specific_role = None
+#         if not is_system_admin:
+#             try:
+#                 member_info = await check_workspace_membership_and_get_role_async(requesting_user_id_obj, final_workspace_id_obj, db_manager_global_qdrant)
+#                 workspace_specific_role = member_info.get("role")
+#             except HTTPException as e_ws_access:
+#                 raise e_ws_access
+#         else:
+#             try:
+#                 ws_member_info = await db_manager_global_qdrant.execute_query(
+#                     "SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2",
+#                     (requesting_user_id_obj, final_workspace_id_obj), fetch_one=True
+#                 )
+#                 if ws_member_info: 
+#                     workspace_specific_role = ws_member_info['role']
+#             except Exception: 
+#                 pass
+
+#         # Handle per_page parameter
+#         processed_per_page: Optional[int] = None
+#         if per_page is not None and per_page.lower() not in ["none", "null", ""]:
+#             try:
+#                 processed_per_page = int(per_page)
+#                 if processed_per_page < 1 or processed_per_page > 100:
+#                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="per_page must be between 1 and 100")
+#             except ValueError:
+#                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="per_page must be a valid integer or 'none'")
+#         elif per_page is None:
+#             processed_per_page = 10
+
+#         # Check search permissions
+#         can_search_feature = user_db_info.get("is_search", False) or \
+#                              is_system_admin or \
+#                              (workspace_specific_role in ["admin", "owner"])
+#         if not can_search_feature:
+#             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Search feature unavailable.")
+
+#         target_collection_name = get_workspace_qdrant_collection_name(final_workspace_id_obj)
+#         await ensure_workspace_qdrant_collection_exists(client, final_workspace_id_obj)
+        
+#         # Build enhanced search query with location
+#         search_query_model = LocationSearchQuery(
+#             camera_id=parse_camera_ids(camera_id_param) if camera_id_param else None,
+#             start_date=start_date, end_date=end_date,
+#             start_time=start_time, end_time=end_time,
+#             location=location, area=area, building=building, floor_level=floor_level, zone=zone
+#         )
+        
+#         filter_obj = build_filter_from_query_with_location(
+#             search_query_model, system_role, workspace_specific_role, username
+#         )
+
+#         # Get count
+#         count_result = client.count(collection_name=target_collection_name, count_filter=filter_obj)
+#         total_count = count_result.count
+
+#         paginated_data: List[Dict[str, Any]] = []
+#         num_of_pages = 0
+#         points_for_current_page = []
+        
+#         if total_count > 0:
+#             if processed_per_page is None:
+#                 # Return all results without pagination
+#                 num_of_pages = 1
+#                 batch_size = 1000
+#                 all_points = []
+#                 next_offset = None
+                
+#                 while len(all_points) < total_count:
+#                     batch_points, next_offset = client.scroll(
+#                         collection_name=target_collection_name, 
+#                         scroll_filter=filter_obj,
+#                         limit=batch_size,
+#                         offset=next_offset,
+#                         with_payload=True, 
+#                         with_vectors=False
+#                     )
+                    
+#                     if not batch_points:
+#                         break
+                    
+#                     all_points.extend(batch_points)
+                    
+#                     if next_offset is None:
+#                         break
+                
+#                 points_for_current_page = all_points
+#             else:
+#                 # OPTIMIZED: Use query_points with offset and limit for true pagination
+#                 num_of_pages = (total_count + processed_per_page - 1) // processed_per_page
+                
+#                 if page <= num_of_pages:
+#                     offset_value = (page - 1) * processed_per_page
+                    
+#                     # Use query_points instead of scroll for proper offset support
+#                     # We create a dummy vector for the query (all zeros) since we only care about filtering
+#                     try:
+#                         # Get collection info to know vector size
+#                         collection_info = client.get_collection(collection_name=target_collection_name)
+#                         vector_size = collection_info.config.params.vectors.size
+                        
+#                         # Query with zero vector and filter
+#                         search_result = client.query_points(
+#                             collection_name=target_collection_name,
+#                             query=[0.0] * vector_size,  # Dummy vector
+#                             query_filter=filter_obj,
+#                             limit=processed_per_page,
+#                             offset=offset_value,
+#                             with_payload=True,
+#                             with_vectors=False,
+#                             score_threshold=None  # Don't filter by score
+#                         )
+                        
+#                         points_for_current_page = search_result.points
+#                     except Exception as query_error:
+#                         logger.warning(f"query_points failed, falling back to scroll: {query_error}")
+#                         # Fallback to scroll method if query_points fails
+#                         records_needed = offset_value + processed_per_page
+#                         all_points = []
+#                         next_offset = None
+                        
+#                         while len(all_points) < records_needed:
+#                             batch_size = min(1000, records_needed - len(all_points))
+#                             batch_points, next_offset = client.scroll(
+#                                 collection_name=target_collection_name,
+#                                 scroll_filter=filter_obj,
+#                                 limit=batch_size,
+#                                 offset=next_offset,
+#                                 with_payload=True,
+#                                 with_vectors=False
+#                             )
+                            
+#                             if not batch_points:
+#                                 break
+                            
+#                             all_points.extend(batch_points)
+                            
+#                             if next_offset is None or len(all_points) >= records_needed:
+#                                 break
+                        
+#                         points_for_current_page = all_points[offset_value:offset_value + processed_per_page]
+#                 else:
+#                     points_for_current_page = []
+
+#             # Process the points data
+#             for point_item in points_for_current_page:
+#                 if point_item.payload: 
+#                     frame_data = point_item.payload.get("frame_base64") if base64 else None
+                    
+#                     paginated_data.append({
+#                         "id": str(point_item.id), 
+#                         "frame": frame_data,
+#                         "metadata": {
+#                             "camera_id": point_item.payload.get("camera_id"),
+#                             "name": point_item.payload.get("name", "Unknown Camera"),
+#                             "timestamp": point_item.payload.get("timestamp"),
+#                             "date": point_item.payload.get("date"), 
+#                             "time": point_item.payload.get("time"),
+#                             "person_count": point_item.payload.get("person_count", 0),
+#                             "male_count": point_item.payload.get("male_count", 0),
+#                             "female_count": point_item.payload.get("female_count", 0),
+#                             "fire_status": point_item.payload.get("fire_status", "no detection"),
+#                             "owner_username": point_item.payload.get("username"),
+#                             "location": point_item.payload.get("location"),
+#                             "area": point_item.payload.get("area"),
+#                             "building": point_item.payload.get("building"),
+#                             "floor_level": point_item.payload.get("floor_level"),
+#                             "zone": point_item.payload.get("zone")
+#                         }
+#                     })
+        
+#         return JSONResponse(content={
+#             "data": paginated_data, 
+#             "current_page": page if processed_per_page is not None else 1, 
+#             "num_of_pages": num_of_pages,
+#             "total_count": total_count, 
+#             "per_page": processed_per_page,
+#             "search_scope": {
+#                 "workspace_id": str(final_workspace_id_obj), 
+#                 "collection_queried": target_collection_name, 
+#                 "filters_applied": search_query_model.model_dump(exclude_none=True),
+#                 "access_level": "system_admin" if is_system_admin else (workspace_specific_role or "member_or_undefined"),
+#                 "base64_frames_included": base64,
+#                 "pagination_disabled": processed_per_page is None
+#             }
+#         })
+        
+#     except HTTPException as e:
+#         raise e
+#     except Exception as e_search:
+#         final_ws_id_log = str(final_workspace_id_obj) if final_workspace_id_obj else 'unknown_workspace'
+#         logger.error(f"Location-based search error in {final_ws_id_log}: {e_search}", exc_info=True)
+#         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error during location-based search.")
+
+# @router.get("/workspace/search_results_with_location")
+# async def workspace_search_results_with_location(
+#     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
+#     camera_id_param: Optional[str] = Query(None, alias="camera_id"),
+#     # Date/time filters
+#     start_date: Optional[str] = Query(None), 
+#     end_date: Optional[str] = Query(None),
+#     start_time: Optional[str] = Query(None), 
+#     end_time: Optional[str] = Query(None),
+#     # Location filters
+#     location: Optional[str] = Query(None, description="Filter by location"),
+#     area: Optional[str] = Query(None, description="Filter by area"),
+#     building: Optional[str] = Query(None, description="Filter by building"),
+#     floor_level: Optional[str] = Query(None, description="Filter by floor_level"),
+#     zone: Optional[str] = Query(None, description="Filter by zone"),
+#     # Sorting
+#     sort_by: Optional[str] = Query("timestamp", description="Field to sort by: timestamp, date, time"),
+#     sort_order: Optional[str] = Query("desc", description="Sort order: asc or desc"),
+#     # Pagination
+#     page: int = Query(1, ge=1), 
+#     per_page: Optional[str] = Query(None),
+#     base64: bool = Query(True),
+#     current_user_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency) 
+# ):
+#     """Enhanced search with location-based filtering, sorting, and optimized pagination using search API."""
+#     from qdrant_client.models import OrderBy, Direction
+    
+#     client = get_qdrant_client()
+#     final_workspace_id_obj: Optional[UUID] = None
+    
+#     try:
+#         requesting_user_id_obj = current_user_data["user_id"]
+#         username = current_user_data["username"]
+#         user_db_info = await user_manager_global_qdrant.get_user_by_id(requesting_user_id_obj)
+#         if not user_db_info: 
+#             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+#         system_role = user_db_info.get("role")
+#         is_system_admin = (system_role == "admin")
+
+#         # Determine workspace
+#         if workspace_id_query:
+#             try: 
+#                 final_workspace_id_obj = UUID(workspace_id_query)
+#             except ValueError: 
+#                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
+#         else:
+#             _, active_ws_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
+#             if not active_ws_id_obj:
+#                  raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
+#             final_workspace_id_obj = active_ws_id_obj
+
+#         # Check permissions
+#         workspace_specific_role = None
+#         if not is_system_admin:
+#             try:
+#                 member_info = await check_workspace_membership_and_get_role_async(requesting_user_id_obj, final_workspace_id_obj, db_manager_global_qdrant)
+#                 workspace_specific_role = member_info.get("role")
+#             except HTTPException as e_ws_access:
+#                 raise e_ws_access
+#         else:
+#             try:
+#                 ws_member_info = await db_manager_global_qdrant.execute_query(
+#                     "SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2",
+#                     (requesting_user_id_obj, final_workspace_id_obj), fetch_one=True
+#                 )
+#                 if ws_member_info: 
+#                     workspace_specific_role = ws_member_info['role']
+#             except Exception: 
+#                 pass
+
+#         # Validate sort parameters
+#         valid_sort_fields = ["timestamp", "date", "time"]
+#         if sort_by not in valid_sort_fields:
+#             raise HTTPException(
+#                 status_code=status.HTTP_400_BAD_REQUEST, 
+#                 detail=f"Invalid sort_by field. Must be one of: {', '.join(valid_sort_fields)}"
+#             )
+        
+#         if sort_order.lower() not in ["asc", "desc"]:
+#             raise HTTPException(
+#                 status_code=status.HTTP_400_BAD_REQUEST, 
+#                 detail="sort_order must be 'asc' or 'desc'"
+#             )
+        
+#         # Create OrderBy object for Qdrant
+#         order_direction = Direction.ASC if sort_order.lower() == "asc" else Direction.DESC
+#         order_by = OrderBy(key=sort_by, direction=order_direction)
+
+#         # Handle per_page parameter
+#         processed_per_page: Optional[int] = None
+#         if per_page is not None and per_page.lower() not in ["none", "null", ""]:
+#             try:
+#                 processed_per_page = int(per_page)
+#                 if processed_per_page < 1 or processed_per_page > 100:
+#                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="per_page must be between 1 and 100")
+#             except ValueError:
+#                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="per_page must be a valid integer or 'none'")
+#         elif per_page is None:
+#             processed_per_page = 10
+
+#         # Check search permissions
+#         can_search_feature = user_db_info.get("is_search", False) or \
+#                              is_system_admin or \
+#                              (workspace_specific_role in ["admin", "owner"])
+#         if not can_search_feature:
+#             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Search feature unavailable.")
+
+#         target_collection_name = get_workspace_qdrant_collection_name(final_workspace_id_obj)
+#         await ensure_workspace_qdrant_collection_exists(client, final_workspace_id_obj)
+        
+#         # Build enhanced search query with location
+#         search_query_model = LocationSearchQuery(
+#             camera_id=parse_camera_ids(camera_id_param) if camera_id_param else None,
+#             start_date=start_date, end_date=end_date,
+#             start_time=start_time, end_time=end_time,
+#             location=location, area=area, building=building, floor_level=floor_level, zone=zone
+#         )
+        
+#         filter_obj = build_filter_from_query_with_location(
+#             search_query_model, system_role, workspace_specific_role, username
+#         )
+
+#         # Get count
+#         count_result = client.count(collection_name=target_collection_name, count_filter=filter_obj)
+#         total_count = count_result.count
+
+#         paginated_data: List[Dict[str, Any]] = []
+#         num_of_pages = 0
+#         points_for_current_page = []
+        
+#         if total_count > 0:
+#             if processed_per_page is None:
+#                 # Return all results without pagination but with sorting
+#                 num_of_pages = 1
+#                 batch_size = 1000
+#                 all_points = []
+#                 next_offset = None
+                
+#                 while len(all_points) < total_count:
+#                     batch_points, next_offset = client.scroll(
+#                         collection_name=target_collection_name, 
+#                         scroll_filter=filter_obj,
+#                         limit=batch_size,
+#                         offset=next_offset,
+#                         order_by=order_by,
+#                         with_payload=True, 
+#                         with_vectors=False
+#                     )
+                    
+#                     if not batch_points:
+#                         break
+                    
+#                     all_points.extend(batch_points)
+                    
+#                     if next_offset is None:
+#                         break
+                
+#                 points_for_current_page = all_points
+#             else:
+#                 # OPTIMIZED: Use query_points with offset, limit, and sorting for true pagination
+#                 num_of_pages = (total_count + processed_per_page - 1) // processed_per_page
+                
+#                 if page <= num_of_pages:
+#                     offset_value = (page - 1) * processed_per_page
+                    
+#                     # Use query_points instead of scroll for proper offset support
+#                     # We create a dummy vector for the query (all zeros) since we only care about filtering
+#                     try:
+#                         # Get collection info to know vector size
+#                         collection_info = client.get_collection(collection_name=target_collection_name)
+#                         vector_size = collection_info.config.params.vectors.size
+                        
+#                         # Query with zero vector and filter
+#                         search_result = client.query_points(
+#                             collection_name=target_collection_name,
+#                             query=[0.0] * vector_size,  # Dummy vector
+#                             query_filter=filter_obj,
+#                             limit=processed_per_page,
+#                             offset=offset_value,
+#                             with_payload=True,
+#                             with_vectors=False,
+#                             score_threshold=None,  # Don't filter by score
+#                             order_by=order_by  # Add sorting here
+#                         )
+                        
+#                         points_for_current_page = search_result.points
+#                     except Exception as query_error:
+#                         logger.warning(f"query_points failed, falling back to scroll: {query_error}")
+#                         # Fallback to scroll method if query_points fails
+#                         records_needed = offset_value + processed_per_page
+#                         all_points = []
+#                         next_offset = None
+                        
+#                         while len(all_points) < records_needed:
+#                             batch_size = min(1000, records_needed - len(all_points))
+#                             batch_points, next_offset = client.scroll(
+#                                 collection_name=target_collection_name,
+#                                 scroll_filter=filter_obj,
+#                                 limit=batch_size,
+#                                 offset=next_offset,
+#                                 order_by=order_by,  # Add sorting here too
+#                                 with_payload=True,
+#                                 with_vectors=False
+#                             )
+                            
+#                             if not batch_points:
+#                                 break
+                            
+#                             all_points.extend(batch_points)
+                            
+#                             if next_offset is None or len(all_points) >= records_needed:
+#                                 break
+                        
+#                         points_for_current_page = all_points[offset_value:offset_value + processed_per_page]
+#                 else:
+#                     points_for_current_page = []
+
+#             # Process the points data
+#             for point_item in points_for_current_page:
+#                 if point_item.payload: 
+#                     frame_data = point_item.payload.get("frame_base64") if base64 else None
+                    
+#                     paginated_data.append({
+#                         "id": str(point_item.id), 
+#                         "frame": frame_data,
+#                         "metadata": {
+#                             "camera_id": point_item.payload.get("camera_id"),
+#                             "name": point_item.payload.get("name", "Unknown Camera"),
+#                             "timestamp": point_item.payload.get("timestamp"),
+#                             "date": point_item.payload.get("date"), 
+#                             "time": point_item.payload.get("time"),
+#                             "person_count": point_item.payload.get("person_count", 0),
+#                             "male_count": point_item.payload.get("male_count", 0),
+#                             "female_count": point_item.payload.get("female_count", 0),
+#                             "fire_status": point_item.payload.get("fire_status", "no detection"),
+#                             "owner_username": point_item.payload.get("username"),
+#                             "location": point_item.payload.get("location"),
+#                             "area": point_item.payload.get("area"),
+#                             "building": point_item.payload.get("building"),
+#                             "floor_level": point_item.payload.get("floor_level"),
+#                             "zone": point_item.payload.get("zone")
+#                         }
+#                     })
+        
+#         return JSONResponse(content={
+#             "data": paginated_data, 
+#             "current_page": page if processed_per_page is not None else 1, 
+#             "num_of_pages": num_of_pages,
+#             "total_count": total_count, 
+#             "per_page": processed_per_page,
+#             "search_scope": {
+#                 "workspace_id": str(final_workspace_id_obj), 
+#                 "collection_queried": target_collection_name, 
+#                 "filters_applied": search_query_model.model_dump(exclude_none=True),
+#                 "access_level": "system_admin" if is_system_admin else (workspace_specific_role or "member_or_undefined"),
+#                 "base64_frames_included": base64,
+#                 "pagination_disabled": processed_per_page is None,
+#                 "sort_by": sort_by,
+#                 "sort_order": sort_order
+#             }
+#         })
+        
+#     except HTTPException as e:
+#         raise e
+#     except Exception as e_search:
+#         final_ws_id_log = str(final_workspace_id_obj) if final_workspace_id_obj else 'unknown_workspace'
+#         logger.error(f"Location-based search error in {final_ws_id_log}: {e_search}", exc_info=True)
+#         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error during location-based search.")
+
 @router.get("/workspace/search_results_with_location")
 async def workspace_search_results_with_location(
     workspace_id_query: Optional[str] = Query(None, alias="workspaceId"),
