@@ -30,6 +30,7 @@ import re
 import os
 from starlette.websockets import WebSocketState
 from workspaces import check_workspace_membership_and_get_role
+import subprocess
 
 session_manager_global = SessionManager()
 user_manager_global = UserManager()
@@ -162,6 +163,7 @@ class StreamValidator:
         
         logging.error(f"All validation attempts failed for: {source}")
         return False
+
 
 class StreamManager:
 
@@ -1434,7 +1436,7 @@ class StreamManager:
 
     async def _validate_stream_source(self, source: str) -> bool:
         """Validate stream source before processing - uses StreamValidator"""
-        return await self.validator.validate_with_retry(source, max_retries=2, timeout=200)
+        return await self.validator.validate_with_retry(source, timeout=200)
         
     async def start_stream_background_with_sharing(self, stream_id: UUID, owner_id: UUID, owner_username: str, 
                                     camera_name: str, source: str, workspace_id: UUID, 

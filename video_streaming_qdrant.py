@@ -1216,13 +1216,18 @@ async def workspace_search_results_with_location(
     building: Optional[str] = Query(None, description="Filter by building"),
     floor_level: Optional[str] = Query(None, description="Filter by floor_level"),
     zone: Optional[str] = Query(None, description="Filter by zone"),
+    # Sorting
+    sort_by: Optional[str] = Query("timestamp", description="Field to sort by: timestamp, date, time"),
+    sort_order: Optional[str] = Query("desc", description="Sort order: asc or desc"),
     # Pagination
     page: int = Query(1, ge=1), 
-    per_page: Optional[str] = Query(None),  # Changed to Optional[str] like v2
-    base64: bool = Query(True),  # New parameter with default True
+    per_page: Optional[str] = Query(None),
+    base64: bool = Query(True),
     current_user_data: Dict = Depends(session_manager_global_qdrant.get_current_user_full_data_dependency) 
 ):
-    """Enhanced search with location-based filtering."""
+    """Enhanced search with location-based filtering, sorting, and optimized pagination using search API."""
+    from qdrant_client.models import OrderBy, Direction
+    
     client = get_qdrant_client()
     final_workspace_id_obj: Optional[UUID] = None
     
@@ -1243,7 +1248,7 @@ async def workspace_search_results_with_location(
             except ValueError: 
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workspaceId format.")
         else:
-            _, active_ws_id_obj = await get_user_and_workspace_refined(username, user_manager_global_qdrant)
+            _, active_ws_id_obj = await get_user_and_workspace_async_refined(username, user_manager_global_qdrant)
             if not active_ws_id_obj:
                  raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
             final_workspace_id_obj = active_ws_id_obj
@@ -1267,7 +1272,25 @@ async def workspace_search_results_with_location(
             except Exception: 
                 pass
 
-        # Handle per_page parameter - convert string to int or None (same logic as v2)
+        # Validate sort parameters
+        valid_sort_fields = ["timestamp", "date", "time"]
+        if sort_by not in valid_sort_fields:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail=f"Invalid sort_by field. Must be one of: {', '.join(valid_sort_fields)}"
+            )
+        
+        if sort_order.lower() not in ["asc", "desc"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="sort_order must be 'asc' or 'desc'"
+            )
+        
+        # Create OrderBy object for Qdrant
+        order_direction = Direction.ASC if sort_order.lower() == "asc" else Direction.DESC
+        order_by = OrderBy(key=sort_by, direction=order_direction)
+
+        # Handle per_page parameter
         processed_per_page: Optional[int] = None
         if per_page is not None and per_page.lower() not in ["none", "null", ""]:
             try:
@@ -1277,7 +1300,6 @@ async def workspace_search_results_with_location(
             except ValueError:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="per_page must be a valid integer or 'none'")
         elif per_page is None:
-            # Default to 10 if no per_page parameter is provided
             processed_per_page = 10
 
         # Check search permissions
@@ -1308,58 +1330,81 @@ async def workspace_search_results_with_location(
 
         paginated_data: List[Dict[str, Any]] = []
         num_of_pages = 0
-        points_for_current_page = []  # Initialize outside the conditional
+        points_for_current_page = []
         
         if total_count > 0:
             if processed_per_page is None:
-                # Return all results without pagination - handle Qdrant limitations (same as v2)
+                # Return all results without pagination but with sorting
                 num_of_pages = 1
+                batch_size = 1000
+                all_points = []
+                next_offset = None
                 
-                # Qdrant scroll has limitations, so we need to batch the requests
-                batch_size = 1000  # Qdrant's typical safe limit
-                offset = 0
-                
-                while offset < total_count:
-                    current_limit = min(batch_size, total_count - offset)
-                    batch_points, _ = client.scroll(
+                while len(all_points) < total_count:
+                    batch_points, next_offset = client.scroll(
                         collection_name=target_collection_name, 
                         scroll_filter=filter_obj,
-                        limit=current_limit, 
-                        offset=offset, 
+                        limit=batch_size,
+                        offset=next_offset,
+                        order_by=order_by,
                         with_payload=True, 
                         with_vectors=False
                     )
-                    points_for_current_page.extend(batch_points)
-                    offset += current_limit
                     
-                    # Break if we got fewer results than expected (end of data)
-                    if len(batch_points) < current_limit:
+                    if not batch_points:
                         break
+                    
+                    all_points.extend(batch_points)
+                    
+                    if next_offset is None:
+                        break
+                
+                points_for_current_page = all_points
             else:
-                # Use pagination
+                # Use scroll with sorting for pagination
                 num_of_pages = (total_count + processed_per_page - 1) // processed_per_page
+                
                 if page <= num_of_pages:
-                    offset = (page - 1) * processed_per_page
-                    points_for_current_page, _ = client.scroll(
-                        collection_name=target_collection_name, 
-                        scroll_filter=filter_obj,
-                        limit=processed_per_page, 
-                        offset=offset, 
-                        with_payload=True, 
-                        with_vectors=False
-                    )
+                    offset_value = (page - 1) * processed_per_page
+                    
+                    # Use scroll with order_by for sorted pagination
+                    # Need to scroll through all records up to our page
+                    records_needed = offset_value + processed_per_page
+                    all_points = []
+                    next_offset = None
+                    
+                    while len(all_points) < records_needed:
+                        batch_size = min(1000, records_needed - len(all_points))
+                        batch_points, next_offset = client.scroll(
+                            collection_name=target_collection_name,
+                            scroll_filter=filter_obj,
+                            limit=batch_size,
+                            offset=next_offset,
+                            order_by=order_by,
+                            with_payload=True,
+                            with_vectors=False
+                        )
+                        
+                        if not batch_points:
+                            break
+                        
+                        all_points.extend(batch_points)
+                        
+                        if next_offset is None or len(all_points) >= records_needed:
+                            break
+                    
+                    points_for_current_page = all_points[offset_value:offset_value + processed_per_page]
                 else:
                     points_for_current_page = []
-            
-            # Process the points data (moved outside the pagination conditional)
+
+            # Process the points data
             for point_item in points_for_current_page:
                 if point_item.payload: 
-                    # Conditionally include frame based on base64 parameter
                     frame_data = point_item.payload.get("frame_base64") if base64 else None
                     
                     paginated_data.append({
                         "id": str(point_item.id), 
-                        "frame": frame_data,  # Will be None when base64=False
+                        "frame": frame_data,
                         "metadata": {
                             "camera_id": point_item.payload.get("camera_id"),
                             "name": point_item.payload.get("name", "Unknown Camera"),
@@ -1371,7 +1416,6 @@ async def workspace_search_results_with_location(
                             "female_count": point_item.payload.get("female_count", 0),
                             "fire_status": point_item.payload.get("fire_status", "no detection"),
                             "owner_username": point_item.payload.get("username"),
-                            # Location metadata
                             "location": point_item.payload.get("location"),
                             "area": point_item.payload.get("area"),
                             "building": point_item.payload.get("building"),
@@ -1391,8 +1435,10 @@ async def workspace_search_results_with_location(
                 "collection_queried": target_collection_name, 
                 "filters_applied": search_query_model.model_dump(exclude_none=True),
                 "access_level": "system_admin" if is_system_admin else (workspace_specific_role or "member_or_undefined"),
-                "base64_frames_included": base64,  # Added to show what was requested
-                "pagination_disabled": processed_per_page is None  # Added to show if pagination was disabled
+                "base64_frames_included": base64,
+                "pagination_disabled": processed_per_page is None,
+                "sort_by": sort_by,
+                "sort_order": sort_order
             }
         })
         

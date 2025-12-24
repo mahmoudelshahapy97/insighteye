@@ -1,4 +1,4 @@
-# shared_stream.py - FIXED VERSION
+# shared_stream.py
 import time
 import logging
 import os
@@ -36,10 +36,6 @@ class SharedVideoStream:
         self.consecutive_failures = 0
         self.last_successful_read = time.time()
         
-        # CRITICAL: Thread-safe shutdown mechanism
-        self._shutdown_lock = threading.Lock()
-        self._cap_release_event = threading.Event()
-        
         # File validation
         self.is_file_source = self._is_file_source(source)
         self.file_exists = self._validate_file_source(source) if self.is_file_source else True
@@ -51,11 +47,11 @@ class SharedVideoStream:
         if self.is_rtsp:
             return (
                 'rtsp_transport;tcp|'      # TCP is more reliable than UDP
-                'timeout;10000000|'         # AGGRESSIVE: 10 second total timeout
-                'stimeout;2000000|'         # AGGRESSIVE: 2 second socket timeout
+                'timeout;30000000|'         # 30 second total timeout
+                'stimeout;5000000|'         # 5 second socket timeout
                 'max_delay;500000|'         # 500ms max delay
-                'reorder_queue_size;5|'     # Smaller queue for faster failure
-                'buffer_size;512000'        # Smaller 512KB buffer
+                'reorder_queue_size;10|'    # Small reorder queue
+                'buffer_size;1024000'       # 1MB buffer
             )
         return ''
 
@@ -117,63 +113,52 @@ class SharedVideoStream:
             
         self.is_running = True
         self.stop_capture.clear()
-        self._cap_release_event.clear()
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.capture_thread.start()
         logging.info(f"Started capture thread for {self.source}")
     
     def _stop_capture(self):
-        """COMPLETELY REWRITTEN: Stop capture with proper thread coordination"""
+        """FIXED: Stop the video capture thread with proper cleanup order"""
         if not self.is_running:
             return
         
-        with self._shutdown_lock:  # Prevent concurrent shutdown attempts
-            if not self.is_running:  # Double-check after acquiring lock
-                return
+        logging.info(f"Stopping capture for {self.source}")
+        
+        # CRITICAL FIX #1: Set flags BEFORE releasing cap
+        self.is_running = False
+        self.stop_capture.set()
+        
+        # CRITICAL FIX #2: Release VideoCapture FIRST to unblock read()
+        # This is the key - the thread is blocked on cap.read(), so we need to
+        # release the capture to unblock it BEFORE trying to join the thread
+        if self.cap:
+            try:
+                logging.debug(f"Releasing VideoCapture for {self.source}")
+                self.cap.release()
+                self.cap = None
+                # Give the thread a moment to detect the released capture
+                time.sleep(0.2)
+            except Exception as e:
+                logging.error(f"Error releasing VideoCapture for {self.source}: {e}")
+        
+        # CRITICAL FIX #3: Now join the thread with appropriate timeout
+        if self.capture_thread and self.capture_thread.is_alive():
+            # For RTSP streams, use longer timeout as network operations may take time
+            timeout = 10.0 if not self.is_file_source else 5.0
             
-            logging.info(f"Stopping capture for {self.source}")
+            logging.debug(f"Waiting for capture thread to stop (timeout: {timeout}s)")
+            self.capture_thread.join(timeout=timeout)
             
-            # STEP 1: Signal stop to the capture thread
-            self.is_running = False
-            self.stop_capture.set()
-            
-            # STEP 2: For RTSP streams, force-release capture to unblock read()
-            if self.is_rtsp and self.cap:
-                try:
-                    logging.debug(f"Force-releasing RTSP capture for {self.source}")
-                    self.cap.release()
-                    self.cap = None
-                    self._cap_release_event.set()
-                    # Give thread time to detect release
-                    time.sleep(0.3)
-                except Exception as e:
-                    logging.error(f"Error force-releasing RTSP capture: {e}")
-            
-            # STEP 3: Wait for thread with appropriate timeout
-            if self.capture_thread and self.capture_thread.is_alive():
-                timeout = 5.0 if self.is_rtsp else 3.0  # Shorter timeout now
-                
-                logging.debug(f"Waiting for capture thread to stop (timeout: {timeout}s)")
-                self.capture_thread.join(timeout=timeout)
-                
-                if self.capture_thread.is_alive():
-                    logging.error(
-                        f"Capture thread for {self.source} did not stop within {timeout}s timeout. "
-                        f"This is unexpected with our improvements. Thread will be abandoned."
-                    )
-                else:
-                    logging.info(f"Capture thread for {self.source} stopped cleanly")
-            
-            # STEP 4: Final cleanup for non-RTSP or if not already released
-            if self.cap:
-                try:
-                    self.cap.release()
-                    self.cap = None
-                except Exception as e:
-                    logging.error(f"Error in final cleanup: {e}")
-            
-            self.capture_thread = None
-            logging.info(f"Stop capture complete for {self.source}")
+            if self.capture_thread.is_alive():
+                # Thread still alive - this is now very rare with our fix
+                logging.error(f"Capture thread for {self.source} did not stop within {timeout}s timeout. "
+                            f"Thread may be stuck. Continuing anyway.")
+                # In Python, we can't force-kill threads, but at least we've released resources
+            else:
+                logging.info(f"Capture thread for {self.source} stopped cleanly")
+        
+        self.capture_thread = None
+        logging.info(f"Stop capture complete for {self.source}")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics for this shared stream"""
@@ -227,7 +212,7 @@ class SharedVideoStream:
             return False
 
     def _capture_loop(self):
-        """ENHANCED: Capture loop with better stop detection and timeout handling"""
+        """FIXED: Enhanced capture loop with better stop detection"""
         logging.info(f"Capture loop started for {self.source}")
         
         # For file sources, get video info
@@ -242,17 +227,17 @@ class SharedVideoStream:
                     video_fps = test_cap.get(cv2.CAP_PROP_FPS)
                     total_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
                     video_duration = total_frames / video_fps if video_fps > 0 else None
-                    logging.info(f"Video info: {total_frames} frames, {video_fps:.1f} FPS, {video_duration:.1f}s duration")
+                    logging.info(f"Video info for {self.source}: {total_frames} frames, {video_fps:.1f} FPS, {video_duration:.1f}s duration")
                 test_cap.release()
             except Exception as e:
-                logging.warning(f"Could not get video info: {e}")
+                logging.warning(f"Could not get video info for {self.source}: {e}")
         
         try:
             while not self.stop_capture.is_set() and self.is_running:
                 try:
-                    # CRITICAL: Check stop condition BEFORE blocking operations
+                    # CRITICAL FIX: Check stop condition BEFORE blocking operations
                     if self.stop_capture.is_set() or not self.is_running:
-                        logging.debug(f"Stop requested, breaking loop")
+                        logging.debug(f"Stop requested for {self.source}, breaking loop")
                         break
                     
                     # Open video source if needed
@@ -263,7 +248,7 @@ class SharedVideoStream:
                             delay = min(10.0, 2.0 * (2 ** min(self.reconnect_attempts, 3)))
                             logging.warning(f"Failed to open {self.source}, retrying in {delay:.1f}s")
                             
-                            # CRITICAL: Use interruptible sleep
+                            # CRITICAL FIX: Use interruptible sleep
                             if self.stop_capture.wait(delay):
                                 logging.debug("Stop signal received during retry delay")
                                 break
@@ -271,27 +256,26 @@ class SharedVideoStream:
                             self.reconnect_attempts += 1
                             continue
                     
-                    # CRITICAL: Check stop BEFORE blocking read
-                    if self.stop_capture.is_set() or not self.is_running:
-                        break
-                    
-                    # CRITICAL: Check if cap was released externally (during shutdown)
+                    # CRITICAL FIX: Double-check before read
                     if not self.cap or not self.cap.isOpened():
-                        logging.debug(f"VideoCapture released externally, stopping")
-                        break
+                        logging.warning(f"VideoCapture not valid for {self.source}")
+                        time.sleep(0.1)
+                        continue
                     
-                    # Read frame (this is the blocking operation)
+                    # Read frame with timeout awareness
+                    # Note: cv2.VideoCapture.read() is blocking and can't be interrupted
+                    # but our fix is to release() the cap from another thread
                     ret, frame = self.cap.read()
                     
-                    # CRITICAL: Immediately check if we were stopped during read
+                    # CRITICAL FIX: Immediately check if we were stopped
                     if self.stop_capture.is_set() or not self.is_running:
-                        logging.debug(f"Stop detected after read")
+                        logging.debug(f"Stop detected after read for {self.source}")
                         break
                     
                     if not ret or frame is None:
                         # Check if cap was released (expected during shutdown)
                         if not self.cap or not self.cap.isOpened():
-                            logging.debug(f"VideoCapture released, stopping")
+                            logging.debug(f"VideoCapture released for {self.source}, stopping")
                             break
                         
                         self._handle_read_failure()
@@ -317,21 +301,21 @@ class SharedVideoStream:
                         self.frame_available.set()
                         self.frame_available.clear()
                     
-                    # Frame rate control
+                    # Frame rate control based on video type
                     if self._is_file_source(self.source) and video_fps and video_fps > 0:
                         target_fps = min(video_fps, 30.0)
                         sleep_time = 1.0 / target_fps
                     else:
                         sleep_time = 0.033  # ~30 FPS
                     
-                    # CRITICAL: Use interruptible sleep
+                    # CRITICAL FIX: Use interruptible sleep
                     if self.stop_capture.wait(sleep_time):
                         logging.debug("Stop signal received during frame delay")
                         break
                     
                 except Exception as e:
                     if self.stop_capture.is_set() or not self.is_running:
-                        logging.debug(f"Stop detected during exception handling")
+                        logging.debug(f"Stop detected during exception handling for {self.source}")
                         break
                     
                     self.last_error = str(e)
@@ -340,15 +324,15 @@ class SharedVideoStream:
                     logging.error(f"Error in capture loop for {self.source}: {e}")
                     
                     if self.consecutive_failures > 20:
-                        logging.error(f"Too many consecutive failures, stopping")
+                        logging.error(f"Too many consecutive failures for {self.source}, stopping")
                         break
                     
-                    # CRITICAL: Interruptible error recovery sleep
+                    # CRITICAL FIX: Interruptible error recovery sleep
                     if self.stop_capture.wait(1.0):
                         break
         
         except Exception as e:
-            logging.error(f"Fatal error in capture loop: {e}", exc_info=True)
+            logging.error(f"Fatal error in capture loop for {self.source}: {e}", exc_info=True)
         
         finally:
             # Final cleanup
@@ -362,7 +346,7 @@ class SharedVideoStream:
             logging.info(f"Capture loop ended for {self.source}")
     
     def _open_video_source(self) -> bool:
-        """ENHANCED: Video source opening with shorter timeouts for RTSP"""
+        """FIXED: Enhanced video source opening with proper RTSP handling"""
         try:
             if self.cap:
                 self.cap.release()
@@ -376,10 +360,11 @@ class SharedVideoStream:
             # Set FFmpeg environment options BEFORE opening capture
             if self.is_rtsp:
                 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = self._get_opencv_capture_options()
-                logging.info(f"Opening RTSP stream with TCP transport and 15s timeout: {self.source}")
+                logging.info(f"Opening RTSP stream with TCP transport: {self.source}")
             
             # Determine backends to try
             if self.is_rtsp:
+                # For RTSP, try FFmpeg first (best RTSP support)
                 backends_to_try = [cv2.CAP_FFMPEG]
             elif self._is_file_source(self.source):
                 backends_to_try = [cv2.CAP_FFMPEG, cv2.CAP_ANY]
@@ -406,17 +391,17 @@ class SharedVideoStream:
                     if self.is_rtsp:
                         # Small buffer to reduce latency
                         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        # Set timeout properties (REDUCED TIMEOUTS)
+                        # Set timeout properties (if supported)
                         try:
-                            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)  # 15s (was 30s)
-                            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 15000)  # 15s (was 30s)
+                            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 30000)
+                            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 30000)
                         except:
-                            pass
+                            pass  # These properties may not be supported
                     else:
                         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     
-                    # Test read with shorter timeout for RTSP
-                    test_timeout = 15.0 if self.is_rtsp else 10.0
+                    # Test read with longer timeout for RTSP
+                    test_timeout = 30.0 if self.is_rtsp else 10.0
                     logging.info(f"Testing frame read (timeout: {test_timeout}s)...")
                     
                     ret, test_frame = self.cap.read()
@@ -442,6 +427,7 @@ class SharedVideoStream:
                         self.cap.release()
                         self.cap = None
                     
+                    # Don't continue if stop requested
                     if self.stop_capture.is_set():
                         return False
                     
@@ -458,7 +444,7 @@ class SharedVideoStream:
             return False
     
     def _handle_read_failure(self):
-        """ENHANCED: Read failure handling with better RTSP reconnection"""
+        """FIXED: Enhanced read failure handling with RTSP-specific logic"""
         self.consecutive_failures += 1
         
         # Special handling for file sources (video looping)
@@ -518,7 +504,6 @@ class SharedVideoStream:
         if self.cap:
             self.cap.release()
             self.cap = None
-
 
 class VideoFileManager:
     """Manages shared video streams to prevent file conflicts"""

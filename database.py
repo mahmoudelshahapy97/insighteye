@@ -84,12 +84,10 @@ async def close_db_pool():
         logger.info("Asyncpg database connection pool closed.")
         connection_pool = None
 
-
 def get_pool() -> asyncpg.Pool:
     if not connection_pool or connection_pool._closed:
         raise RuntimeError("DB pool not initialized")
     return connection_pool
-
 
 def is_pool_healthy() -> bool:
     """Check if the connection pool is healthy."""

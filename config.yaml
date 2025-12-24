@@ -177,3 +177,11 @@ short_video_optimization: true
 
 people_count_cooldown_duration_seconds: 300
 enable_people_count_email_alerts: true
+
+
+# RTSP-specific settings
+RTSP_CONNECTION_TIMEOUT: 30  # seconds
+RTSP_READ_TIMEOUT: 30  # seconds
+RTSP_RECONNECT_ATTEMPTS: 10  # More attempts for network streams
+RTSP_TRANSPORT: tcp  # "tcp" or "udp" - TCP is more reliable
+RTSP_BUFFER_SIZE: 1  # Keep small for low latency

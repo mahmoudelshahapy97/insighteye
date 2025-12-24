@@ -15,7 +15,7 @@ from users import router as users_router
 from otp import router as otp_router
 from login_user import router as login_router
 from text_chat import router as chat_router
-from stream_two import router as stream_two_router
+# from stream_two import router as stream_two_router
 from stream_one import router as stream_one_router, stream_manager, initialize_stream_manager
 from qdrant_chat import router as qdrant_chat_router
 from workspaces import router as workspace_router
@@ -146,7 +146,7 @@ app.include_router(login_router)
 app.include_router(otp_router)
 app.include_router(camera_router)
 app.include_router(chat_router)
-app.include_router(stream_two_router)
+# app.include_router(stream_two_router)
 app.include_router(stream_one_router)
 app.include_router(qdrant_chat_router)
 app.include_router(workspace_router)
@@ -205,7 +205,7 @@ async def on_startup():
 
 if __name__ == "__main__":
     server_host = config.get("server_host", "0.0.0.0")
-    server_port = config.get("server_port", 8001)
+    server_port = config.get("server_port", 8000)
     reload_app = config.get("debug_reload", False)
 
     logger.info(f"Starting Uvicorn server on {server_host}:{server_port} with reload: {reload_app}")
