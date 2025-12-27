@@ -17,7 +17,7 @@ router = APIRouter(prefix="/analytics", tags=["Analytics"])
 @router.get("/cameras/unique")
 async def get_unique_cameras(
     request: Request,
-    order_by: str = Query("camera_name", regex="^(camera_name|camera_id)$"),
+    order_by: str = Query("camera_name", pattern="^(camera_name|camera_id)$"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -226,7 +226,7 @@ async def get_average_people_per_camera(
 @router.get("/cameras/average-gender")
 async def get_average_gender_per_camera(
     request: Request,
-    gender: str = Query("male", regex="^(male|female)$"),
+    gender: str = Query("male", pattern="^(male|female)$"),
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -307,7 +307,7 @@ async def get_average_gender_per_camera(
 @router.get("/zones/gender-by-weekday")
 async def get_gender_by_zone_and_weekday(
     request: Request,
-    gender: str = Query("male", regex="^(male|female)$"),
+    gender: str = Query("male", pattern="^(male|female)$"),
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
@@ -1085,7 +1085,7 @@ async def get_fire_detections_by_location(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    group_by: str = Query("location", regex="^(location|area|building|zone|floor_level)$"),
+    group_by: str = Query("location", pattern="^(location|area|building|zone|floor_level)$"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1165,7 +1165,7 @@ async def get_fire_detections_timeline(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    interval: str = Query("day", regex="^(hour|day|week|month)$"),
+    interval: str = Query("day", pattern="^(hour|day|week|month)$"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """

@@ -1130,7 +1130,7 @@ async def get_workspace_cameras(
     zone: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     search_term: Optional[str] = Query(None),
-    group_by: Optional[str] = Query(None, regex="^(location|area|building|floor_level|zone)$"),
+    group_by: Optional[str] = Query(None, pattern="^(location|area|building|floor_level|zone)$"),
     include_inactive: bool = Query(False),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
@@ -1482,7 +1482,7 @@ async def get_location_analytics(
     end_date: Optional[str] = Query(None),
     start_time: Optional[str] = Query(None),
     end_time: Optional[str] = Query(None),
-    group_by: str = Query("location", regex="^(location|area|building|floor_level|zone)$"),
+    group_by: str = Query("location", pattern="^(location|area|building|floor_level|zone)$"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get analytics data grouped by location hierarchy."""

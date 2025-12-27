@@ -1208,7 +1208,7 @@ async def get_cameras_by_location(
     building: Optional[str] = Query(None),
     floor_level: Optional[str] = Query(None),
     zone: Optional[str] = Query(None),
-    group_by: str = Query("location", regex="^(location|area|building|floor_level|zone)$"),
+    group_by: str = Query("location", pattern="^(location|area|building|floor_level|zone)$"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Get cameras grouped by location criteria."""
@@ -2112,9 +2112,9 @@ async def get_user_camera_limit(
 async def get_all_users_camera_limits(
     page: int = Query(1, ge=1, description="Page number"),
     per_page: int = Query(50, ge=1, le=200, description="Items per page"),
-    sort_by: str = Query("username", regex="^(username|email|count_of_camera|current_cameras|remaining_limit)$"),
-    sort_order: str = Query("asc", regex="^(asc|desc)$"),
-    filter_role: Optional[str] = Query(None, regex="^(user|admin)$"),
+    sort_by: str = Query("username", pattern="^(username|email|count_of_camera|current_cameras|remaining_limit)$"),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
+    filter_role: Optional[str] = Query(None, pattern="^(user|admin)$"),
     filter_subscribed: Optional[bool] = Query(None),
     search: Optional[str] = Query(None, description="Search by username or email"),
     current_admin_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)

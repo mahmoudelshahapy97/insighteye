@@ -255,7 +255,7 @@ async def get_gender_ratio_trends(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    interval: str = Query("day", regex="^(hour|day|week|month)$"),
+    interval: str = Query("day", pattern="^(hour|day|week|month)$"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -343,7 +343,7 @@ async def get_gender_distribution_by_location(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    group_by: str = Query("location", regex="^(location|area|building|zone|floor_level)$"),
+    group_by: str = Query("location", pattern="^(location|area|building|zone|floor_level)$"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1148,7 +1148,7 @@ async def get_zone_popularity_rankings(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    group_by: str = Query("zone", regex="^(location|area|building|zone|floor_level)$"),
+    group_by: str = Query("zone", pattern="^(location|area|building|zone|floor_level)$"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1769,7 +1769,7 @@ async def get_camera_vs_average_benchmark(
 @router.get("/benchmark/best-worst-performers")
 async def get_best_worst_performers(
     request: Request,
-    metric: str = Query("occupancy", regex="^(occupancy|reliability|data_quality|fire_safety)$"),
+    metric: str = Query("occupancy", pattern="^(occupancy|reliability|data_quality|fire_safety)$"),
     top_n: int = Query(10, ge=1, le=50),
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,

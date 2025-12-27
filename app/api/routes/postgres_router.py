@@ -456,7 +456,7 @@ async def get_workspace_statistics(
 
 @router.get("/workspace/export")
 async def export_workspace_data(
-    format: str = Query("csv", regex="^(csv|json)$"),
+    format: str = Query("csv", pattern="^(csv|json)$"),
     camera_id_param: Optional[str] = Query(None, alias="camera_id"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
