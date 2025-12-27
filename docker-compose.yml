@@ -9,17 +9,4 @@ services:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - .:/app
-    # networks:
-    #   - insighteye_network
-    network_mode: "host"  
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"
-    # dns:
-    #   - 8.8.8.8
-    #   - 8.8.4.4
-    shm_size: '2gb'
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
-
-# networks:
-#   insighteye_network:
-#     driver: bridge
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,219 @@
+# app/config/config.yaml
+project:
+  description: Insighteye API with various ML capabilities
+  name: Insighteye API
+  version: 1.0.0
+
+app:
+  api_prefix: /api/v2
+  reload: true
+  debug: true
+  description: Insighteye API with various ML capabilities
+  host: 127.0.0.1
+  name: Insighteye API
+  port: 8000
+  version: 1.0.0
+  log_level: info
+  workers: 8
+
+logging:
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  level: INFO
+
+cors_origins:
+  - "13.61.228.251"
+  - "http://13.61.228.251"
+  - "http://localhost:8000"
+  - "http://localhost:3000"
+  - "localhost"
+allow_origins:
+  - "13.61.228.251"
+  - "http://13.61.228.251"
+  - "http://localhost:8000"
+  - "http://localhost:3000"
+  - "localhost"
+cors_allow_credentials: true
+cors_allow_methods:
+  - "GET"
+  - "POST"
+  - "PUT"
+  - "DELETE"
+cors_allow_headers:
+  - "Content-Type"
+  - "Authorization"
+  - "X-Request-ID"
+expose_headers: "X-Request-ID"
+trusted_hosts:
+  - "127.0.0.1"
+  - "localhost"
+
+otp_rate_limit_seconds: 60
+otp_expiration_seconds: 600
+
+
+ACCESS_TOKEN_EXPIRE_MINUTES: 1500 #min
+REFRESH_TOKEN_EXPIRE_DAYS: 15 #days
+ALGORITHM: HS256 #seconds
+session_timeout: 600 #seconds
+# secrets.token_urlsafe(32)
+SECRET_KEY: e20d4027c260b6452f7607db8e7e4d02994d65a67d245665ba597e1d374cc2b4
+people_model_path: "models/people.pt"
+gender_model_path: "models/gender.pt"
+fire_model_path: "models/fire.pt"
+max_workers: 4
+
+# sender_email: "Insighteye@gateworx.net"
+# sender_password: "ymis milr mwoo wzrv"
+sender_email: "mimo16603@gmail.com"
+sender_password: "rtww osun qfij afqw"
+
+otp_expiry: 300
+smtp_server: "smtp.gmail.com"
+smtp_port: 587
+# smtp_username: "Insighteye@gateworx.net"
+# smtp_password: "ymis milr mwoo wzrv"
+# otp_sender_email: "Insighteye@gateworx.net"
+
+smtp_username: "mimo16603@gmail.com"
+smtp_password: "rtww osun qfij afqw"
+otp_sender_email: "mimo16603@gmail.com"
+
+insert_batch_size: 5
+insert_interval: 60 #seconds
+
+DATA_BACKEND: "qdrant"
+
+qdrant_url: "172.31.25.133"
+qdrant_port: 6333
+qdrant_collection_name: "person_counts"
+query_timeout: 50
+qdrant_fetch_limit: 50
+qdrant_vector_size: 1
+
+elasticsearch_hosts: "http://172.31.25.133:9200"
+elasticsearch_index_name: "person_counts"
+elasticsearch_timeout: 60.0
+elasticsearch_version: 8
+
+session_id: "2gXz1vQjW7-M6XsHwZp9D1BEXyL3oAqVfJbYK9t5U2c"
+
+database:
+  dbname: "insighteye_db"
+  user: "insighteye_user"
+  password: "insighteye*+#@"
+  host: "172.31.25.133"
+  port: "5432"
+
+server_host: "127.0.0.1"
+server_port: 8000
+fastapi_root_path: "/insighteye"
+
+stream_cleanup_interval_seconds: 60.0
+
+models:
+  cache_dir: ./model_cache
+  device: cuda
+  chat:
+    embeddings: mixedbread-ai/mxbai-embed-large-v1
+    format: json
+    llama: llama3.2:1b
+    phi: vanilj/Phi-4:Q8_0
+    phi4: phi4
+    commandra: command-r7b-arabic
+    qwen: qwen2.5:14b
+    qwen_coder: qwen2.5-coder:7b
+    max_new_tokens: 1024
+    max_tokens: 1024
+    num_predict: 1024
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 40
+    top_k_retriever: 2
+
+sql_file_path: "app/config/insighteye-query_v1.2.sql"
+
+prompts:
+  system_prompt: You are a helpful assistant.
+  text_chat: You are a helpful assistant that can answer questions about the text.
+
+max_history_length: 100
+
+# Add random delay to prevent simultaneous access
+file_access_jitter_seconds: 2.0
+
+# Improved buffer settings
+cv_frame_buffer_size: 1  
+
+# Maximum concurrent streams per file
+max_streams_per_file: 2
+shared_stream_buffer_size: 3
+shared_stream_timeout_seconds: 30.0
+
+frame_skip: 300  # Reduced from 2
+
+# Shorter delays and timeouts
+stream_reconnect_delay_base_seconds: 1.0
+stream_reconnect_delay_frame_read_seconds: 2.0
+max_consecutive_frame_failures: 15  # Reduced threshold
+
+
+# Prevent multiple streams from same file
+prevent_duplicate_file_streams: True
+file_access_timeout_seconds: 10.0
+
+# Enable stream sharing for same source
+enable_stream_sharing: True
+
+# Performance settings
+shared_stream_max_fps: 30
+video_file_manager_cleanup_interval: 300  # 5 minutes
+
+# Error handling
+shared_stream_reconnect_delay: 2.0
+shared_stream_max_reconnect_attempts: 5
+stream_max_reconnect_attempts: 3
+
+# Memory management
+max_shared_streams: 50
+shared_stream_memory_limit_mb: 100
+
+# Debugging
+log_shared_stream_stats: true
+log_shared_stream_stats_interval: 30
+
+video_loop_on_end: true
+video_validation_enabled: true
+max_video_restart_attempts: 10
+
+# Timeouts
+stream_stop_timeout_seconds: 10.0
+stream_stale_threshold_seconds: 45.0
+stream_manager_poll_interval_seconds: 2.0
+
+# File validation
+validate_video_files_before_processing: true
+video_file_validation_timeout: 10.0
+
+# Performance
+yolo_max_input_dim: 640  # Reduced for better performance
+stream_db_activity_update_interval_seconds: 5.0  # More frequent DB updates
+
+# Video-specific settings
+video_loop_enabled: true
+video_restart_on_end: true
+short_video_optimization: true
+
+people_count_cooldown_duration_seconds: 300
+enable_people_count_email_alerts: true
+
+STREAM_HEALTHCHECK_INTERVAL_SECONDS: 120
+STREAM_STALE_THRESHOLD_SECONDS: 300 
+STREAM_START_STAGGER_DELAY: 2.0
+SHARED_STREAM_FRAME_WAIT_TIMEOUT: 15.0 
+
+# RTSP-specific settings
+RTSP_CONNECTION_TIMEOUT: 30  # seconds
+RTSP_READ_TIMEOUT: 30  # seconds
+RTSP_RECONNECT_ATTEMPTS: 10  # More attempts for network streams
+RTSP_TRANSPORT: "tcp"  # "tcp" or "udp" - TCP is more reliable
+RTSP_BUFFER_SIZE: 1  # Keep small for low latency
