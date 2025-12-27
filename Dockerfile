@@ -29,6 +29,9 @@ ENV OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp|timeout;10000000|stimeout;
 ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 
+# Upgrade pip
+RUN python -m pip install --upgrade pip
+
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
