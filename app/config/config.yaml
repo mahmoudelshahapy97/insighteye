@@ -62,21 +62,15 @@ gender_model_path: "models/gender.pt"
 fire_model_path: "models/fire.pt"
 max_workers: 4
 
-# sender_email: "Insighteye@gateworx.net"
-# sender_password: "ymis milr mwoo wzrv"
-sender_email: "mimo16603@gmail.com"
-sender_password: "rtww osun qfij afqw"
+sender_email: "Insighteye@gateworx.net"
+sender_password: "ymis milr mwoo wzrv"
 
 otp_expiry: 300
 smtp_server: "smtp.gmail.com"
 smtp_port: 587
-# smtp_username: "Insighteye@gateworx.net"
-# smtp_password: "ymis milr mwoo wzrv"
-# otp_sender_email: "Insighteye@gateworx.net"
-
-smtp_username: "mimo16603@gmail.com"
-smtp_password: "rtww osun qfij afqw"
-otp_sender_email: "mimo16603@gmail.com"
+smtp_username: "Insighteye@gateworx.net"
+smtp_password: "ymis milr mwoo wzrv"
+otp_sender_email: "Insighteye@gateworx.net"
 
 insert_batch_size: 5
 insert_interval: 60 #seconds
