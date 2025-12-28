@@ -28,6 +28,19 @@ class FireDetectionService:
         last_notification_time: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """Create or update fire detection state."""
+        # query = """
+        #     INSERT INTO fire_detection_state 
+        #     (stream_id, fire_status, last_detection_time, last_notification_time, updated_at)
+        #     VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+        #     ON CONFLICT (stream_id)
+        #     DO UPDATE SET
+        #         fire_status = EXCLUDED.fire_status,
+        #         last_detection_time = EXCLUDED.last_detection_time,
+        #         last_notification_time = EXCLUDED.last_notification_time,
+        #         updated_at = CURRENT_TIMESTAMP
+        #     RETURNING *
+        # """
+
         query = """
             INSERT INTO fire_detection_state 
             (stream_id, fire_status, last_detection_time, last_notification_time, updated_at)
@@ -36,7 +49,11 @@ class FireDetectionService:
             DO UPDATE SET
                 fire_status = EXCLUDED.fire_status,
                 last_detection_time = EXCLUDED.last_detection_time,
-                last_notification_time = EXCLUDED.last_notification_time,
+                last_notification_time = CASE 
+                    WHEN EXCLUDED.last_notification_time IS NOT NULL 
+                    THEN EXCLUDED.last_notification_time 
+                    ELSE fire_detection_state.last_notification_time  -- ← Keep existing!
+                END,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING *
         """
@@ -50,6 +67,7 @@ class FireDetectionService:
             logger.debug(f"Fire detection state updated for stream {stream_id}: {fire_status}")
         
         return result
+
 
     async def get_fire_detection_state(self, stream_id: UUID) -> Optional[Dict[str, Any]]:
         """Get fire detection state for a stream."""

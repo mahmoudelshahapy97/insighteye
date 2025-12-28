@@ -163,7 +163,7 @@ class StreamProcessingService:
             if frame_count % 10 == 0 and self.fire_model:
                 try:
                     fire_results = self.fire_model(source=input_frame, conf=0.8, verbose=False)
-                    
+
                     current_fire_status = "no detection"
                     if fire_results and len(fire_results) > 0 and fire_results[0].boxes is not None:
                         classes = [int(box.cls) for box in fire_results[0].boxes]

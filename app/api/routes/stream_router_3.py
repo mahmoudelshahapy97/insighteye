@@ -1504,3 +1504,133 @@ async def get_camera_stop_history(
         "time_window_hours": hours,
         "stop_history": history
     }
+
+
+@router.post("/test/fire-alert/{stream_id}")
+async def test_fire_alert(
+    stream_id: str,
+    fire_status: str = "fire",  # or "smoke"
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    TEST ENDPOINT: Manually trigger a fire alert popup.
+    Use this to test if the popup system is working.
+    """
+    try:
+        stream_uuid = UUID(stream_id)
+        
+        # Get stream info
+        from app.services.video_stream_service import video_stream_service
+        stream_info = await video_stream_service.get_video_stream_by_id(stream_uuid)
+        
+        if not stream_info:
+            raise HTTPException(status_code=404, detail="Stream not found")
+        
+        # Build location info
+        location_info = {
+            'location': stream_info.get('location'),
+            'area': stream_info.get('area'),
+            'building': stream_info.get('building'),
+            'zone': stream_info.get('zone'),
+            'floor_level': stream_info.get('floor_level'),
+        }
+        
+        # Build location text
+        location_parts = []
+        if location_info.get('building'):
+            location_parts.append(location_info['building'])
+        if location_info.get('floor_level'):
+            location_parts.append(f"Floor {location_info['floor_level']}")
+        if location_info.get('zone'):
+            location_parts.append(location_info['zone'])
+        
+        location_text = " - ".join(location_parts) if location_parts else "Test Location"
+        
+        alert_type = "FIRE" if fire_status == "fire" else "SMOKE"
+        message = f"🔥 TEST {alert_type} ALERT: {fire_status.upper()} detected in {location_text}"
+        
+        # Create notification
+        from app.services.notification_service import notification_service
+        notification = await notification_service.create_notification(
+            workspace_id=stream_info['workspace_id'],
+            user_id=stream_info['user_id'],
+            status="urgent",
+            message=message,
+            stream_id=stream_uuid,
+            camera_name=stream_info['name']
+        )
+        
+        # Build and broadcast popup
+        popup_alert = {
+            "type": "fire_alert_popup",
+            "alert": {
+                "id": str(notification.get("notification_id")),
+                "severity": "critical",
+                "alert_type": alert_type.lower(),
+                "status": fire_status,
+                "camera_name": stream_info['name'],
+                "camera_id": str(stream_uuid),
+                "location": location_text,
+                "location_details": location_info,
+                "message": message,
+                "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).timestamp(),
+                "workspace_id": str(stream_info['workspace_id']),
+                "user_id": str(stream_info['user_id']),
+                "requires_acknowledgment": True,
+                "sound_alert": True,
+                "priority": "critical"
+            }
+        }
+        
+        # Broadcast to current user for testing
+        sent_count = await stream_manager.broadcast_notification(
+            str(current_user['user_id']),
+            popup_alert
+        )
+        
+        return {
+            "status": "success",
+            "message": f"Test fire alert sent to {sent_count} WebSocket connection(s)",
+            "alert": popup_alert
+        }
+        
+    except Exception as e:
+        logger.error(f"Error sending test fire alert: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@router.get("/debug/fire-state/{stream_id}")
+async def debug_fire_state(
+    stream_id: str,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Debug endpoint to check fire detection state"""
+    try:
+        from app.services.fire_detection_service import fire_detection_service
+        
+        stream_uuid = UUID(stream_id)
+        fire_state = await fire_detection_service.get_fire_detection_state(stream_uuid)
+        
+        if not fire_state:
+            return {"message": "No fire state found", "can_notify": True}
+        
+        current_time = datetime.now(ZoneInfo("Africa/Cairo"))
+        last_notification = fire_state.get("last_notification_time")
+        
+        if last_notification:
+            time_since_last = (current_time - last_notification).total_seconds() / 60
+            can_notify = time_since_last >= 10
+            remaining = max(0, 10 - time_since_last)
+        else:
+            time_since_last = None
+            can_notify = True
+            remaining = 0
+        
+        return {
+            "fire_status": fire_state.get("fire_status"),
+            "last_notification": last_notification.isoformat() if last_notification else None,
+            "minutes_since_last": round(time_since_last, 2) if time_since_last else None,
+            "cooldown_remaining_minutes": round(remaining, 2),
+            "can_notify_now": can_notify
+        }
+    except Exception as e:
+        return {"error": str(e)}

@@ -1,6 +1,6 @@
 # app/routes/analytics_extended_router.py
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 from datetime import date, datetime, time, timedelta
 from uuid import UUID
 import logging
@@ -8,10 +8,71 @@ import logging
 from app.services.session_service import session_manager
 from app.services.workspace_service import workspace_service
 from app.services.database import db_manager
-from app.utils import check_workspace_access
+from app.utils import check_workspace_access, parse_string_or_list
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analytics/extended", tags=["Extended Analytics"])
+
+
+def build_location_filters(
+    params: list,
+    param_count: int,
+    locations: Optional[Union[str, List[str]]] = None,
+    areas: Optional[Union[str, List[str]]] = None,
+    buildings: Optional[Union[str, List[str]]] = None,
+    floor_levels: Optional[Union[str, List[str]]] = None,
+    zones: Optional[Union[str, List[str]]] = None
+) -> tuple:
+    """Helper function to build location filter SQL and params"""
+    filters = []
+    
+    if locations:
+        locations = parse_string_or_list(locations)
+        if locations:
+            param_count += 1
+            placeholders = ", ".join([f"${param_count + i}" for i in range(len(locations))])
+            filters.append(f"location IN ({placeholders})")
+            params.extend(locations)
+            param_count += len(locations) - 1
+    
+    if areas:
+        areas = parse_string_or_list(areas)
+        if areas:
+            param_count += 1
+            placeholders = ", ".join([f"${param_count + i}" for i in range(len(areas))])
+            filters.append(f"area IN ({placeholders})")
+            params.extend(areas)
+            param_count += len(areas) - 1
+    
+    if buildings:
+        buildings = parse_string_or_list(buildings)
+        if buildings:
+            param_count += 1
+            placeholders = ", ".join([f"${param_count + i}" for i in range(len(buildings))])
+            filters.append(f"building IN ({placeholders})")
+            params.extend(buildings)
+            param_count += len(buildings) - 1
+    
+    if floor_levels:
+        floor_levels = parse_string_or_list(floor_levels)
+        if floor_levels:
+            param_count += 1
+            placeholders = ", ".join([f"${param_count + i}" for i in range(len(floor_levels))])
+            filters.append(f"floor_level IN ({placeholders})")
+            params.extend(floor_levels)
+            param_count += len(floor_levels) - 1
+    
+    if zones:
+        zones = parse_string_or_list(zones)
+        if zones:
+            param_count += 1
+            placeholders = ", ".join([f"${param_count + i}" for i in range(len(zones))])
+            filters.append(f"zone IN ({placeholders})")
+            params.extend(zones)
+            param_count += len(zones) - 1
+    
+    return filters, param_count
+
 
 # ==================== OCCUPANCY & TRAFFIC ANALYTICS ====================
 
@@ -22,6 +83,11 @@ async def get_peak_vs_offpeak_analysis(
     end_date: Optional[date] = None,
     business_start_hour: int = Query(9, ge=0, le=23),
     business_end_hour: int = Query(17, ge=0, le=23),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -41,14 +107,22 @@ async def get_peak_vs_offpeak_analysis(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj, business_start_hour, business_end_hour]
+        param_count = 3
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             SELECT
@@ -69,6 +143,7 @@ async def get_peak_vs_offpeak_analysis(
               AND time IS NOT NULL
               AND person_count IS NOT NULL
               {date_filter}
+              {location_where}
             GROUP BY camera_name, camera_id, location, period_type
             ORDER BY camera_name, period_type
         """
@@ -85,6 +160,15 @@ async def get_peak_vs_offpeak_analysis(
             "success": True,
             "business_hours": f"{business_start_hour}:00 - {business_end_hour}:00",
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -99,6 +183,11 @@ async def get_occupancy_heatmap(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -118,14 +207,22 @@ async def get_occupancy_heatmap(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             SELECT
@@ -139,6 +236,7 @@ async def get_occupancy_heatmap(
               AND time IS NOT NULL
               AND person_count IS NOT NULL
               {date_filter}
+              {location_where}
             GROUP BY location, EXTRACT(HOUR FROM time)
             ORDER BY location, hour
         """
@@ -154,6 +252,15 @@ async def get_occupancy_heatmap(
         return {
             "success": True,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -168,6 +275,11 @@ async def get_capacity_utilization(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -187,14 +299,22 @@ async def get_capacity_utilization(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND sr.date >= ${len(params)}"
+            date_filter += f" AND sr.date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND sr.date <= ${len(params)}"
+            date_filter += f" AND sr.date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             SELECT
@@ -222,6 +342,7 @@ async def get_capacity_utilization(
               AND sr.person_count IS NOT NULL
               AND vs.count_threshold_greater IS NOT NULL
               {date_filter}
+              {location_where}
             GROUP BY sr.camera_name, sr.camera_id, sr.location, vs.count_threshold_greater
             ORDER BY avg_utilization_percentage DESC NULLS LAST
         """
@@ -239,6 +360,15 @@ async def get_capacity_utilization(
         return {
             "success": True,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -256,6 +386,11 @@ async def get_gender_ratio_trends(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     interval: str = Query("day", pattern="^(hour|day|week|month)$"),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -275,14 +410,22 @@ async def get_gender_ratio_trends(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
         
         truncate_expr = {
             'hour': "DATE_TRUNC('hour', timestamp)",
@@ -308,6 +451,7 @@ async def get_gender_ratio_trends(
             WHERE workspace_id = $1
               AND timestamp IS NOT NULL
               {date_filter}
+              {location_where}
             GROUP BY {truncate_expr}
             ORDER BY time_period DESC
         """
@@ -329,6 +473,15 @@ async def get_gender_ratio_trends(
             "success": True,
             "interval": interval,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -344,6 +497,11 @@ async def get_gender_distribution_by_location(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     group_by: str = Query("location", pattern="^(location|area|building|zone|floor_level)$"),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -363,14 +521,22 @@ async def get_gender_distribution_by_location(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             SELECT
@@ -385,6 +551,7 @@ async def get_gender_distribution_by_location(
             FROM stream_results
             WHERE workspace_id = $1
               {date_filter}
+              {location_where}
             GROUP BY COALESCE({group_by}, 'Unknown')
             ORDER BY group_name
         """
@@ -405,6 +572,15 @@ async def get_gender_distribution_by_location(
             "success": True,
             "group_by": group_by,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -419,6 +595,11 @@ async def get_peak_hours_by_gender(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -438,14 +619,22 @@ async def get_peak_hours_by_gender(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             SELECT
@@ -459,6 +648,7 @@ async def get_peak_hours_by_gender(
             WHERE workspace_id = $1
               AND time IS NOT NULL
               {date_filter}
+              {location_where}
             GROUP BY EXTRACT(HOUR FROM time)
             ORDER BY hour
         """
@@ -481,6 +671,15 @@ async def get_peak_hours_by_gender(
             "peak_male_hour": peak_male_hour['hour'] if peak_male_hour else None,
             "peak_female_hour": peak_female_hour['hour'] if peak_female_hour else None,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -497,6 +696,11 @@ async def get_occupancy_forecast(
     request: Request,
     camera_id: Optional[UUID] = None,
     forecast_hours: int = Query(24, ge=1, le=168),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -516,11 +720,18 @@ async def get_occupancy_forecast(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         camera_filter = ""
         
         if camera_id:
+            param_count += 1
             params.append(camera_id)
-            camera_filter = f" AND stream_id = ${len(params)}"
+            camera_filter = f" AND stream_id = ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         # Get historical averages by hour of day and day of week
         query = f"""
@@ -537,6 +748,7 @@ async def get_occupancy_forecast(
                   AND date >= CURRENT_DATE - INTERVAL '30 days'
                   AND person_count IS NOT NULL
                   {camera_filter}
+                  {location_where}
                 GROUP BY camera_name, day_of_week, hour_of_day
             )
             SELECT
@@ -584,6 +796,14 @@ async def get_occupancy_forecast(
             "forecast_hours": forecast_hours,
             "forecast_start": current_time.isoformat(),
             "forecast_end": (current_time + timedelta(hours=forecast_hours)).isoformat(),
+            "filters_applied": {
+                "camera_id": str(camera_id) if camera_id else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": forecast_data
         }
         
@@ -599,6 +819,11 @@ async def detect_anomalies(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     sensitivity: float = Query(2.0, ge=1.0, le=5.0, description="Standard deviations for anomaly threshold"),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -618,14 +843,22 @@ async def detect_anomalies(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj, sensitivity]
+        param_count = 2
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             WITH camera_stats AS (
@@ -638,6 +871,7 @@ async def detect_anomalies(
                 WHERE workspace_id = $1
                   AND person_count IS NOT NULL
                   {date_filter}
+                  {location_where}
                 GROUP BY stream_id, camera_name
             ),
             anomalies AS (
@@ -664,6 +898,7 @@ async def detect_anomalies(
                 WHERE sr.workspace_id = $1
                   AND sr.person_count IS NOT NULL
                   {date_filter}
+                  {location_where}
             )
             SELECT *
             FROM anomalies
@@ -703,6 +938,15 @@ async def detect_anomalies(
                 "low_drops": low_drops,
                 "critical_anomalies": len([d for d in data if d['severity'] == 'critical'])
             },
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -712,11 +956,17 @@ async def detect_anomalies(
         logger.error(f"Error in anomaly detection: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.get("/predictive/threshold-breach-forecast")
 async def forecast_threshold_breaches(
     request: Request,
     camera_id: Optional[UUID] = None,
     forecast_hours: int = Query(24, ge=1, le=168),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -736,11 +986,18 @@ async def forecast_threshold_breaches(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         camera_filter = ""
         
         if camera_id:
+            param_count += 1
             params.append(camera_id)
-            camera_filter = f" AND sr.stream_id = ${len(params)}"
+            camera_filter = f" AND sr.stream_id = ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         # Get cameras with thresholds and their historical patterns
         query = f"""
@@ -772,6 +1029,7 @@ async def forecast_threshold_breaches(
                   AND sr.date >= CURRENT_DATE - INTERVAL '30 days'
                   AND sr.person_count IS NOT NULL
                   {camera_filter}
+                  {location_where}
                 GROUP BY sr.stream_id, ct.camera_name, ct.count_threshold_greater, ct.count_threshold_less, day_of_week, hour_of_day
             )
             SELECT
@@ -827,6 +1085,14 @@ async def forecast_threshold_breaches(
             "success": True,
             "forecast_hours": forecast_hours,
             "breach_forecasts": len(forecast_data),
+            "filters_applied": {
+                "camera_id": str(camera_id) if camera_id else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": forecast_data
         }
         
@@ -843,6 +1109,11 @@ async def get_camera_uptime_reliability(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -862,14 +1133,22 @@ async def get_camera_uptime_reliability(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             WITH camera_activity AS (
@@ -886,13 +1165,14 @@ async def get_camera_uptime_reliability(
                 FROM stream_results
                 WHERE workspace_id = $1
                   {date_filter}
+                  {location_where}
                 GROUP BY stream_id, camera_name, location
             ),
             expected_days AS (
                 SELECT 
                     CASE 
-                        WHEN ${len(params)} > 1 THEN 
-                            EXTRACT(DAY FROM (${len(params)}::date - ${len(params) - 1}::date)) + 1
+                        WHEN {len([p for p in [start_date, end_date] if p])} = 2 THEN 
+                            EXTRACT(DAY FROM (${param_count - (1 if end_date else 0)}::date - ${param_count - (1 if start_date and end_date else 0) - (1 if not end_date else 0)}::date)) + 1
                         ELSE 
                             EXTRACT(DAY FROM (CURRENT_DATE - (SELECT MIN(date) FROM stream_results WHERE workspace_id = $1))) + 1
                     END AS expected_days
@@ -939,6 +1219,15 @@ async def get_camera_uptime_reliability(
         return {
             "success": True,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -953,6 +1242,11 @@ async def get_data_quality_metrics(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -972,14 +1266,22 @@ async def get_data_quality_metrics(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             SELECT
@@ -1005,6 +1307,7 @@ async def get_data_quality_metrics(
             FROM stream_results
             WHERE workspace_id = $1
               {date_filter}
+              {location_where}
             GROUP BY stream_id, camera_name, location
             ORDER BY data_quality_rating DESC, camera_name
         """
@@ -1032,6 +1335,15 @@ async def get_data_quality_metrics(
         return {
             "success": True,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -1047,6 +1359,11 @@ async def get_camera_comparison_matrix(
     camera_ids: List[UUID] = Query(None, description="List of camera IDs to compare"),
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1066,19 +1383,28 @@ async def get_camera_comparison_matrix(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         camera_filter = ""
         
         if camera_ids:
-            camera_filter = f" AND stream_id = ANY(${len(params) + 1})"
+            param_count += 1
+            camera_filter = f" AND sr.stream_id = ANY(${param_count})"
             params.append(camera_ids)
             
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND sr.date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND sr.date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             SELECT
@@ -1103,6 +1429,7 @@ async def get_camera_comparison_matrix(
             WHERE sr.workspace_id = $1
               {camera_filter}
               {date_filter}
+              {location_where}
             GROUP BY sr.stream_id, sr.camera_name, sr.location, vs.status, vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled
             ORDER BY sr.camera_name
         """
@@ -1132,6 +1459,16 @@ async def get_camera_comparison_matrix(
         return {
             "success": True,
             "cameras_compared": len(data),
+            "filters_applied": {
+                "camera_ids": [str(cid) for cid in camera_ids] if camera_ids else None,
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -1141,6 +1478,7 @@ async def get_camera_comparison_matrix(
         logger.error(f"Error in camera comparison: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ==================== LOCATION & ZONE INTELLIGENCE ====================
 
 @router.get("/zones/popularity-rankings")
@@ -1149,6 +1487,11 @@ async def get_zone_popularity_rankings(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     group_by: str = Query("zone", pattern="^(location|area|building|zone|floor_level)$"),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1168,14 +1511,22 @@ async def get_zone_popularity_rankings(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             WITH zone_stats AS (
@@ -1191,6 +1542,7 @@ async def get_zone_popularity_rankings(
                 WHERE workspace_id = $1
                   AND person_count IS NOT NULL
                   {date_filter}
+                  {location_where}
                 GROUP BY COALESCE({group_by}, 'Unknown')
             ),
             ranked_zones AS (
@@ -1233,6 +1585,15 @@ async def get_zone_popularity_rankings(
             "success": True,
             "group_by": group_by,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -1247,6 +1608,11 @@ async def get_cross_location_analysis(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1266,14 +1632,22 @@ async def get_cross_location_analysis(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             WITH location_metrics AS (
@@ -1291,6 +1665,7 @@ async def get_cross_location_analysis(
                 FROM stream_results
                 WHERE workspace_id = $1
                   {date_filter}
+                  {location_where}
                 GROUP BY building, floor_level, zone
             )
             SELECT
@@ -1323,6 +1698,15 @@ async def get_cross_location_analysis(
         return {
             "success": True,
             "count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -1340,6 +1724,11 @@ async def get_location_hierarchy_drilldown(
     zone: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1359,23 +1748,35 @@ async def get_location_hierarchy_drilldown(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         filters = ["workspace_id = $1"]
         
         if building:
+            param_count += 1
             params.append(building)
-            filters.append(f"building = ${len(params)}")
+            filters.append(f"building = ${param_count}")
         if floor_level:
+            param_count += 1
             params.append(floor_level)
-            filters.append(f"floor_level = ${len(params)}")
+            filters.append(f"floor_level = ${param_count}")
         if zone:
+            param_count += 1
             params.append(zone)
-            filters.append(f"zone = ${len(params)}")
+            filters.append(f"zone = ${param_count}")
         if start_date:
+            param_count += 1
             params.append(start_date)
-            filters.append(f"date >= ${len(params)}")
+            filters.append(f"date >= ${param_count}")
         if end_date:
+            param_count += 1
             params.append(end_date)
-            filters.append(f"date <= ${len(params)}")
+            filters.append(f"date <= ${param_count}")
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        if location_filters:
+            filters.extend(location_filters)
             
         where_clause = " AND ".join(filters)
             
@@ -1441,7 +1842,14 @@ async def get_location_hierarchy_drilldown(
             "filters_applied": {
                 "building": building,
                 "floor_level": floor_level,
-                "zone": zone
+                "zone": zone,
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
             }
         }
         
@@ -1451,12 +1859,18 @@ async def get_location_hierarchy_drilldown(
         logger.error(f"Error in hierarchy drilldown: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ==================== TIME-BASED ANALYTICS ====================
 
 @router.get("/time/month-over-month")
 async def get_month_over_month_comparison(
     request: Request,
     months_back: int = Query(6, ge=2, le=12),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1475,7 +1889,15 @@ async def get_month_over_month_comparison(
 
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
-        query = """
+        params = [workspace_id_obj, months_back]
+        param_count = 2
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+        
+        query = f"""
             WITH monthly_stats AS (
                 SELECT
                     DATE_TRUNC('month', date) AS month,
@@ -1488,6 +1910,7 @@ async def get_month_over_month_comparison(
                 FROM stream_results
                 WHERE workspace_id = $1
                   AND date >= DATE_TRUNC('month', CURRENT_DATE) - ($2 || ' months')::INTERVAL
+                  {location_where}
                 GROUP BY DATE_TRUNC('month', date)
             ),
             monthly_comparison AS (
@@ -1533,7 +1956,7 @@ async def get_month_over_month_comparison(
         """
         
         async with db_manager.get_connection() as conn:
-            results = await conn.fetch(query, workspace_id_obj, months_back)
+            results = await conn.fetch(query, *params)
             
         data = [{
             'month': row['month'].isoformat(),
@@ -1553,6 +1976,13 @@ async def get_month_over_month_comparison(
         return {
             "success": True,
             "months_analyzed": len(data),
+            "filters_applied": {
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -1565,6 +1995,11 @@ async def get_month_over_month_comparison(
 @router.get("/time/seasonal-patterns")
 async def get_seasonal_patterns(
     request: Request,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1583,7 +2018,15 @@ async def get_seasonal_patterns(
 
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
-        query = """
+        params = [workspace_id_obj]
+        param_count = 1
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+        
+        query = f"""
             SELECT
                 EXTRACT(QUARTER FROM date) AS quarter,
                 EXTRACT(MONTH FROM date) AS month,
@@ -1597,12 +2040,13 @@ async def get_seasonal_patterns(
             WHERE workspace_id = $1
               AND date >= CURRENT_DATE - INTERVAL '1 year'
               AND person_count IS NOT NULL
+              {location_where}
             GROUP BY quarter, month, week, TO_CHAR(date, 'Day'), EXTRACT(DOW FROM date)
             ORDER BY quarter, month, week, weekday_num
         """
         
         async with db_manager.get_connection() as conn:
-            results = await conn.fetch(query, workspace_id_obj)
+            results = await conn.fetch(query, *params)
             
         # Group by different periods
         quarterly = {}
@@ -1647,7 +2091,14 @@ async def get_seasonal_patterns(
             "success": True,
             "quarterly_patterns": quarterly_data,
             "monthly_patterns": sorted(monthly_data, key=lambda x: x['month']),
-            "total_weeks_analyzed": len(weekly)
+            "total_weeks_analyzed": len(weekly),
+            "filters_applied": {
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            }
         }
         
     except HTTPException:
@@ -1663,6 +2114,11 @@ async def get_camera_vs_average_benchmark(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1682,14 +2138,22 @@ async def get_camera_vs_average_benchmark(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             WITH workspace_avg AS (
@@ -1702,6 +2166,7 @@ async def get_camera_vs_average_benchmark(
                 WHERE workspace_id = $1
                   AND person_count IS NOT NULL
                   {date_filter}
+                  {location_where}
             ),
             camera_stats AS (
                 SELECT
@@ -1716,6 +2181,7 @@ async def get_camera_vs_average_benchmark(
                 WHERE workspace_id = $1
                   AND person_count IS NOT NULL
                   {date_filter}
+                  {location_where}
                 GROUP BY stream_id, camera_name, location
             )
             SELECT
@@ -1757,6 +2223,15 @@ async def get_camera_vs_average_benchmark(
         return {
             "success": True,
             "cameras_analyzed": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -1773,6 +2248,11 @@ async def get_best_worst_performers(
     top_n: int = Query(10, ge=1, le=50),
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1792,14 +2272,22 @@ async def get_best_worst_performers(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND sr.date >= ${len(params)}"
+            date_filter += f" AND sr.date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND sr.date <= ${len(params)}"
+            date_filter += f" AND sr.date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
         
         # Different queries based on metric
         if metric == "occupancy":
@@ -1816,6 +2304,7 @@ async def get_best_worst_performers(
                 WHERE sr.workspace_id = $1
                   AND sr.person_count IS NOT NULL
                   {date_filter}
+                  {location_where}
                 GROUP BY sr.stream_id, sr.camera_name, sr.location
                 ORDER BY avg_occupancy DESC
             """
@@ -1833,6 +2322,7 @@ async def get_best_worst_performers(
                 FROM stream_results sr
                 WHERE sr.workspace_id = $1
                   {date_filter}
+                  {location_where}
                 GROUP BY sr.stream_id, sr.camera_name, sr.location
                 ORDER BY uptime_percentage DESC
             """
@@ -1849,6 +2339,7 @@ async def get_best_worst_performers(
                 FROM stream_results sr
                 WHERE sr.workspace_id = $1
                   {date_filter}
+                  {location_where}
                 GROUP BY sr.stream_id, sr.camera_name, sr.location
                 ORDER BY data_quality_score DESC
             """
@@ -1865,6 +2356,7 @@ async def get_best_worst_performers(
                 FROM stream_results sr
                 WHERE sr.workspace_id = $1
                   {date_filter}
+                  {location_where}
                 GROUP BY sr.stream_id, sr.camera_name, sr.location
                 ORDER BY fire_detection_rate ASC
             """
@@ -1901,7 +2393,16 @@ async def get_best_worst_performers(
             "metric": metric,
             "top_n": top_n,
             "top_performers": top_performers,
-            "worst_performers": list(reversed(worst_performers))
+            "worst_performers": list(reversed(worst_performers)),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            }
         }
         
     except HTTPException:
@@ -1910,6 +2411,7 @@ async def get_best_worst_performers(
         logger.error(f"Error in best/worst performers: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ==================== ADVANCED STATISTICAL ANALYTICS ====================
 
 @router.get("/statistics/correlation-analysis")
@@ -1917,6 +2419,11 @@ async def get_correlation_analysis(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -1936,14 +2443,22 @@ async def get_correlation_analysis(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         # Get time-series data for all cameras
         query = f"""
@@ -1956,6 +2471,7 @@ async def get_correlation_analysis(
                 WHERE workspace_id = $1
                   AND person_count IS NOT NULL
                   {date_filter}
+                  {location_where}
                 GROUP BY DATE_TRUNC('hour', timestamp), camera_name
             ),
             camera_pairs AS (
@@ -2000,6 +2516,15 @@ async def get_correlation_analysis(
         return {
             "success": True,
             "pairs_analyzed": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -2014,6 +2539,11 @@ async def get_variance_analysis(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -2033,14 +2563,22 @@ async def get_variance_analysis(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         query = f"""
             SELECT
@@ -2068,6 +2606,7 @@ async def get_variance_analysis(
             WHERE workspace_id = $1
               AND person_count IS NOT NULL
               {date_filter}
+              {location_where}
             GROUP BY stream_id, camera_name, location
             HAVING COUNT(*) >= 10
             ORDER BY coefficient_of_variation ASC
@@ -2097,6 +2636,15 @@ async def get_variance_analysis(
         return {
             "success": True,
             "cameras_analyzed": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -2111,6 +2659,11 @@ async def get_variance_analysis(
 @router.get("/realtime/current-occupancy")
 async def get_current_occupancy_dashboard(
     request: Request,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -2129,7 +2682,15 @@ async def get_current_occupancy_dashboard(
 
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
-        query = """
+        params = [workspace_id_obj]
+        param_count = 1
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+        
+        query = f"""
             WITH latest_data AS (
                 SELECT DISTINCT ON (sr.stream_id)
                     sr.stream_id,
@@ -2151,6 +2712,7 @@ async def get_current_occupancy_dashboard(
                 FROM stream_results sr
                 JOIN video_stream vs ON sr.stream_id = vs.stream_id
                 WHERE sr.workspace_id = $1
+                  {location_where}
                 ORDER BY sr.stream_id, sr.timestamp DESC
             )
             SELECT
@@ -2183,7 +2745,7 @@ async def get_current_occupancy_dashboard(
         """
         
         async with db_manager.get_connection() as conn:
-            results = await conn.fetch(query, workspace_id_obj)
+            results = await conn.fetch(query, *params)
             
         data = [{
             'stream_id': str(row['stream_id']),
@@ -2220,6 +2782,13 @@ async def get_current_occupancy_dashboard(
                 "cameras_in_alert": cameras_in_alert,
                 "cameras_with_fire": len([d for d in data if d['fire_status'] != 'no detection'])
             },
+            "filters_applied": {
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -2233,6 +2802,11 @@ async def get_current_occupancy_dashboard(
 async def get_live_alerts_feed(
     request: Request,
     minutes_back: int = Query(60, ge=1, le=1440),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -2251,7 +2825,15 @@ async def get_live_alerts_feed(
 
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
-        query = """
+        params = [workspace_id_obj, minutes_back]
+        param_count = 2
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+        
+        query = f"""
             WITH alert_events AS (
                 SELECT
                     sr.result_id,
@@ -2280,6 +2862,7 @@ async def get_live_alerts_feed(
                 WHERE sr.workspace_id = $1
                   AND sr.timestamp >= NOW() - ($2 || ' minutes')::INTERVAL
                   AND vs.alert_enabled = TRUE
+                  {location_where}
                   AND (
                       sr.fire_status != 'no detection'
                       OR (vs.count_threshold_greater IS NOT NULL AND sr.person_count > vs.count_threshold_greater)
@@ -2304,7 +2887,7 @@ async def get_live_alerts_feed(
         """
         
         async with db_manager.get_connection() as conn:
-            results = await conn.fetch(query, workspace_id_obj, minutes_back)
+            results = await conn.fetch(query, *params)
             
         data = [{
             'result_id': str(row['result_id']),
@@ -2324,6 +2907,13 @@ async def get_live_alerts_feed(
             "success": True,
             "minutes_back": minutes_back,
             "total_alerts": len(data),
+            "filters_applied": {
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -2333,6 +2923,7 @@ async def get_live_alerts_feed(
         logger.error(f"Error in live alerts feed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ==================== ALERT & NOTIFICATION ANALYTICS ====================
 
 @router.get("/alerts/effectiveness-metrics")
@@ -2340,6 +2931,11 @@ async def get_alert_effectiveness_metrics(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -2359,14 +2955,20 @@ async def get_alert_effectiveness_metrics(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND n.timestamp::date >= ${len(params)}"
+            date_filter += f" AND n.timestamp::date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND n.timestamp::date <= ${len(params)}"
+            date_filter += f" AND n.timestamp::date <= ${param_count}"
+        
+        # Note: notifications table doesn't have location fields, so we can't filter by location
+        # This endpoint focuses on alert effectiveness metrics regardless of location
             
         query = f"""
             SELECT
@@ -2414,6 +3016,11 @@ async def get_alert_effectiveness_metrics(
                 "unread_notifications": total_notifs - read_notifs,
                 "overall_read_rate": round((read_notifs / total_notifs * 100), 2) if total_notifs > 0 else 0
             },
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "note": "Location filters not applicable to notifications table"
+            },
             "data": data
         }
         
@@ -2430,6 +3037,11 @@ async def get_workspace_activity_summary(
     request: Request,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -2449,14 +3061,22 @@ async def get_workspace_activity_summary(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND date >= ${len(params)}"
+            date_filter += f" AND date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND date <= ${len(params)}"
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
             
         # Get comprehensive workspace stats
         query = f"""
@@ -2474,6 +3094,7 @@ async def get_workspace_activity_summary(
                 FROM stream_results
                 WHERE workspace_id = $1
                   {date_filter}
+                  {location_where}
             ),
             camera_stats AS (
                 SELECT
@@ -2518,6 +3139,15 @@ async def get_workspace_activity_summary(
         return {
             "success": True,
             "workspace_id": str(workspace_id_obj),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
@@ -2551,14 +3181,17 @@ async def get_user_engagement_metrics(
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
         params = [workspace_id_obj]
+        param_count = 1
         date_filter = ""
         
         if start_date:
+            param_count += 1
             params.append(start_date)
-            date_filter += f" AND created_at::date >= ${len(params)}"
+            date_filter += f" AND created_at::date >= ${param_count}"
         if end_date:
+            param_count += 1
             params.append(end_date)
-            date_filter += f" AND created_at::date <= ${len(params)}"
+            date_filter += f" AND created_at::date <= ${param_count}"
             
         # Get user activity stats
         query = f"""
@@ -2628,6 +3261,11 @@ async def get_user_engagement_metrics(
         return {
             "success": True,
             "total_users": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "note": "Location filters not applicable to user engagement metrics"
+            },
             "data": data
         }
         
@@ -2642,6 +3280,11 @@ async def get_user_engagement_metrics(
 @router.get("/executive/summary")
 async def get_executive_summary(
     request: Request,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -2660,8 +3303,16 @@ async def get_executive_summary(
 
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
+        params = [workspace_id_obj]
+        param_count = 1
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+        
         # Get comprehensive executive summary
-        query = """
+        query = f"""
             WITH current_month AS (
                 SELECT
                     AVG(person_count) AS avg_occupancy,
@@ -2671,6 +3322,7 @@ async def get_executive_summary(
                 FROM stream_results
                 WHERE workspace_id = $1
                   AND date >= DATE_TRUNC('month', CURRENT_DATE)
+                  {location_where}
             ),
             previous_month AS (
                 SELECT
@@ -2681,6 +3333,7 @@ async def get_executive_summary(
                 WHERE workspace_id = $1
                   AND date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
                   AND date < DATE_TRUNC('month', CURRENT_DATE)
+                  {location_where}
             ),
             camera_health AS (
                 SELECT
@@ -2723,7 +3376,7 @@ async def get_executive_summary(
         """
         
         async with db_manager.get_connection() as conn:
-            result = await conn.fetchrow(query, workspace_id_obj)
+            result = await conn.fetchrow(query, *params)
             
         data = {
             'occupancy_metrics': {
@@ -2759,6 +3412,13 @@ async def get_executive_summary(
         return {
             "success": True,
             "generated_at": datetime.now().isoformat(),
+            "filters_applied": {
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
             "data": data
         }
         
