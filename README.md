@@ -110,7 +110,7 @@ POST /camera/cameras/bulk-location-assignment  # Bulk assign
 ### Environment Variables
 ```bash
 # Database
-DATABASE_URL=postgresql://user:pass@host:5432/db
+DATABASE_URL=postgresql://user:pass@host:6432/db
 
 # Models
 PEOPLE_MODEL_PATH=yolov8n.pt

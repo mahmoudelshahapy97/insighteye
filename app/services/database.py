@@ -35,7 +35,7 @@ def validate_db_config(config: Dict[str, Any]) -> None:
         if key not in config['database'] and not os.environ.get(f"DB_{key.upper()}"):
             raise ValueError(f"Missing database configuration for '{key}'")
     try:
-        port = config['database'].get('port', os.environ.get('DB_PORT', '5432'))
+        port = config['database'].get('port', os.environ.get('DB_PORT', '6432'))
         int(port)  # Ensure port is a valid integer
     except ValueError:
         raise ValueError("Database port must be a valid integer")
@@ -71,18 +71,18 @@ async def init_db_pool(
         
         # Get configuration with optimized defaults
         DB_HOST = config['database'].get('host', os.environ.get('DB_HOST', 'localhost'))
-        DB_PORT = int(config['database'].get('port', os.environ.get('DB_PORT', '5432')))
+        DB_PORT = int(config['database'].get('port', os.environ.get('DB_PORT', '6432')))
         POSTGRES_DB = config['database'].get('dbname', os.environ.get('POSTGRES_DB', 'appdb'))
         DB_USER = config['database'].get('user', os.environ.get('POSTGRES_USER', 'postgres'))
         POSTGRES_PASSWORD = config['database'].get('password', os.environ.get('POSTGRES_PASSWORD', 'postgres'))
         
         # Optimized pool settings for remote database
-        min_size = min_connections or int(os.environ.get('DB_MIN_POOL_SIZE', '10'))
-        max_size = max_connections or int(os.environ.get('DB_MAX_POOL_SIZE', '50'))
+        min_size = min_connections or int(os.environ.get('DB_MIN_POOL_SIZE', '50'))
+        max_size = max_connections or int(os.environ.get('DB_MAX_POOL_SIZE', '200'))
         
         # Connection timeout settings
-        timeout = float(os.environ.get('DB_TIMEOUT', '30.0'))
-        command_timeout = float(os.environ.get('DB_COMMAND_TIMEOUT', '60.0'))
+        timeout = float(os.environ.get('DB_TIMEOUT', '10.0'))
+        command_timeout = float(os.environ.get('DB_COMMAND_TIMEOUT', '30.0'))
 
         logger.info(f"Attempting to connect to PostgreSQL at {DB_HOST}:{DB_PORT}/{POSTGRES_DB}")
         logger.info(f"Pool configuration: min={min_size}, max={max_size}, timeout={timeout}s")
@@ -96,15 +96,17 @@ async def init_db_pool(
             min_size=min_size,
             max_size=max_size,
             max_queries=50000,  # Maximum queries per connection before recycling
-            max_inactive_connection_lifetime=3600.0,  # Recycle idle connections after 1 hour
+            max_inactive_connection_lifetime=1800.0,  # Recycle idle connections after 30 minutes
             timeout=timeout,  # Connection acquire timeout
             command_timeout=command_timeout,  # Query execution timeout
             init=setup_asyncpg_connection,
             setup=setup_asyncpg_connection_types,
+            statement_cache_size=0,  # Disable prepared statements for PgBouncer
             # Server settings for each connection
             server_settings={
                 'application_name': 'insighteye_camera_streams',
-                'jit': 'off',  # Disable JIT for faster connection setup
+                # 'jit': 'off',  # Disable JIT for faster connection setup
+                # 'statement_timeout': '30s', 
             }
         )
         

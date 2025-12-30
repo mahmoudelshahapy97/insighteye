@@ -44,6 +44,91 @@ class WorkspaceQuotaExceeded(Exception):
     """Raised when workspace stream quota is exceeded."""
     pass
 
+class StreamStatusBatcher:
+    """Batches stream status updates to reduce database load"""
+    
+    def __init__(self, db_manager, batch_interval: float = 5.0):
+        self.db_manager = db_manager
+        self.batch_interval = batch_interval
+        self.pending_updates: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+        self._task: Optional[asyncio.Task] = None
+        
+    async def start(self):
+        """Start the batch worker"""
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._batch_worker())
+            logger.info("StreamStatusBatcher started")
+    
+    async def stop(self):
+        """Stop the batch worker"""
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+    
+    async def queue_update(self, stream_id: UUID, status: str, is_streaming: bool):
+        """Queue a status update"""
+        async with self._lock:
+            self.pending_updates[str(stream_id)] = {
+                'status': status,
+                'is_streaming': is_streaming,
+                'updated_at': datetime.now(ZoneInfo("Africa/Cairo"))
+            }
+    
+    async def _batch_worker(self):
+        """Flush updates every N seconds"""
+        while True:
+            try:
+                await asyncio.sleep(self.batch_interval)
+                
+                async with self._lock:
+                    if not self.pending_updates:
+                        continue
+                    
+                    updates = list(self.pending_updates.items())
+                    self.pending_updates.clear()
+                
+                # Execute batch update
+                try:
+                    await self._execute_batch_update(updates)
+                except Exception as e:
+                    logger.error(f"Batch update failed: {e}")
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in batch worker: {e}")
+                await asyncio.sleep(1)
+    
+    async def _execute_batch_update(self, updates: List[Tuple[str, Dict]]):
+        """Single query to update multiple streams"""
+        if not updates:
+            return
+        
+        # Build VALUES list
+        values_list = []
+        for stream_id_str, data in updates:
+            values_list.append(
+                f"('{stream_id_str}'::uuid, '{data['status']}', {data['is_streaming']}, '{data['updated_at'].isoformat()}'::timestamptz)"
+            )
+        
+        query = f"""
+            UPDATE video_stream
+            SET 
+                status = batch.status,
+                is_streaming = batch.is_streaming,
+                updated_at = batch.updated_at,
+                last_activity = batch.updated_at
+            FROM (VALUES {','.join(values_list)}) AS batch(stream_id, status, is_streaming, updated_at)
+            WHERE video_stream.stream_id = batch.stream_id
+        """
+        
+        await self.db_manager.execute_query(query)
+        logger.debug(f"✅ Batched {len(updates)} status updates")
+
 
 class StreamManager:
     """
@@ -56,6 +141,7 @@ class StreamManager:
         self.video_file_manager = video_file_manager
         self.qdrant_service = qdrant_service
         self.retry_service = retry_service
+        self.status_batcher = StreamStatusBatcher(self.db_manager, batch_interval=5.0)
         
         # Service dependencies
         self.fire_service = fire_detection_service
@@ -1300,6 +1386,9 @@ class StreamManager:
             
             # Existing tasks
             await self._start_background_tasks_internal()
+
+            # Start status batcher
+            await self.status_batcher.start()
             
             # NEW: Start retry loop
             self.retry_task = asyncio.create_task(self._retry_loop())
@@ -1821,66 +1910,48 @@ class StreamManager:
 
                 # ==================== STEP 5: Execute Start Tasks ====================
                 if start_tasks:
-                    logger.info(
-                        f"🚀 Starting {len(start_tasks)} cameras in batches..."
+                    logger.info(f"🚀 Starting {len(start_tasks)} cameras in PARALLEL...")
+                    
+                    # CRITICAL FIX: Start ALL cameras at once using asyncio.gather
+                    batch_coros = [task for _, task in start_tasks]
+                    
+                    # Start all cameras simultaneously
+                    results = await asyncio.gather(
+                        *batch_coros, 
+                        return_exceptions=True
                     )
                     
-                    batch_size = config.get("stream_start_batch_size", 10)
-                    for i in range(0, len(start_tasks), batch_size):
-                        batch = start_tasks[i:i + batch_size]
-                        batch_stream_ids = [sid for sid, _ in batch]
-                        batch_coros = [task for _, task in batch]
-                        
-                        logger.info(
-                            f"📦 Processing batch {i//batch_size + 1}: "
-                            f"{len(batch)} cameras"
-                        )
-                        
-                        results = await asyncio.gather(
-                            *batch_coros, 
-                            return_exceptions=True
-                        )
-                        
-                        # Log results
-                        for idx, (stream_id, result) in enumerate(zip(batch_stream_ids, results)):
-                            if isinstance(result, Exception):
-                                logger.error(
-                                    f"❌ Failed to start {stream_id}: {result}", 
-                                    exc_info=result
-                                )
-                                
-                                # Determine error type and record
-                                if isinstance(result, ConnectionError):
-                                    stop_reason = 'connection_error'
-                                elif isinstance(result, TimeoutError):
-                                    stop_reason = 'timeout'
-                                else:
-                                    stop_reason = 'system_error'
-                                
-                                # Record the failure (retry_service will pick it up)
-                                try:
-                                    await self.video_stream_service.record_camera_stop(
-                                        stream_id=stream_id,
-                                        stop_reason=stop_reason,
-                                        stopped_by=None,
-                                        additional_context=str(result)
-                                    )
-                                except Exception as record_err:
-                                    logger.error(
-                                        f"Error recording stop for {stream_id}: {record_err}"
-                                    )
+                    # Log results
+                    for idx, (stream_id, result) in enumerate(zip([sid for sid, _ in start_tasks], results)):
+                        if isinstance(result, Exception):
+                            logger.error(f"❌ Failed to start {stream_id}: {result}")
+                            
+                            # Determine error type
+                            if isinstance(result, ConnectionError):
+                                stop_reason = 'connection_error'
+                            elif isinstance(result, TimeoutError):
+                                stop_reason = 'timeout'
                             else:
-                                logger.info(f"✅ Successfully started {stream_id}")
-                        
-                        # Small delay between batches
-                        if i + batch_size < len(start_tasks):
-                            await asyncio.sleep(2)
+                                stop_reason = 'system_error'
+                            
+                            # Record failure (retry_service will pick it up)
+                            try:
+                                await self.video_stream_service.record_camera_stop(
+                                    stream_id=stream_id,
+                                    stop_reason=stop_reason,
+                                    stopped_by=None,
+                                    additional_context=str(result)
+                                )
+                            except Exception as record_err:
+                                logger.error(f"Error recording stop for {stream_id}: {record_err}")
+                        else:
+                            logger.info(f"✅ Successfully started {stream_id}")
                 else:
                     logger.info("✅ No cameras need starting")
-
+                    
                 # ==================== STEP 6: Cleanup ====================
                 # Cleanup empty shared streams
-                self.video_file_manager.cleanup_empty_streams()
+                await self.video_file_manager.cleanup_empty_streams()
 
                 # ==================== STEP 7: Health Check ====================
                 current_time = datetime.now(ZoneInfo("Africa/Cairo"))
@@ -2251,19 +2322,6 @@ class StreamManager:
                     stats['detection_count'] += 1
                 stats['last_updated'] = current_time
 
-    def get_shared_stream(self, source: str):
-        """Get shared stream for a source."""
-        return self.video_file_manager.get_shared_stream(source, max_subscribers=10)
-    
-    def create_shared_stream(self, source: str, owner_username: str, stream_id: UUID):
-        """Create and register a shared stream."""
-        shared_stream = self.video_file_manager.get_shared_stream(source, max_subscribers=10)
-        return shared_stream
-    
-    def remove_shared_stream(self, source: str):
-        """Remove a shared stream."""
-        self.video_file_manager.remove_shared_stream(source)
-
     # ==================== Notification Management ====================
 
     async def subscribe_to_notifications(
@@ -2466,7 +2524,7 @@ class StreamManager:
         
         # Stop shared streams
         for source in list(self.video_file_manager.shared_streams.keys()):
-            self.video_file_manager.remove_shared_stream(source)
+            await self.video_file_manager.remove_shared_stream(source)
         
         logging.info("✅ StreamManager shutdown complete")
 

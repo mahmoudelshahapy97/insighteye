@@ -502,63 +502,102 @@ class StreamProcessingService:
                 threshold_type = "less_than"
             
             if not threshold_type:
+                logger.debug(f"No threshold violated for stream {stream_id_str}")
                 return
             
             # Check cooldown
             should_notify = False
             if not alert_state:
                 should_notify = True
+                logger.info(f"First people count alert for stream {stream_id_str}")
             else:
                 last_notification = alert_state.get("last_notification_time")
                 if last_notification:
                     time_since_last = (current_time - last_notification).total_seconds() / 60
                     if time_since_last >= cooldown_minutes:
                         should_notify = True
+                        logger.info(
+                            f"Cooldown expired for stream {stream_id_str}: "
+                            f"{time_since_last:.1f} min since last alert"
+                        )
+                    else:
+                        logger.info(
+                            f"Cooldown active for stream {stream_id_str}: "
+                            f"{time_since_last:.1f}/{cooldown_minutes} min"
+                        )
                 else:
                     should_notify = True
+                    logger.info(f"No previous notification time for stream {stream_id_str}")
             
             if should_notify:
-                message = f"People count alert: {person_count} people detected (threshold: {threshold_type})"
-                
-                # ✅ Create notification
-                notification = await notification_service.create_notification(
-                    workspace_id=workspace_id,
-                    user_id=owner_id,
-                    status="unread",
-                    message=message,
-                    stream_id=stream_id,
-                    camera_name=camera_name
+                # Build alert message
+                threshold_desc = f">{greater_than}" if threshold_type == "greater_than" else f"<{less_than}"
+                message = (
+                    f"⚠️ People count alert: {person_count} people detected "
+                    f"(threshold: {threshold_desc}) at camera '{camera_name}'"
                 )
-
-                # ✅ CRITICAL: Broadcast to WebSocket clients
-                if notification and self.stream_manager:
-                    formatted_notification = {
-                        "type": "new_notification",
-                        "notification": {
-                            "id": str(notification.get("notification_id")),
-                            "user_id": str(notification.get("user_id")),
-                            "workspace_id": str(notification.get("workspace_id")),
-                            "stream_id": str(notification.get("stream_id")) if notification.get("stream_id") else None,
-                            "camera_name": notification.get("camera_name"),
-                            "status": notification.get("status"),
-                            "message": notification.get("message"),
-                            "timestamp": notification.get("timestamp").timestamp() if notification.get("timestamp") else None,
-                            "read": notification.get("is_read", False)
-                        }
-                    }
-                    
-                    await self.stream_manager.broadcast_notification(
-                        str(owner_id),
-                        formatted_notification
-                    )
-                    logger.info(f"✅ Broadcasted people count notification to user {owner_id}")
-
-                # ✅ FIX: Fetch user email and send email
+                
+                logger.warning(f"🚨 PEOPLE COUNT ALERT: {message}")
+                
+                # ✅ Create notification in database
                 try:
-                    user_info  = await user_manager.get_user_by_id(owner_id)
-                    if user_info and 'email' in user_info:
-                        user_email = user_info["email"]
+                    notification = await notification_service.create_notification(
+                        workspace_id=workspace_id,
+                        user_id=owner_id,
+                        status="urgent",  # Changed from "unread" to "urgent"
+                        message=message,
+                        stream_id=stream_id,
+                        camera_name=camera_name
+                    )
+                    
+                    if notification:
+                        logger.info(f"✅ Notification created: {notification.get('notification_id')}")
+                    else:
+                        logger.error(f"❌ Failed to create notification in database")
+                        
+                except Exception as notif_err:
+                    logger.error(f"❌ Error creating notification: {notif_err}", exc_info=True)
 
+                # ✅ Broadcast to WebSocket clients
+                if notification and self.stream_manager:
+                    try:
+                        formatted_notification = {
+                            "type": "new_notification",
+                            "notification": {
+                                "id": str(notification.get("notification_id")),
+                                "user_id": str(notification.get("user_id")),
+                                "workspace_id": str(notification.get("workspace_id")),
+                                "stream_id": str(notification.get("stream_id")) if notification.get("stream_id") else None,
+                                "camera_name": notification.get("camera_name"),
+                                "status": notification.get("status"),
+                                "message": notification.get("message"),
+                                "timestamp": notification.get("timestamp").timestamp() if notification.get("timestamp") else current_time.timestamp(),
+                                "read": notification.get("is_read", False)
+                            }
+                        }
+                        
+                        await self.stream_manager.broadcast_notification(
+                            str(owner_id),
+                            formatted_notification
+                        )
+                        logger.info(f"✅ Broadcasted people count notification to user {owner_id}")
+                        
+                    except Exception as ws_err:
+                        logger.error(f"❌ Error broadcasting notification: {ws_err}", exc_info=True)
+
+                # ✅ FIX: Fetch user email and send email with proper await
+                try:
+                    user_info = await user_manager.get_user_by_id(owner_id)
+                    
+                    if not user_info:
+                        logger.error(f"❌ User {owner_id} not found, cannot send email")
+                    elif 'email' not in user_info:
+                        logger.error(f"❌ User {owner_id} has no email address")
+                    else:
+                        user_email = user_info["email"]
+                        logger.info(f"📧 Preparing to send email to {user_email}")
+
+                        # Get stream info for location
                         stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
                         location_info = None
                         if stream_info:
@@ -571,32 +610,55 @@ class StreamProcessingService:
                                 'latitude': stream_info.get('latitude'),
                                 'longitude': stream_info.get('longitude')
                             }
+                            logger.debug(f"Location info: {location_info}")
 
-                        # ✅ FIXED: Properly await email sending
-                        await send_people_count_alert_email(
+                        # ✅ CRITICAL FIX: Add await here!
+                        email_success = await send_people_count_alert_email(
                             user_email=user_email,
                             camera_name=camera_name,
                             person_count=person_count,
-                            threshold_settings=threshold_settings,
+                            threshold_settings={
+                                "greater_than": greater_than,
+                                "less_than": less_than,
+                                "alert_enabled": threshold_settings.get("alert_enabled", True)
+                            },
                             location_info=location_info
                         )
-                        logger.info(f"✅ People count alert email sent to {user_email}")
+                        
+                        if email_success:
+                            logger.info(f"✅ People count alert email sent to {user_email}")
+                        else:
+                            logger.warning(f"⚠️ Failed to send email to {user_email} (may be rate-limited)")
 
                 except Exception as email_error:
-                    logger.error(f"❌ Error sending people count alert email: {email_error}", exc_info=True)
+                    logger.error(
+                        f"❌ Error sending people count alert email: {email_error}", 
+                        exc_info=True
+                    )
 
-                # Update alert state
-                await people_count_service.create_or_update_people_count_alert_state(
-                    stream_id=stream_id,
-                    last_count=person_count,
-                    last_threshold_type=threshold_type,
-                    last_notification_time=current_time
+                # ✅ Update alert state in database
+                try:
+                    await people_count_service.create_or_update_people_count_alert_state(
+                        stream_id=stream_id,
+                        last_count=person_count,
+                        last_threshold_type=threshold_type,
+                        last_notification_time=current_time
+                    )
+                    logger.info(f"✅ Updated people count alert state for stream {stream_id_str}")
+                    
+                except Exception as state_err:
+                    logger.error(f"❌ Error updating alert state: {state_err}", exc_info=True)
+                
+                logger.info(
+                    f"✅ People count alert completed for stream {stream_id_str}: "
+                    f"count={person_count}, threshold={threshold_desc}"
                 )
-                
-                logger.info(f"People count alert sent for stream {stream_id_str}")
-                
+                    
         except Exception as e:
-            logger.error(f"Error handling people count alert: {e}", exc_info=True)
+            logger.error(
+                f"❌ Error handling people count alert for stream {stream_id_str}: {e}", 
+                exc_info=True
+            )
 
     async def _handle_fire_detection_alert(
         self,
@@ -828,10 +890,10 @@ class StreamProcessingService:
                     f"frame_delay={frame_delay_target}, conf={conf_threshold}")
             
             # Get or create shared stream
-            shared_stream = self.video_file_manager.get_shared_stream(source)
+            shared_stream = await self.video_file_manager.get_shared_stream(source)
             
             # Add this stream as a subscriber
-            if not shared_stream.add_subscriber(stream_id_str):
+            if not await shared_stream.add_subscriber(stream_id_str):
                 logger.error(f"Failed to add subscriber {stream_id_str} to shared stream")
                 # DON'T update database here - let caller handle it
                 raise RuntimeError(f"Failed to subscribe to shared stream for {source}")
@@ -850,7 +912,7 @@ class StreamProcessingService:
                         last_heartbeat = current_time
                     
                     # Wait for frame
-                    if not shared_stream.wait_for_frame(timeout=10.0):
+                    if not await shared_stream.wait_for_frame(timeout=10.0):
                         consecutive_failures += 1
                         
                         if consecutive_failures % 3 == 0:
@@ -865,7 +927,7 @@ class StreamProcessingService:
                         continue
                     
                     # Get frame
-                    frame = shared_stream.get_latest_frame(stream_id_str)
+                    frame = await shared_stream.get_latest_frame(stream_id_str)
                     
                     if frame is None or frame.size == 0:
                         consecutive_failures += 1
@@ -974,9 +1036,13 @@ class StreamProcessingService:
                                                 
                         logger.debug(f"📊 Periodic update: {stream_id_str} -> status=active, is_streaming=TRUE")
                         try:
-                            await video_stream_service.update_stream_status(
-                                stream_id, "active", is_streaming=True, last_activity=current_time  
-                            )
+                            # await video_stream_service.update_stream_status(
+                            #     stream_id, "active", is_streaming=True, last_activity=current_time  
+                            # )
+                            if self.stream_manager:
+                                await self.stream_manager.status_batcher.queue_update(
+                                    stream_id, "active", True
+                                )
 
                         except Exception as e:
                             logger.error(f"Error in periodic DB update for {stream_id_str}: {e}")
@@ -1034,13 +1100,13 @@ class StreamProcessingService:
                 error_context=str(e)
             )
             raise
-        
+
         finally:
             # Cleanup
             logger.info(f"Cleaning up stream {stream_id_str}. Total frames: {frame_count}")
             
             if shared_stream:
-                shared_stream.remove_subscriber(stream_id_str)
+                await shared_stream.remove_subscriber(stream_id_str)
                 logger.info(f"Removed subscriber {stream_id_str} from shared stream")
             
             # Clear cache
@@ -1073,12 +1139,12 @@ class StreamProcessingService:
                     logger.error(f"Stream {stream_id_str} not found in database during cleanup")
                     return
                 
-                # If user stopped it, don't touch the database!
-                if db_check['stop_reason'] == 'user_action' and db_check['is_streaming'] == False:
+                # ✅ CRITICAL FIX: If user stopped it, don't touch the database AT ALL!
+                if db_check['stop_reason'] == 'user_action':
                     logger.info(
                         f"✅ Stream {stream_id_str} was user-stopped "
-                        f"(stop_reason='user_action', is_streaming=FALSE). "
-                        f"Skipping database update in finally block."
+                        f"(stop_reason='user_action', is_streaming={db_check['is_streaming']}). "
+                        f"Skipping ALL database operations in finally block."
                     )
                     return
                 
@@ -1086,19 +1152,38 @@ class StreamProcessingService:
                 # still don't touch it (might be workspace disabled, etc)
                 if db_check['is_streaming'] == False:
                     logger.info(
-                        f"✅ Stream {stream_id_str} already marked is_streaming=FALSE in database. "
-                        f"Skipping database update."
+                        f"✅ Stream {stream_id_str} already marked is_streaming=FALSE in database "
+                        f"(stop_reason={db_check['stop_reason']}). Skipping database update."
                     )
                     return
+                
+                # ✅ NEW CHECK: If stop event was set gracefully (like from stop API)
+                # Check if database was already updated by the API call
+                if stop_event.is_set():
+                    # Double-check database - API might have already updated it
+                    current_db_state = await video_stream_service.db_manager.execute_query(
+                        "SELECT stop_reason, is_streaming FROM video_stream WHERE stream_id = $1",
+                        (stream_id,),
+                        fetch_one=True
+                    )
+                    
+                    if current_db_state and current_db_state['stop_reason'] == 'user_action':
+                        logger.info(
+                            f"✅ Stop event set AND database shows user_action. "
+                            f"API already handled database update. Skipping."
+                        )
+                        return
                 
                 # Only update database if:
                 # 1. is_streaming=TRUE (stream should still be running but crashed)
                 # 2. stop_reason != 'user_action'
+                # 3. NOT gracefully stopped by API
+                
                 if stop_event.is_set():
-                    # Graceful stop (but not user-initiated)
+                    # Graceful stop (but not user-initiated based on checks above)
                     logger.info(
                         f"Stream {stream_id_str} stopped gracefully (system-initiated). "
-                        f"Recording stop but keeping is_streaming=TRUE for potential retry."
+                        f"Recording as system_error to allow retry."
                     )
                     
                     await video_stream_service.record_camera_stop(
@@ -1111,7 +1196,14 @@ class StreamProcessingService:
                     # Unexpected termination
                     logger.warning(
                         f"⚠️ Stream {stream_id_str} ended unexpectedly. "
-                        f"Retry already scheduled by exception handler."
+                        f"Recording as system_error."
+                    )
+                    
+                    await video_stream_service.record_camera_stop(
+                        stream_id=stream_id,
+                        stop_reason='system_error',
+                        stopped_by=None,
+                        additional_context="Stream ended unexpectedly"
                     )
                 
             except Exception as e:
@@ -1164,14 +1256,18 @@ class StreamProcessingService:
                         
                         # CRITICAL: Always explicitly set is_streaming=True
                         current_time = datetime.now(ZoneInfo("Africa/Cairo"))
-                        success = await video_stream_service.update_stream_status(
-                            UUID(stream_id_str), 'active', is_streaming=True, last_activity=current_time
-                        )
+                        # success = await video_stream_service.update_stream_status(
+                        #     UUID(stream_id_str), 'active', is_streaming=True, last_activity=current_time
+                        # )
+                        if self.stream_manager:
+                            await self.stream_manager.status_batcher.queue_update(
+                                UUID(stream_id_str), "active", True
+                            )
                         
-                        if not success:
-                            logger.error(f"Failed to update DB status for {stream_id_str}")
-                            # DON'T set is_streaming=False on error!
-                            # Just log and continue processing
+                        # if not success:
+                        #     logger.error(f"Failed to update DB status for {stream_id_str}")
+                        #     # DON'T set is_streaming=False on error!
+                        #     # Just log and continue processing
                             
                     except Exception as e:
                         logger.error(f"Exception updating DB status for {stream_id_str}: {e}")

@@ -100,7 +100,7 @@ database:
   user: "insighteye_user"
   password: "insighteye*+#@"
   host: "172.31.25.133"
-  port: "5432"
+  port: "6432"
 
   # Connection Pool Settings (optimized for 50+ cameras)
   min_pool_connections: 10   # Minimum connections to keep alive
