@@ -57,6 +57,7 @@ ALGORITHM: HS256 #seconds
 session_timeout: 600 #seconds
 # secrets.token_urlsafe(32)
 SECRET_KEY: e20d4027c260b6452f7607db8e7e4d02994d65a67d245665ba597e1d374cc2b4
+
 people_model_path: "models/people.pt"
 gender_model_path: "models/gender.pt"
 fire_model_path: "models/fire.pt"
@@ -91,6 +92,9 @@ elasticsearch_version: 8
 
 session_id: "2gXz1vQjW7-M6XsHwZp9D1BEXyL3oAqVfJbYK9t5U2c"
 
+# =============================================================================
+# DATABASE CONFIGURATION - OPTIMIZED FOR REMOTE POSTGRESQL
+# =============================================================================
 database:
   dbname: "insighteye_db"
   user: "insighteye_user"
@@ -98,12 +102,67 @@ database:
   host: "172.31.25.133"
   port: "5432"
 
+  # Connection Pool Settings (optimized for 50+ cameras)
+  min_pool_connections: 10   # Minimum connections to keep alive
+  max_pool_connections: 50   # Maximum connections in pool
+  
+  # Timeouts (in seconds)
+  connection_timeout: 30.0    # Time to wait for connection acquisition
+  command_timeout: 60.0       # Query execution timeout
+  idle_timeout: 600.0         # Close idle connections after 10 minutes
+  
+  # Connection recycling
+  max_queries_per_connection: 50000  # Recycle connection after this many queries
+  max_inactive_lifetime: 3600.0      # Recycle idle connections after 1 hour
+  
+  # Health check
+  health_check_interval: 60   # Check connection health every 60s
+  
+  # Retry settings
+  max_retries: 10
+  retry_delay_base: 2         # Base delay for exponential backoff
+  retry_delay_max: 30         # Maximum retry delay
+
 server_host: "127.0.0.1"
 server_port: 8000
 fastapi_root_path: "/insighteye"
 
+# =============================================================================
+# STREAM MANAGEMENT - OPTIMIZED FOR HIGH CONCURRENCY
+# =============================================================================
 stream_cleanup_interval_seconds: 60.0
+STREAM_HEALTHCHECK_INTERVAL_SECONDS: 120
+STREAM_STALE_THRESHOLD_SECONDS: 300 
+STREAM_START_STAGGER_DELAY: 2.0
+SHARED_STREAM_FRAME_WAIT_TIMEOUT: 15.0 
 
+# Management loop settings
+stream_management_loop_interval: 30.0   # Run management loop every 30s
+stream_batch_update_size: 50            # Update this many streams at once
+max_concurrent_stream_starts: 10
+
+# Database update frequency
+stream_db_activity_update_interval_seconds: 5.0  # More frequent DB updates
+
+# Stream reconnection
+stream_reconnect_delay_base_seconds: 1.0
+stream_reconnect_delay_frame_read_seconds: 2.0
+max_consecutive_frame_failures: 15  # Reduced threshold
+
+
+# =============================================================================
+# RTSP-SPECIFIC SETTINGS
+# =============================================================================
+RTSP_CONNECTION_TIMEOUT: 30  # seconds
+RTSP_READ_TIMEOUT: 30  # seconds
+RTSP_RECONNECT_ATTEMPTS: 10  # More attempts for network streams
+RTSP_TRANSPORT: "tcp"  # "tcp" or "udp" - TCP is more reliable
+RTSP_BUFFER_SIZE: 1  # Keep small for low latency
+stream_max_reconnect_attempts: 5
+
+# =============================================================================
+# VIDEO FILE SETTINGS
+# =============================================================================
 models:
   cache_dir: ./model_cache
   device: cuda
@@ -132,82 +191,47 @@ prompts:
 
 max_history_length: 100
 
-# Add random delay to prevent simultaneous access
+# Video file access control
 file_access_jitter_seconds: 2.0
-
-# Improved buffer settings
-cv_frame_buffer_size: 1  
-
-# Maximum concurrent streams per file
 max_streams_per_file: 2
+file_access_timeout_seconds: 10.0
+prevent_duplicate_file_streams: True
+
+# Video stream sharing
+enable_stream_sharing: True
 shared_stream_buffer_size: 3
 shared_stream_timeout_seconds: 30.0
-
-frame_skip: 300  # Reduced from 2
-
-# Shorter delays and timeouts
-stream_reconnect_delay_base_seconds: 1.0
-stream_reconnect_delay_frame_read_seconds: 2.0
-max_consecutive_frame_failures: 15  # Reduced threshold
-
-
-# Prevent multiple streams from same file
-prevent_duplicate_file_streams: True
-file_access_timeout_seconds: 10.0
-
-# Enable stream sharing for same source
-enable_stream_sharing: True
-
-# Performance settings
 shared_stream_max_fps: 30
-video_file_manager_cleanup_interval: 300  # 5 minutes
-
-# Error handling
-shared_stream_reconnect_delay: 2.0
-shared_stream_max_reconnect_attempts: 5
-stream_max_reconnect_attempts: 3
-
-# Memory management
 max_shared_streams: 50
 shared_stream_memory_limit_mb: 100
+shared_stream_reconnect_delay: 2.0
+shared_stream_max_reconnect_attempts: 5
+
+# Frame processing
+cv_frame_buffer_size: 1  
+frame_skip: 300  # Reduced from 2
+
+# Video file management
+video_loop_on_end: true
+video_validation_enabled: true
+max_video_restart_attempts: 10
+video_file_manager_cleanup_interval: 300  # 5 minutes
+validate_video_files_before_processing: true
+video_file_validation_timeout: 10.0
+video_loop_enabled: true
+video_restart_on_end: true
+short_video_optimization: true
+
+# Performance settings
+yolo_max_input_dim: 640  # Reduced for better performance
+stream_stop_timeout_seconds: 10.0
+stream_stale_threshold_seconds: 45.0
+stream_manager_poll_interval_seconds: 2.0
 
 # Debugging
 log_shared_stream_stats: true
 log_shared_stream_stats_interval: 30
 
-video_loop_on_end: true
-video_validation_enabled: true
-max_video_restart_attempts: 10
-
-# Timeouts
-stream_stop_timeout_seconds: 10.0
-stream_stale_threshold_seconds: 45.0
-stream_manager_poll_interval_seconds: 2.0
-
-# File validation
-validate_video_files_before_processing: true
-video_file_validation_timeout: 10.0
-
-# Performance
-yolo_max_input_dim: 640  # Reduced for better performance
-stream_db_activity_update_interval_seconds: 5.0  # More frequent DB updates
-
-# Video-specific settings
-video_loop_enabled: true
-video_restart_on_end: true
-short_video_optimization: true
-
+# Alerts
 people_count_cooldown_duration_seconds: 300
 enable_people_count_email_alerts: true
-
-STREAM_HEALTHCHECK_INTERVAL_SECONDS: 120
-STREAM_STALE_THRESHOLD_SECONDS: 300 
-STREAM_START_STAGGER_DELAY: 2.0
-SHARED_STREAM_FRAME_WAIT_TIMEOUT: 15.0 
-
-# RTSP-specific settings
-RTSP_CONNECTION_TIMEOUT: 30  # seconds
-RTSP_READ_TIMEOUT: 30  # seconds
-RTSP_RECONNECT_ATTEMPTS: 10  # More attempts for network streams
-RTSP_TRANSPORT: "tcp"  # "tcp" or "udp" - TCP is more reliable
-RTSP_BUFFER_SIZE: 1  # Keep small for low latency
