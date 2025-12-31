@@ -1492,101 +1492,91 @@ class StreamManager:
 
     async def _stop_stream(self, stream_id_str: str, for_restart: bool = False):
         """
-        Internal stream stop with cleanup.
-        
-        CRITICAL: This function does NOT change is_streaming anymore!
-        The database should already be updated by the caller.
+        Stop stream with thorough cleanup.
+        FIXED: Always removes from active_streams, even if not found initially.
         """
+        logger.info(f"🛑 Stopping stream {stream_id_str} (for_restart={for_restart})")
+        
         # Transition to STOPPING state
         await self._transition_stream_state(stream_id_str, StreamState.STOPPING, force=True)
         
+        # Get stream info before removing
         async with self._lock:
-            stream_info = self.active_streams.pop(stream_id_str, None)
-            
-            # Clean up workspace registry
-            if stream_id_str in self.stream_workspaces:
-                workspace_id_str = self.stream_workspaces.pop(stream_id_str)
-                if workspace_id_str in self.workspace_streams:
-                    self.workspace_streams[workspace_id_str].discard(stream_id_str)
+            stream_info = self.active_streams.get(stream_id_str)
         
-        if not stream_info:
-            logger.debug(f"Stream {stream_id_str} not in memory, skipping cleanup")
-            await self._transition_stream_state(stream_id_str, StreamState.INACTIVE, force=True)
-            return
-
-        stream_uuid = UUID(stream_id_str)
-        stop_event_obj = stream_info.get('stop_event')
-        task_obj = stream_info.get('task')
-        workspace_id = stream_info.get('workspace_id')
-        camera_name = stream_info.get('camera_name', 'Unknown Camera')
-        source = stream_info.get('source')
-
-        # Clean up shared stream registry
-        if source:
-            self._shared_stream_registry[source].discard(stream_id_str)
-            if not self._shared_stream_registry[source]:
-                del self._shared_stream_registry[source]
-
-        # Clean up state 
-        self.fire_detection_states.pop(stream_id_str, None)
-        self.fire_detection_frame_counts.pop(stream_id_str, None)
-        self.people_count_notification_cooldowns.pop(stream_id_str, None)
-        self.stream_errors.pop(stream_id_str, None)
-
-        # Calculate stream duration for metrics
-        start_time = stream_info.get('start_time')
-        if start_time:
-            duration = (datetime.now(ZoneInfo("Africa/Cairo")) - start_time).total_seconds()
-            current_avg = self.metrics['avg_stream_duration']
-            total_stopped = self.metrics['total_streams_stopped']
-            self.metrics['avg_stream_duration'] = (
-                (current_avg * total_stopped + duration) / (total_stopped + 1)
-            )
-
+        # Always try to clean up, even if stream_info is None
         try:
-            # Signal stop
-            if stop_event_obj:
-                stop_event_obj.set()
+            if stream_info:
+                stop_event_obj = stream_info.get('stop_event')
+                task_obj = stream_info.get('task')
+                workspace_id = stream_info.get('workspace_id')
+                source = stream_info.get('source')
+                
+                # Signal stop
+                if stop_event_obj:
+                    stop_event_obj.set()
+                    logger.debug(f"Set stop event for {stream_id_str}")
+                
+                # Cancel task
+                if task_obj and not task_obj.done():
+                    task_obj.cancel()
+                    try:
+                        await asyncio.wait_for(task_obj, timeout=5.0)
+                        logger.debug(f"Task cancelled for {stream_id_str}")
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        logger.warning(f"Task cancellation timeout for {stream_id_str}")
+                
+                # Clean up workspace registry
+                if workspace_id:
+                    workspace_id_str = str(workspace_id)
+                    if workspace_id_str in self.workspace_streams:
+                        self.workspace_streams[workspace_id_str].discard(stream_id_str)
+                        if not self.workspace_streams[workspace_id_str]:
+                            del self.workspace_streams[workspace_id_str]
+                
+                # Clean up shared stream registry
+                if source:
+                    self._shared_stream_registry[source].discard(stream_id_str)
+                    if not self._shared_stream_registry[source]:
+                        del self._shared_stream_registry[source]
             
-            # Cancel task with timeout
-            if task_obj and not task_obj.done():
-                task_obj.cancel()
-                try:
-                    await asyncio.wait_for(
-                        task_obj, 
-                        timeout=config.get("stream_stop_timeout_seconds", 5.0)
-                    )
-                except (asyncio.CancelledError, asyncio.TimeoutError) as e:
-                    logger.warning(f"Task cancellation timeout for {stream_id_str}: {e}")
+            # CRITICAL: Always remove from these dicts, even if stream_info was None
+            async with self._lock:
+                self.active_streams.pop(stream_id_str, None)
             
-            # ===== CRITICAL CHANGE: DO NOT UPDATE DATABASE HERE =====
-            # The database was already updated by stop_stream_in_workspace()
-            # or restart_stream_in_workspace() BEFORE this function was called
+            self.stream_workspaces.pop(stream_id_str, None)
+            self.stream_processing_stats.pop(stream_id_str, None)
+            self.fire_detection_states.pop(stream_id_str, None)
+            self.fire_detection_frame_counts.pop(stream_id_str, None)
+            self.people_count_notification_cooldowns.pop(stream_id_str, None)
+            self.stream_errors.pop(stream_id_str, None)
             
-            logger.info(f"✅ Stream {stream_id_str} memory cleanup complete")
-            
-            # Notify workspace members (only for non-restart stops)
-            if not for_restart and workspace_id:
-                await self._notify_workspace_stream_stopped(
-                    workspace_id, camera_name, stream_info.get('username')
-                )
+            logger.info(f"✅ Cleaned up all references for {stream_id_str}")
             
             # Update metrics
             if not for_restart:
                 self.metrics['total_streams_stopped'] += 1
-                
-        except Exception as e:
-            logger.error(f"Error during _stop_stream for {stream_id_str}: {e}", exc_info=True)
-            await self._record_stream_error(stream_id_str, "stop", str(e))
-        finally:
-            self.stream_processing_stats.pop(stream_id_str, None)
             
             # Transition to final state
             if for_restart:
                 await self._transition_stream_state(stream_id_str, StreamState.STARTING, force=True)
             else:
                 await self._transition_stream_state(stream_id_str, StreamState.INACTIVE, force=True)
-
+            
+            logger.info(f"✅ Stream {stream_id_str} stopped successfully")
+        
+        except Exception as e:
+            logger.error(f"Error in _stop_stream for {stream_id_str}: {e}", exc_info=True)
+            
+            # Even on error, force cleanup
+            try:
+                async with self._lock:
+                    self.active_streams.pop(stream_id_str, None)
+                self.stream_workspaces.pop(stream_id_str, None)
+                self.stream_processing_stats.pop(stream_id_str, None)
+                logger.warning(f"⚠️ Force-cleaned {stream_id_str} after error")
+            except:
+                pass
 
     async def get_workspace_streams_for_user(
         self,
