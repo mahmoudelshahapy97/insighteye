@@ -1634,3 +1634,403 @@ async def debug_fire_state(
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@router.get("/debug/stream-health/{stream_id}")
+async def debug_stream_health(
+    stream_id: str,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Debug endpoint to check if a stream is truly healthy and processing.
+    Returns detailed health information.
+    """
+    try:
+        stream_id_str = str(stream_id)
+        
+        # Check memory state
+        async with stream_manager._lock:
+            stream_info = stream_manager.active_streams.get(stream_id_str)
+            stream_state = stream_manager.stream_states.get(stream_id_str)
+        
+        if not stream_info:
+            return {
+                "stream_id": stream_id_str,
+                "status": "not_in_memory",
+                "message": "Stream not found in active streams"
+            }
+        
+        # Get task info
+        task = stream_info.get('task')
+        task_alive = task and not task.done()
+        task_exception = None
+        if task and task.done():
+            try:
+                task_exception = str(task.exception())
+            except:
+                pass
+        
+        # Get frame info
+        latest_frame = stream_info.get('latest_frame')
+        last_frame_time = stream_info.get('last_frame_time')
+        
+        frame_age = None
+        if last_frame_time:
+            frame_age = (datetime.now(ZoneInfo("Africa/Cairo")) - last_frame_time).total_seconds()
+        
+        # Get shared stream info
+        source = stream_info.get('source')
+        shared_stream = None
+        if source:
+            shared_stream = await stream_manager.video_file_manager.get_shared_stream(source)
+            shared_stats = await shared_stream.get_stats() if shared_stream else None
+        
+        # Database state
+        from app.services.video_stream_service import video_stream_service
+        db_state = await video_stream_service.get_video_stream_by_id(UUID(stream_id))
+        
+        # Processing stats
+        processing_stats = stream_manager.stream_processing_stats.get(stream_id_str, {})
+        
+        # Health verdict
+        is_healthy = (
+            task_alive and
+            latest_frame is not None and
+            frame_age is not None and
+            frame_age < 30 and
+            stream_state == StreamState.ACTIVE
+        )
+        
+        return {
+            "stream_id": stream_id_str,
+            "overall_health": "healthy" if is_healthy else "unhealthy",
+            "state": {
+                "memory_state": stream_state.value if stream_state else "unknown",
+                "status": stream_info.get('status'),
+                "database_status": db_state.get('status') if db_state else None,
+                "database_is_streaming": db_state.get('is_streaming') if db_state else None
+            },
+            "task": {
+                "alive": task_alive,
+                "done": task.done() if task else None,
+                "exception": task_exception
+            },
+            "frames": {
+                "has_frame": latest_frame is not None,
+                "last_frame_time": last_frame_time.isoformat() if last_frame_time else None,
+                "age_seconds": frame_age,
+                "is_stale": frame_age > 30 if frame_age else None
+            },
+            "shared_stream": {
+                "source": source,
+                "stats": shared_stats if shared_stream else None
+            },
+            "processing": {
+                "frames_processed": processing_stats.get('frames_processed', 0),
+                "detection_count": processing_stats.get('detection_count', 0),
+                "errors": processing_stats.get('errors', 0)
+            },
+            "diagnosis": self._diagnose_stream_issue(
+                task_alive, latest_frame, frame_age, stream_state
+            ),
+            "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error debugging stream health: {e}", exc_info=True)
+        return {"error": str(e)}
+
+def _diagnose_stream_issue(self, task_alive, has_frame, frame_age, state):
+    """Diagnose what's wrong with a stream"""
+    issues = []
+    
+    if not task_alive:
+        issues.append("Processing task is not running")
+    
+    if not has_frame:
+        issues.append("No frames have been received")
+    
+    if frame_age and frame_age > 30:
+        issues.append(f"Frames are stale ({frame_age:.1f}s old)")
+    
+    if state != StreamState.ACTIVE:
+        issues.append(f"Stream state is {state.value}, not ACTIVE")
+    
+    if not issues:
+        return "Stream appears healthy"
+    
+    return "; ".join(issues)
+
+
+@router.post("/debug/force-restart/{stream_id}")
+async def force_restart_stream(
+    stream_id: str,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Force restart a stream even if it appears active.
+    Useful when stream is stuck in bad state.
+    """
+    try:
+        user_id = str(current_user_data["user_id"])
+        stream_uuid = UUID(stream_id)
+        
+        # Validate access
+        stream_info, _ = await stream_manager.validate_workspace_stream_access(
+            user_id=UUID(user_id),
+            stream_id=stream_uuid
+        )
+        
+        stream_id_str = str(stream_id)
+        
+        logger.warning(f"🔧 FORCE RESTART requested for stream {stream_id_str} by user {user_id}")
+        
+        # Force stop (even if not in memory)
+        try:
+            await stream_manager._stop_stream(stream_id_str, for_restart=True)
+        except Exception as e:
+            logger.warning(f"Stop failed (expected if not in memory): {e}")
+        
+        # Wait a bit
+        await asyncio.sleep(2.0)
+        
+        # Start fresh
+        result = await stream_manager.start_stream_in_workspace(
+            stream_id=stream_uuid,
+            requester_user_id=UUID(user_id)
+        )
+        
+        return {
+            "status": "success",
+            "message": f"Stream force-restarted",
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error(f"Error force-restarting stream: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/admin/cleanup-zombies")
+async def cleanup_zombie_streams(
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Admin endpoint: Manually trigger zombie stream cleanup.
+    Detects and removes streams stuck in memory but not actually processing.
+    """
+    # Check if admin
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        zombies = await stream_manager.detect_and_cleanup_zombie_streams()
+        
+        return {
+            "status": "success",
+            "zombies_found": len(zombies),
+            "zombies_cleaned": zombies,
+            "message": f"Cleaned up {len(zombies)} zombie streams"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in zombie cleanup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/admin/memory-stats")
+async def get_memory_stats(
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Admin endpoint: Get detailed memory statistics.
+    Shows what's actually in memory vs database.
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Get memory state
+        async with stream_manager._lock:
+            memory_stream_ids = list(stream_manager.active_streams.keys())
+            memory_details = {}
+            
+            for stream_id in memory_stream_ids:
+                info = stream_manager.active_streams[stream_id]
+                task = info.get('task')
+                last_frame = info.get('last_frame_time')
+                
+                memory_details[stream_id] = {
+                    'camera_name': info.get('camera_name'),
+                    'status': info.get('status'),
+                    'has_task': task is not None,
+                    'task_alive': task and not task.done() if task else False,
+                    'has_frames': info.get('latest_frame') is not None,
+                    'last_frame_age': (
+                        (datetime.now(ZoneInfo("Africa/Cairo")) - last_frame).total_seconds()
+                        if last_frame else None
+                    ),
+                    'start_time': info.get('start_time').isoformat() if info.get('start_time') else None
+                }
+        
+        # Get database state
+        db_streaming_query = """
+            SELECT stream_id, name, is_streaming, status, stop_reason
+            FROM video_stream
+            WHERE is_streaming = TRUE
+        """
+        db_streaming = await stream_manager.db_manager.execute_query(
+            db_streaming_query, fetch_all=True
+        )
+        
+        db_stream_ids = [str(s['stream_id']) for s in db_streaming]
+        
+        # Find discrepancies
+        in_memory_not_db = set(memory_stream_ids) - set(db_stream_ids)
+        in_db_not_memory = set(db_stream_ids) - set(memory_stream_ids)
+        
+        return {
+            "memory": {
+                "total_streams": len(memory_stream_ids),
+                "stream_ids": memory_stream_ids,
+                "details": memory_details
+            },
+            "database": {
+                "total_streaming": len(db_stream_ids),
+                "stream_ids": db_stream_ids,
+                "streams": db_streaming
+            },
+            "discrepancies": {
+                "in_memory_but_not_database": list(in_memory_not_db),
+                "in_database_but_not_memory": list(in_db_not_memory),
+                "count_mismatch": len(memory_stream_ids) != len(db_stream_ids)
+            },
+            "shared_streams": {
+                "total_sources": len(stream_manager._shared_stream_registry),
+                "sources": list(stream_manager._shared_stream_registry.keys())
+            },
+            "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting memory stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/admin/force-sync")
+async def force_sync_memory_database(
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Admin endpoint: Force synchronization between memory and database.
+    - Removes streams from memory that database says should stop
+    - Does NOT start streams (let management loop handle that)
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        # Get all streams in memory
+        async with stream_manager._lock:
+            memory_stream_ids = list(stream_manager.active_streams.keys())
+        
+        stopped_count = 0
+        errors = []
+        
+        for stream_id_str in memory_stream_ids:
+            try:
+                # Check database
+                db_state = await stream_manager.db_manager.execute_query(
+                    """SELECT is_streaming, status, stop_reason, name
+                       FROM video_stream
+                       WHERE stream_id = $1""",
+                    (UUID(stream_id_str),),
+                    fetch_one=True
+                )
+                
+                # If not in database OR database says don't stream, stop it
+                should_stop = False
+                reason = ""
+                
+                if not db_state:
+                    should_stop = True
+                    reason = "not_in_database"
+                elif not db_state['is_streaming']:
+                    should_stop = True
+                    reason = f"database_is_streaming_false (status={db_state['status']})"
+                elif db_state.get('stop_reason') == 'user_action':
+                    should_stop = True
+                    reason = "user_stopped"
+                
+                if should_stop:
+                    logger.warning(
+                        f"🔧 Force-stopping {stream_id_str}: {reason}"
+                    )
+                    await stream_manager._stop_stream(stream_id_str, for_restart=False)
+                    stopped_count += 1
+            
+            except Exception as e:
+                logger.error(f"Error force-syncing {stream_id_str}: {e}")
+                errors.append({
+                    'stream_id': stream_id_str,
+                    'error': str(e)
+                })
+        
+        return {
+            "status": "success",
+            "stopped_count": stopped_count,
+            "errors": errors,
+            "message": f"Force-stopped {stopped_count} streams to sync with database"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in force sync: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/admin/stream/{stream_id}/force-remove")
+async def force_remove_stream_from_memory(
+    stream_id: str,
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Admin endpoint: Forcefully remove a specific stream from memory.
+    Last resort when a stream is completely stuck.
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        stream_id_str = str(stream_id)
+        
+        # Check if in memory
+        async with stream_manager._lock:
+            exists = stream_id_str in stream_manager.active_streams
+        
+        if not exists:
+            return {
+                "status": "info",
+                "message": f"Stream {stream_id_str} not in memory"
+            }
+        
+        # Force stop
+        await stream_manager._stop_stream(stream_id_str, for_restart=False)
+        
+        # Double-check removal
+        async with stream_manager._lock:
+            still_exists = stream_id_str in stream_manager.active_streams
+        
+        if still_exists:
+            # Nuclear option: direct removal
+            async with stream_manager._lock:
+                stream_manager.active_streams.pop(stream_id_str, None)
+            stream_manager.stream_workspaces.pop(stream_id_str, None)
+            logger.warning(f"⚠️ Nuclear removal of {stream_id_str}")
+        
+        return {
+            "status": "success",
+            "message": f"Stream {stream_id_str} forcefully removed from memory"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error force-removing stream: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
