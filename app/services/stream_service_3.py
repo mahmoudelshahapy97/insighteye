@@ -1116,13 +1116,13 @@ class StreamManager:
                 self.active_streams[stream_id_str]['status'] = 'stopping'
                 self.active_streams[stream_id_str]['stop_reason'] = stop_reason
         
-        # Record stop in history
-        await self.video_stream_service.record_camera_stop(
-            stream_id=stream_id,
-            stop_reason=stop_reason,
-            stopped_by=requester_user_id if stop_reason == 'user_action' else None,
-            additional_context=additional_context
-        )
+        # # Record stop in history
+        # await self.video_stream_service.record_camera_stop(
+        #     stream_id=stream_id,
+        #     stop_reason=stop_reason,
+        #     stopped_by=requester_user_id if stop_reason == 'user_action' else None,
+        #     additional_context=additional_context
+        # )
         
         # Clean up in memory (this won't change database anymore)
         await self._stop_stream(stream_id_str, for_restart=False)
@@ -1882,16 +1882,16 @@ class StreamManager:
                             else:
                                 stop_reason = 'system_error'
                             
-                            # Record failure (retry_service will pick it up)
-                            try:
-                                await self.video_stream_service.record_camera_stop(
-                                    stream_id=stream_id,
-                                    stop_reason=stop_reason,
-                                    stopped_by=None,
-                                    additional_context=str(result)
-                                )
-                            except Exception as record_err:
-                                logger.error(f"Error recording stop for {stream_id}: {record_err}")
+                            # # Record failure (retry_service will pick it up)
+                            # try:
+                            #     await self.video_stream_service.record_camera_stop(
+                            #         stream_id=stream_id,
+                            #         stop_reason=stop_reason,
+                            #         stopped_by=None,
+                            #         additional_context=str(result)
+                            #     )
+                            # except Exception as record_err:
+                            #     logger.error(f"Error recording stop for {stream_id}: {record_err}")
                         else:
                             logger.info(f"✅ Successfully started {stream_id}")
                 else:

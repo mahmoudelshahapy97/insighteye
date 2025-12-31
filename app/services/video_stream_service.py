@@ -433,11 +433,24 @@ class VideoStreamService:
         additional_context: Optional[str] = None
     ) -> bool:
         """
-        Record camera stop in history WITHOUT changing is_streaming or status.
-        CRITICAL: If camera is already user-stopped, do NOT overwrite!
+        Record why and when a camera was stopped.
+        
+        CRITICAL RULES:
+        1. If stop_reason='user_action': Set is_streaming=FALSE (user stopped it)
+        2. If stop_reason='system_*': Keep is_streaming=TRUE (will retry)
+        3. NEVER change is_streaming if already FALSE and stop_reason='user_action'
         """
+        valid_reasons = [
+            'user_action', 'connection_error', 'system_error', 
+            'timeout', 'manual_restart'
+        ]
+        
+        if stop_reason not in valid_reasons:
+            logger.error(f"Invalid stop_reason: {stop_reason}. Must be one of {valid_reasons}")
+            return False
+        
         try:
-            # ✅ CRITICAL: Check current state first
+            # First, check current state
             current_state = await self.db_manager.execute_query(
                 """SELECT stop_reason, is_streaming, status 
                 FROM video_stream 
@@ -451,34 +464,90 @@ class VideoStreamService:
                 return False
             
             # ✅ If already user-stopped, NEVER overwrite
-            if current_state['stop_reason'] == 'user_action':
+            if current_state['stop_reason'] == 'user_action':#and current_state['is_streaming'] == False)
+                
                 logger.info(
                     f"⏭️ Camera {stream_id} already user-stopped. "
                     f"Ignoring record_camera_stop call with reason '{stop_reason}'"
                 )
                 return True  # Return success but don't change anything
             
-            # Only record stop history, don't change is_streaming or status
-            insert_query = """
-                INSERT INTO camera_stop_history 
-                (stream_id, stop_reason, stopped_by, stopped_at, additional_context)
-                VALUES ($1, $2, $3, NOW(), $4)
-            """
+            if stop_reason == 'user_action':
+                # User stop: Set is_streaming=FALSE, NO retry
+                query = """
+                    UPDATE video_stream 
+                    SET stop_reason = $1::VARCHAR(50),
+                        stopped_by = $2,
+                        stopped_at = NOW(),
+                        status = 'inactive',
+                        is_streaming = FALSE,
+                        retry_count = 0,
+                        next_retry_at = NULL,
+                        last_retry_at = NULL,
+                        updated_at = NOW()
+                    WHERE stream_id = $3
+                """
+                
+                await self.db_manager.execute_query(
+                    query, 
+                    (stop_reason, stopped_by, stream_id)
+                )
+                
+                logger.info(
+                    f"✅ User stop recorded for {stream_id}: "
+                    f"is_streaming=FALSE, will NOT restart"
+                )
+                
+            else:
+                # System stop: Keep is_streaming=TRUE for retry
+                query = """
+                    UPDATE video_stream 
+                    SET stop_reason = $1::VARCHAR(50),
+                        stopped_by = $2,
+                        stopped_at = NOW(),
+                        status = 'error',
+                        is_streaming = TRUE,
+                        updated_at = NOW()
+                    WHERE stream_id = $3
+                """
+                
+                await self.db_manager.execute_query(
+                    query, 
+                    (stop_reason, stopped_by, stream_id)
+                )
+                
+                logger.info(
+                    f"⚠️ System stop recorded for {stream_id}: "
+                    f"is_streaming=TRUE, will retry (reason: {stop_reason})"
+                )
             
-            await self.db_manager.execute_query(
-                insert_query,
-                (stream_id, stop_reason, stopped_by, additional_context)
-            )
-            
-            logger.info(
-                f"✅ Recorded stop history for camera {stream_id}: "
-                f"reason={stop_reason}, context={additional_context}"
-            )
-            
+            # try:
+            #     # Only record stop history, don't change is_streaming or status
+            #     insert_query = """
+            #         INSERT INTO camera_stop_history 
+            #         (stream_id, stop_reason, stopped_by, stopped_at, additional_context)
+            #         VALUES ($1, $2, $3, NOW(), $4)
+            #     """
+                
+            #     await self.db_manager.execute_query(
+            #         insert_query,
+            #         (stream_id, stop_reason, stopped_by, additional_context)
+            #     )
+
+            #     logger.info(
+            #         f"✅ Recorded stop history for camera {stream_id}: "
+            #         f"reason={stop_reason}, context={additional_context}"
+            #     )
+            # except Exception as history_err:
+            #     # Table might not exist - not critical, just log and continue
+            #     logger.debug(
+            #         f"Could not record camera_stop_history (table may not exist): {history_err}"
+            #     )
+                
             return True
             
         except Exception as e:
-            logger.error(f"Error recording camera stop for {stream_id}: {e}", exc_info=True)
+            logger.error(f"Error recording camera stop: {e}", exc_info=True)
             return False
 
     async def _log_camera_issue(

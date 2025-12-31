@@ -2034,3 +2034,112 @@ async def force_remove_stream_from_memory(
     except Exception as e:
         logger.error(f"Error force-removing stream: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/admin/model-health")
+async def check_model_health(
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Admin endpoint: Check if YOLO models are loaded and functioning.
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        from app.services.stream_processing_service import stream_processing_service
+        
+        # Check model status
+        model_status = stream_processing_service.get_model_status()
+        
+        # Get model paths from config
+        people_path = config.get("people_model_path", "yolov8n.pt")
+        gender_path = config.get("gender_model_path", "gender.pt")
+        fire_path = config.get("fire_model_path", "fire.pt")
+        
+        # Check file existence
+        files_exist = {
+            "people_model": os.path.exists(people_path),
+            "gender_model": os.path.exists(gender_path),
+            "fire_model": os.path.exists(fire_path)
+        }
+        
+        # Overall health
+        critical_models_ok = model_status['people_model']
+        all_models_ok = all(model_status.values())
+        
+        health_status = "healthy" if critical_models_ok else "critical"
+        if critical_models_ok and not all_models_ok:
+            health_status = "degraded"
+        
+        return {
+            "status": health_status,
+            "models": {
+                "people": {
+                    "loaded": model_status['people_model'],
+                    "path": people_path,
+                    "file_exists": files_exist['people_model'],
+                    "critical": True
+                },
+                "gender": {
+                    "loaded": model_status['gender_model'],
+                    "path": gender_path,
+                    "file_exists": files_exist['gender_model'],
+                    "critical": False
+                },
+                "fire": {
+                    "loaded": model_status['fire_model'],
+                    "path": fire_path,
+                    "file_exists": files_exist['fire_model'],
+                    "critical": False
+                }
+            },
+            "warnings": [
+                msg for msg in [
+                    "🚨 CRITICAL: People model not loaded! Detection disabled!" 
+                    if not model_status['people_model'] else None,
+                    "⚠️ Gender model not loaded - gender detection disabled" 
+                    if not model_status['gender_model'] else None,
+                    "⚠️ Fire model not loaded - fire detection disabled" 
+                    if not model_status['fire_model'] else None,
+                ] if msg
+            ],
+            "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
+        }
+    
+    except Exception as e:
+        logger.error(f"Error checking model health: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/admin/reload-models")
+async def reload_models(
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Admin endpoint: Force reload of YOLO models.
+    Useful if models failed to load during startup.
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        from app.services.stream_processing_service import stream_processing_service
+        
+        logger.warning(f"🔄 Model reload requested by admin {current_user['username']}")
+        
+        # Reinitialize models
+        stream_processing_service._initialize_models()
+        
+        # Check status
+        model_status = stream_processing_service.get_model_status()
+        
+        return {
+            "status": "success",
+            "models_loaded": model_status,
+            "message": "Models reloaded",
+            "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
+        }
+    
+    except Exception as e:
+        logger.error(f"Error reloading models: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

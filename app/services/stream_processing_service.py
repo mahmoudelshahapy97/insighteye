@@ -88,6 +88,81 @@ class StreamProcessingService:
             self.gender_model = None
             self.fire_model = None
 
+    # def _initialize_models(self):
+    #     """
+    #     Initialize YOLO models with retry logic and better error handling.
+    #     """
+    #     people_model_path = config.get("people_model_path", "yolov8n.pt")
+    #     gender_model_path = config.get("gender_model_path", "gender.pt")
+    #     fire_model_path = config.get("fire_model_path", "fire.pt")
+        
+    #     logger.info(f"🔍 Initializing YOLO models:")
+    #     logger.info(f"  People: {people_model_path} (exists: {os.path.exists(people_model_path)})")
+    #     logger.info(f"  Gender: {gender_model_path} (exists: {os.path.exists(gender_model_path)})")
+    #     logger.info(f"  Fire: {fire_model_path} (exists: {os.path.exists(fire_model_path)})")
+        
+    #     # Initialize people model (CRITICAL - MUST SUCCEED)
+    #     max_retries = 3
+    #     for attempt in range(max_retries):
+    #         try:
+    #             logger.info(f"Loading people model (attempt {attempt + 1}/{max_retries})...")
+    #             self.people_model = YOLO(people_model_path)
+    #             logger.info("✅ People model loaded successfully")
+    #             break
+    #         except Exception as e:
+    #             logger.error(f"❌ Attempt {attempt + 1} failed to load people model: {e}")
+    #             if attempt == max_retries - 1:
+    #                 logger.critical(
+    #                     f"🚨 CRITICAL: Failed to load people model after {max_retries} attempts. "
+    #                     f"Object detection will NOT work!"
+    #                 )
+    #                 self.people_model = None
+    #             else:
+    #                 import time
+    #                 time.sleep(2)  # Wait before retry
+        
+    #     # Initialize gender model (OPTIONAL - can fail gracefully)
+    #     try:
+    #         logger.info("Loading gender model...")
+    #         self.gender_model = YOLO(gender_model_path)
+    #         logger.info("✅ Gender model loaded successfully")
+    #     except Exception as e:
+    #         logger.warning(f"⚠️ Gender model failed to load: {e}")
+    #         logger.warning("Gender detection will be disabled")
+    #         self.gender_model = None
+        
+    #     # Initialize fire model (OPTIONAL - can fail gracefully)
+    #     try:
+    #         logger.info("Loading fire model...")
+    #         self.fire_model = YOLO(fire_model_path)
+    #         logger.info("✅ Fire model loaded successfully")
+    #     except Exception as e:
+    #         logger.warning(f"⚠️ Fire model failed to load: {e}")
+    #         logger.warning("Fire detection will be disabled")
+    #         self.fire_model = None
+        
+    #     # Summary
+    #     models_loaded = []
+    #     if self.people_model:
+    #         models_loaded.append("people")
+    #     if self.gender_model:
+    #         models_loaded.append("gender")
+    #     if self.fire_model:
+    #         models_loaded.append("fire")
+        
+    #     if not models_loaded:
+    #         logger.critical("🚨 NO MODELS LOADED! System will not function properly!")
+    #     else:
+    #         logger.info(f"✅ Models initialized: {', '.join(models_loaded)}")
+
+    def get_model_status(self) -> Dict[str, bool]:
+        """Get status of all models for health checks."""
+        return {
+            "people_model": self.people_model is not None,
+            "gender_model": self.gender_model is not None,
+            "fire_model": self.fire_model is not None
+        }
+
     def detect_objects_with_threshold(
         self,
         frame: np.ndarray,
@@ -101,6 +176,12 @@ class StreamProcessingService:
         """
         if frame is None or frame.size == 0:
             return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
+
+        # ✅ CRITICAL FIX: Check if models are initialized
+        if self.people_model is None:
+            logger.error(f"People model not initialized for stream {stream_id_str}")
+            # Return frame without detection
+            return frame.copy(), 0, False, 0, 0, "no detection"
 
         # Stream-specific frame counting
         if stream_id_str and self.stream_manager:
@@ -137,7 +218,7 @@ class StreamProcessingService:
             input_frame = frame
 
         try:
-            # People detection
+            # People detection - NOW SAFE because we checked above
             people_results = self.people_model.predict(
                 source=input_frame, conf=conf_threshold, classes=[0], verbose=False
             )
@@ -159,7 +240,7 @@ class StreamProcessingService:
                 except Exception as e:
                     logger.error(f"Gender detection error for stream {stream_id_str}: {e}")
 
-            # Fire detection (every 10th frame)
+            # Fire detection (every 10th frame) - ✅ Check model first
             if frame_count % 10 == 0 and self.fire_model:
                 try:
                     fire_results = self.fire_model(source=input_frame, conf=0.8, verbose=False)
@@ -1235,7 +1316,7 @@ class StreamProcessingService:
                     
                     await video_stream_service.record_camera_stop(
                         stream_id=stream_id,
-                        stop_reason='system_error',
+                        stop_reason='user_action',
                         stopped_by=None,
                         additional_context="Stream stopped cleanly by system"
                     )
