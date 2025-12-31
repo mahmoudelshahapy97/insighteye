@@ -483,7 +483,7 @@ class StreamProcessingService:
         workspace_id: UUID,
         owner_id: UUID
     ):
-        """Handle people count alert logic."""
+        """Handle people count alert logic with workspace-wide broadcasting."""
         try:
             # Get alert state
             alert_state = await people_count_service.get_people_count_alert_state(stream_id)
@@ -530,11 +530,38 @@ class StreamProcessingService:
                     logger.info(f"No previous notification time for stream {stream_id_str}")
             
             if should_notify:
-                # Build alert message
+                # Get location info for more detailed alert
+                stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
+                location_info = None
+                location_text = "Unknown Location"
+                
+                if stream_info:
+                    location_info = {
+                        'location': stream_info.get('location'),
+                        'area': stream_info.get('area'),
+                        'building': stream_info.get('building'),
+                        'zone': stream_info.get('zone'),
+                        'floor_level': stream_info.get('floor_level'),
+                    }
+                    
+                    # Build readable location string
+                    location_parts = []
+                    if location_info.get('building'):
+                        location_parts.append(location_info['building'])
+                    if location_info.get('floor_level'):
+                        location_parts.append(f"Floor {location_info['floor_level']}")
+                    if location_info.get('zone'):
+                        location_parts.append(location_info['zone'])
+                    if location_info.get('area'):
+                        location_parts.append(location_info['area'])
+                    
+                    location_text = " - ".join(location_parts) if location_parts else location_info.get('location', 'Unknown Location')
+                
+                # Build alert message with location
                 threshold_desc = f">{greater_than}" if threshold_type == "greater_than" else f"<{less_than}"
                 message = (
-                    f"⚠️ People count alert: {person_count} people detected "
-                    f"(threshold: {threshold_desc}) at camera '{camera_name}'"
+                    f"⚠️ PEOPLE COUNT ALERT: {person_count} people detected "
+                    f"(threshold: {threshold_desc}) at {location_text}"
                 )
                 
                 logger.warning(f"🚨 PEOPLE COUNT ALERT: {message}")
@@ -544,23 +571,26 @@ class StreamProcessingService:
                     notification = await notification_service.create_notification(
                         workspace_id=workspace_id,
                         user_id=owner_id,
-                        status="urgent",  # Changed from "unread" to "urgent"
+                        status="urgent",
                         message=message,
                         stream_id=stream_id,
                         camera_name=camera_name
                     )
                     
                     if notification:
-                        logger.info(f"✅ Notification created: {notification.get('notification_id')}")
+                        logger.info(f"✅ People count notification created: {notification.get('notification_id')}")
                     else:
-                        logger.error(f"❌ Failed to create notification in database")
+                        logger.error(f"❌ Failed to create people count notification in database")
+                        return  # Exit if notification creation failed
                         
                 except Exception as notif_err:
-                    logger.error(f"❌ Error creating notification: {notif_err}", exc_info=True)
+                    logger.error(f"❌ Error creating people count notification: {notif_err}", exc_info=True)
+                    return  # Exit if notification creation failed
 
                 # ✅ Broadcast to WebSocket clients
                 if notification and self.stream_manager:
                     try:
+                        # Format notification for WebSocket
                         formatted_notification = {
                             "type": "new_notification",
                             "notification": {
@@ -576,16 +606,48 @@ class StreamProcessingService:
                             }
                         }
                         
+                        # Broadcast to camera owner
                         await self.stream_manager.broadcast_notification(
                             str(owner_id),
                             formatted_notification
                         )
-                        logger.info(f"✅ Broadcasted people count notification to user {owner_id}")
+                        logger.warning(
+                            f"⚠️ Broadcasted PEOPLE COUNT notification to owner {owner_id} "
+                            f"(will appear in notification list)"
+                        )
                         
+                        # 🔥 NEW: Broadcast to ALL workspace members (like fire alerts!)
+                        try:
+                            workspace_members = await self.stream_manager.workspace_service.get_workspace_members(
+                                workspace_id=workspace_id,
+                                current_user_id=workspace_id,
+                                is_admin=True
+                            )
+                            
+                            broadcast_count = 0
+                            for member in workspace_members:
+                                member_id = str(member['user_id'])
+                                if member_id != str(owner_id):  # Skip owner (already sent)
+                                    try:
+                                        await self.stream_manager.broadcast_notification(
+                                            member_id,
+                                            formatted_notification
+                                        )
+                                        broadcast_count += 1
+                                    except Exception as member_err:
+                                        logger.error(f"Error broadcasting to member {member_id}: {member_err}")
+                            
+                            logger.warning(
+                                f"⚠️ Broadcasted people count alert to {broadcast_count} additional workspace members"
+                            )
+                            
+                        except Exception as broadcast_err:
+                            logger.error(f"Error broadcasting to workspace members: {broadcast_err}")
+                            
                     except Exception as ws_err:
-                        logger.error(f"❌ Error broadcasting notification: {ws_err}", exc_info=True)
+                        logger.error(f"❌ Error broadcasting people count notification: {ws_err}", exc_info=True)
 
-                # ✅ FIX: Fetch user email and send email with proper await
+                # ✅ Send email alert
                 try:
                     user_info = await user_manager.get_user_by_id(owner_id)
                     
@@ -595,24 +657,9 @@ class StreamProcessingService:
                         logger.error(f"❌ User {owner_id} has no email address")
                     else:
                         user_email = user_info["email"]
-                        logger.info(f"📧 Preparing to send email to {user_email}")
+                        logger.info(f"📧 Preparing to send people count alert email to {user_email}")
 
-                        # Get stream info for location
-                        stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
-                        location_info = None
-                        if stream_info:
-                            location_info = {
-                                'location': stream_info.get('location'),
-                                'area': stream_info.get('area'),
-                                'building': stream_info.get('building'),
-                                'zone': stream_info.get('zone'),
-                                'floor_level': stream_info.get('floor_level'),
-                                'latitude': stream_info.get('latitude'),
-                                'longitude': stream_info.get('longitude')
-                            }
-                            logger.debug(f"Location info: {location_info}")
-
-                        # ✅ CRITICAL FIX: Add await here!
+                        # Send email with await
                         email_success = await send_people_count_alert_email(
                             user_email=user_email,
                             camera_name=camera_name,
@@ -649,9 +696,9 @@ class StreamProcessingService:
                 except Exception as state_err:
                     logger.error(f"❌ Error updating alert state: {state_err}", exc_info=True)
                 
-                logger.info(
+                logger.warning(
                     f"✅ People count alert completed for stream {stream_id_str}: "
-                    f"count={person_count}, threshold={threshold_desc}"
+                    f"count={person_count}, threshold={threshold_desc}, location={location_text}"
                 )
                     
         except Exception as e:
