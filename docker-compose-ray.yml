@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: insighteye_app
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - .:/app
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+    networks:
+      - insighteye_network
+    depends_on:
+      - ray-head
+
+  ray-head:
+    image: rayproject/ray:latest
+    container_name: ray_head
+    restart: unless-stopped
+    ports:
+      - "6379:6379" # Redis port for Ray
+      - "8265:8265" # Dashboard
+      - "10001:10001" # Client port
+    command: >
+      ray start
+      --head
+      --port=6379
+      --dashboard-host=0.0.0.0
+    networks:
+      - insighteye_network
+
+  ray-worker:
+    image: rayproject/ray:latest
+    restart: unless-stopped
+    depends_on:
+      - ray-head
+    command: >
+      ray start
+      --address=ray-head:6379
+      --num-cpus=2
+    # Limit to 8 cameras
+    networks:
+      - insighteye_network
+    # deploy:
+    #   replicas: 12 # 12 workers * 8 cameras = 96 cameras capacity
+
+networks:
+  insighteye_network:
+    driver: bridge

@@ -53,7 +53,7 @@ class StreamProcessingService:
         self.video_file_manager = None
         self.qdrant_service = None
         self._cached_results = {}
-        
+
         # Initialize models
         self._initialize_models()
         
@@ -79,8 +79,11 @@ class StreamProcessingService:
                 
         try:
             self.people_model = YOLO(people_model_path)
+            self.people_model.fuse()
             self.gender_model = YOLO(gender_model_path)
+            self.gender_model.fuse()
             self.fire_model = YOLO(fire_model_path)
+            self.fire_model.fuse()
             logger.info("YOLO models initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize YOLO models: {e}", exc_info=True)
@@ -90,7 +93,8 @@ class StreamProcessingService:
 
     # def _initialize_models(self):
     #     """
-    #     Initialize YOLO models with retry logic and better error handling.
+    #     Initialize YOLO models with MANDATORY success requirement.
+    #     System CANNOT start if people model fails to load.
     #     """
     #     people_model_path = config.get("people_model_path", "yolov8n.pt")
     #     gender_model_path = config.get("gender_model_path", "gender.pt")
@@ -101,60 +105,81 @@ class StreamProcessingService:
     #     logger.info(f"  Gender: {gender_model_path} (exists: {os.path.exists(gender_model_path)})")
     #     logger.info(f"  Fire: {fire_model_path} (exists: {os.path.exists(fire_model_path)})")
         
-    #     # Initialize people model (CRITICAL - MUST SUCCEED)
+    #     # ===== CRITICAL: People model MUST load (it's mandatory) =====
     #     max_retries = 3
+    #     last_error = None
+        
     #     for attempt in range(max_retries):
     #         try:
     #             logger.info(f"Loading people model (attempt {attempt + 1}/{max_retries})...")
     #             self.people_model = YOLO(people_model_path)
-    #             logger.info("✅ People model loaded successfully")
+    #             self.people_model.fuse()
+                
+    #             # Verify it actually works
+    #             test_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+    #             test_result = self.people_model.predict(test_frame, verbose=False)
+                
+    #             logger.info("✅ People model loaded and verified successfully")
     #             break
+                
     #         except Exception as e:
+    #             last_error = e
     #             logger.error(f"❌ Attempt {attempt + 1} failed to load people model: {e}")
-    #             if attempt == max_retries - 1:
-    #                 logger.critical(
-    #                     f"🚨 CRITICAL: Failed to load people model after {max_retries} attempts. "
-    #                     f"Object detection will NOT work!"
-    #                 )
-    #                 self.people_model = None
-    #             else:
+                
+    #             if attempt < max_retries - 1:
     #                 import time
     #                 time.sleep(2)  # Wait before retry
+    #             else:
+    #                 # CRITICAL: MUST raise exception if all retries fail
+    #                 error_msg = (
+    #                     f"🚨 CRITICAL: Failed to load people model after {max_retries} attempts. "
+    #                     f"Last error: {last_error}. "
+    #                     f"System CANNOT function without this model!"
+    #                 )
+    #                 logger.critical(error_msg)
+    #                 raise RuntimeError(error_msg) from last_error
         
-    #     # Initialize gender model (OPTIONAL - can fail gracefully)
+    #     # ===== Gender model (optional - graceful degradation) =====
     #     try:
     #         logger.info("Loading gender model...")
     #         self.gender_model = YOLO(gender_model_path)
+    #         self.gender_model.fuse()
+            
+    #         # Quick verification
+    #         test_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+    #         test_result = self.gender_model.predict(test_frame, verbose=False)
+            
     #         logger.info("✅ Gender model loaded successfully")
     #     except Exception as e:
     #         logger.warning(f"⚠️ Gender model failed to load: {e}")
-    #         logger.warning("Gender detection will be disabled")
+    #         logger.warning("Gender detection will be disabled (non-critical)")
     #         self.gender_model = None
         
-    #     # Initialize fire model (OPTIONAL - can fail gracefully)
+    #     # ===== Fire model (optional - graceful degradation) =====
     #     try:
     #         logger.info("Loading fire model...")
     #         self.fire_model = YOLO(fire_model_path)
+    #         self.fire_model.fuse()
+            
+    #         # Quick verification
+    #         test_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+    #         test_result = self.fire_model.predict(test_frame, verbose=False)
+            
     #         logger.info("✅ Fire model loaded successfully")
     #     except Exception as e:
     #         logger.warning(f"⚠️ Fire model failed to load: {e}")
-    #         logger.warning("Fire detection will be disabled")
+    #         logger.warning("Fire detection will be disabled (non-critical)")
     #         self.fire_model = None
         
-    #     # Summary
-    #     models_loaded = []
-    #     if self.people_model:
-    #         models_loaded.append("people")
+    #     # ===== Summary =====
+    #     models_loaded = ["people"]  # People is always loaded if we get here
     #     if self.gender_model:
     #         models_loaded.append("gender")
     #     if self.fire_model:
     #         models_loaded.append("fire")
         
-    #     if not models_loaded:
-    #         logger.critical("🚨 NO MODELS LOADED! System will not function properly!")
-    #     else:
-    #         logger.info(f"✅ Models initialized: {', '.join(models_loaded)}")
-
+    #     logger.info(f"✅ Model initialization complete: {', '.join(models_loaded)}")
+        
     def get_model_status(self) -> Dict[str, bool]:
         """Get status of all models for health checks."""
         return {
@@ -177,11 +202,13 @@ class StreamProcessingService:
         if frame is None or frame.size == 0:
             return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
 
-        # ✅ CRITICAL FIX: Check if models are initialized
+        # ✅ CRITICAL CHECK: This should NEVER happen now
         if self.people_model is None:
-            logger.error(f"People model not initialized for stream {stream_id_str}")
-            # Return frame without detection
-            return frame.copy(), 0, False, 0, 0, "no detection"
+            error_msg = f"🚨 CRITICAL: People model not initialized for stream {stream_id_str}"
+            logger.error(error_msg)
+            
+            # This is a system-level failure - should trigger service restart
+            raise RuntimeError(error_msg)
 
         # Stream-specific frame counting
         if stream_id_str and self.stream_manager:
@@ -230,7 +257,7 @@ class StreamProcessingService:
             # Gender detection (every 3rd frame when people detected)
             if person_count > 0 and frame_count % 3 == 0 and self.gender_model:
                 try:
-                    gender_results = self.gender_model(source=input_frame, conf=0.5, verbose=False)
+                    gender_results = self.gender_model.predict(source=input_frame, conf=0.5, verbose=False)
                     if gender_results and len(gender_results) > 0 and gender_results[0].boxes is not None:
                         male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
                         female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
@@ -243,11 +270,12 @@ class StreamProcessingService:
             # Fire detection (every 10th frame) - ✅ Check model first
             if frame_count % 10 == 0 and self.fire_model:
                 try:
-                    fire_results = self.fire_model(source=input_frame, conf=0.8, verbose=False)
+                    fire_results = self.fire_model.predict(source=input_frame, conf=0.8, verbose=False)
 
                     current_fire_status = "no detection"
                     if fire_results and len(fire_results) > 0 and fire_results[0].boxes is not None:
-                        classes = [int(box.cls) for box in fire_results[0].boxes]
+                        # classes = [int(box.cls) for box in fire_results[0].boxes]
+                        classes = [int(box.cls[0]) for box in fire_results[0].boxes]
                         if 0 in classes:
                             current_fire_status = "fire"
                         elif 1 in classes:

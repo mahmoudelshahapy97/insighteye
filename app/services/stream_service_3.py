@@ -2199,7 +2199,7 @@ class StreamManager:
                             current_time_utc - last_activity_time_mem
                         ).total_seconds()
 
-                    stale_threshold = config.get("stream_stale_threshold_seconds", 300.0)
+                    stale_threshold = config.get("stream_stale_threshold_seconds", 120.0)
                     if time_since_last_frame > stale_threshold:
                         health_issues.append(
                             f"{stream_id_str}: frozen ({time_since_last_frame:.0f}s since last frame)"

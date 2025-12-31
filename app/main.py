@@ -10,6 +10,7 @@ from app.utils.logging_config import setup_logging
 
 from app.api.routes import router
 from app.services.stream_service_3 import stream_manager, initialize_stream_manager
+from app.services.stream_processing_service import stream_processing_service
 
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
@@ -41,6 +42,12 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("DB health check failed after pool init")
     except Exception as e:
         logger.warning("Index/health check failed: %s", e)
+    
+    try:
+        stream_processing_service._initialize_models()
+        logger.info("Stream manager initialized and background tasks started.")
+    except Exception as e:
+        logger.error(f"Failed to initialize StreamManager: {e}", exc_info=True)
 
     try:
         await initialize_stream_manager() 
