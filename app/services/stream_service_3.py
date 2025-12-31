@@ -631,8 +631,10 @@ class StreamManager:
                     
                     # Calculate time since last frame
                     is_healthy = False
+                    age_str = "never"  # Default string
                     if last_frame_time:
                         age = (datetime.now(ZoneInfo("Africa/Cairo")) - last_frame_time).total_seconds()
+                        age_str = f"{age:.1f}s"  # ✅ FIX: Format age separately
                         # Consider healthy if received frame in last 30 seconds
                         is_healthy = age < 30 and latest_frame is not None
                     
@@ -642,7 +644,7 @@ class StreamManager:
                     if current_state == StreamState.ACTIVE and is_healthy and task_alive:
                         logger.info(
                             f"✅ Stream {stream_id_str} is truly active and healthy "
-                            f"(last frame: {age:.1f}s ago)"
+                            f"(last frame: {age_str} ago)"
                         )
                         return  # Actually active and processing
                     else:
@@ -651,7 +653,7 @@ class StreamManager:
                             f"🔧 Stream {stream_id_str} exists but is UNHEALTHY:\n"
                             f"  - State: {current_state}\n"
                             f"  - Has frames: {latest_frame is not None}\n"
-                            f"  - Last frame: {age if last_frame_time else 'never':.1f}s ago\n"
+                            f"  - Last frame: {age_str} ago\n"
                             f"  - Task alive: {task_alive}\n"
                             f"  - FORCING RESTART"
                         )
@@ -843,278 +845,6 @@ class StreamManager:
                 )
                 
                 raise
-
-    # async def start_stream_background(
-    #     self,
-    #     stream_id: UUID,
-    #     owner_id: UUID,
-    #     owner_username: str,
-    #     camera_name: str,
-    #     source: str,
-    #     workspace_id: UUID,
-    #     location_info: Optional[Dict[str, Any]] = None
-    # ):
-    #     """
-    #     Stream start with error handling and state management.
-    #     FIXED: Proper string formatting for age calculation
-    #     """
-    #     stream_id_str = str(stream_id)
-    #     workspace_id_str = str(workspace_id)
-
-    #     logger.info(f"🎬 START REQUEST: stream={stream_id_str}, camera={camera_name}, "
-    #         f"workspace={workspace_id_str}, source={source}")
-        
-    #     # Validate workspace access and limits
-    #     try:
-    #         can_start, reason = await self.can_start_stream_in_workspace(workspace_id, owner_id)
-    #         if not can_start:
-    #             logger.warning(f"Cannot start stream {stream_id_str}: {reason}")
-    #             await self.notification_service.create_notification(
-    #                 workspace_id=workspace_id,
-    #                 user_id=owner_id,
-    #                 status="error",
-    #                 message=f"Cannot start camera '{camera_name}': {reason}",
-    #                 stream_id=stream_id,
-    #                 camera_name=camera_name
-    #             )
-    #             raise WorkspaceQuotaExceeded(reason)
-            
-    #         logger.info(f"✅ QUOTA CHECK PASSED for stream {stream_id_str}")
-            
-    #     except Exception as e:
-    #         logger.error(f"❌ VALIDATION ERROR: {e}", exc_info=True)
-    #         raise
-        
-    #     async with self._safe_stream_operation(stream_id_str, "start"):
-    #         async with self._lock:
-    #             # ===== CRITICAL FIX: Verify stream health, not just state =====
-    #             if stream_id_str in self.active_streams:
-    #                 current_state = self.stream_states.get(stream_id_str)
-    #                 logger.warning(f"⚠️ Stream {stream_id_str} already registered in state: {current_state}")
-                    
-    #                 # Check if it's actually healthy
-    #                 stream_info = self.active_streams[stream_id_str]
-    #                 task = stream_info.get('task')
-    #                 latest_frame = stream_info.get('latest_frame')
-    #                 last_frame_time = stream_info.get('last_frame_time')
-                    
-    #                 # Calculate time since last frame
-    #                 is_healthy = False
-    #                 age_str = "never"  # Default string
-                    
-    #                 if last_frame_time:
-    #                     age = (datetime.now(ZoneInfo("Africa/Cairo")) - last_frame_time).total_seconds()
-    #                     age_str = f"{age:.1f}s"  # ✅ FIX: Format age separately
-    #                     # Consider healthy if received frame in last 30 seconds
-    #                     is_healthy = age < 30 and latest_frame is not None
-                    
-    #                 # Check if task is still running
-    #                 task_alive = task and not task.done()
-                    
-    #                 if current_state == StreamState.ACTIVE and is_healthy and task_alive:
-    #                     logger.info(
-    #                         f"✅ Stream {stream_id_str} is truly active and healthy "
-    #                         f"(last frame: {age_str} ago)"  # ✅ Use pre-formatted string
-    #                     )
-    #                     return  # Actually active and processing
-    #                 else:
-    #                     # Stream exists but is NOT healthy - force restart
-    #                     logger.error(
-    #                         f"🔧 Stream {stream_id_str} exists but is UNHEALTHY:\n"
-    #                         f"  - State: {current_state}\n"
-    #                         f"  - Has frames: {latest_frame is not None}\n"
-    #                         f"  - Last frame: {age_str} ago\n"  # ✅ FIX: Use pre-formatted string
-    #                         f"  - Task alive: {task_alive}\n"
-    #                         f"  - FORCING RESTART"
-    #                     )
-                        
-    #                     # Clean up the broken stream
-    #                     await self._stop_stream(stream_id_str, for_restart=True)
-                        
-    #                     # Small delay before restart
-    #                     await asyncio.sleep(1.0)
-                
-    #             # ===== Continue with normal start process =====
-    #             logger.info(f"🔄 Starting fresh stream instance for {stream_id_str}")
-                
-    #             # Transition to STARTING state
-    #             await self._transition_stream_state(stream_id_str, StreamState.STARTING)
-                
-    #             # Register stream in workspace
-    #             self.workspace_streams[workspace_id_str].add(stream_id_str)
-    #             self.stream_workspaces[stream_id_str] = workspace_id_str
-    #             logger.info(f"✅ Registered stream in workspace registry")
-                
-    #             # Initialize stream entry
-    #             self.active_streams[stream_id_str] = {
-    #                 'status': 'starting',
-    #                 'task': None,
-    #                 'start_time': datetime.now(ZoneInfo("Africa/Cairo")),
-    #                 'location_info': location_info or {},
-    #                 'workspace_id': workspace_id,
-    #                 'source': source,
-    #                 'camera_name': camera_name,
-    #                 'username': owner_username,
-    #                 'user_id': owner_id,
-    #                 'clients': set(),
-    #                 'latest_frame': None,
-    #                 'last_frame_time': None,
-    #                 'last_heartbeat': datetime.now(ZoneInfo("Africa/Cairo"))
-    #             }
-    #             logger.info(f"✅ Initialized stream entry in active_streams")
-
-    #             # Initialize fire detection state
-    #             self.fire_detection_states[stream_id_str] = {
-    #                 'status': 'no detection',
-    #                 'last_detection_time': None,
-    #                 'last_notification_time': None
-    #             }
-    #             self.fire_detection_frame_counts[stream_id_str] = 0
-    #             logger.info(f"✅ Initialized fire detection state")
-
-    #         try:
-    #             # Clear stop_reason and retry fields
-    #             logger.info(f"💾 Updating database: is_streaming=TRUE, clearing stop_reason")
-    #             update_query = """
-    #                 UPDATE video_stream
-    #                 SET is_streaming = TRUE,
-    #                     status = 'processing',
-    #                     stop_reason = NULL,
-    #                     stopped_at = NULL,
-    #                     stopped_by = NULL,
-    #                     retry_count = 0,
-    #                     last_retry_at = NULL,
-    #                     next_retry_at = NULL,
-    #                     auto_retry_enabled = TRUE,
-    #                     updated_at = NOW(),
-    #                     last_activity = NOW()
-    #                 WHERE stream_id = $1
-    #             """
-    #             await self.db_manager.execute_query(update_query, (stream_id,))
-    #             logger.info(f"✅ Database updated successfully")
-
-    #             # Verify the database update
-    #             verify_query = """
-    #                 SELECT is_streaming, status, stop_reason, retry_count 
-    #                 FROM video_stream 
-    #                 WHERE stream_id = $1
-    #             """
-    #             verify_result = await self.db_manager.execute_query(
-    #                 verify_query, (stream_id,), fetch_one=True
-    #             )
-                            
-    #             if not verify_result:
-    #                 logger.error(f"❌ Stream {stream_id_str} not found in database!")
-    #                 raise RuntimeError("Stream not found")
-                
-    #             logger.info(
-    #                 f"📊 Database verification: is_streaming={verify_result['is_streaming']}, "
-    #                 f"status={verify_result['status']}, stop_reason={verify_result['stop_reason']}"
-    #             )
-                
-    #             if verify_result['stop_reason'] is not None:
-    #                 logger.error(f"❌ CRITICAL: stop_reason was not cleared! Value: {verify_result['stop_reason']}")
-    #                 raise RuntimeError("Failed to clear stop_reason")
-
-    #             # Initialize processing stats
-    #             self.stream_processing_stats[stream_id_str] = {
-    #                 "frames_processed": 0,
-    #                 "detection_count": 0,
-    #                 "avg_processing_time": 0.0,
-    #                 "last_updated": datetime.now(ZoneInfo("Africa/Cairo")),
-    #                 "errors": 0
-    #             }
-
-    #             logger.info(f"✅ Initialized processing stats")
-
-    #             # Ensure Qdrant collection
-    #             logger.info(f"🗄️ Ensuring Qdrant collection for workspace {workspace_id_str}")
-    #             try:
-    #                 if self.qdrant_service:
-    #                     await self.qdrant_service.ensure_workspace_collection(workspace_id)
-    #                     logger.info(f"✅ Qdrant collection verified")
-    #                 else:
-    #                     logger.warning(f"⚠️ Qdrant service not initialized")
-    #             except Exception as e:
-    #                 logger.error(f"❌ Failed to ensure Qdrant collection: {e}")
-
-    #             # Create stop event
-    #             stop_event = asyncio.Event()
-    #             logger.info(f"✅ Created stop event")
-
-    #             # Create processing task
-    #             task = asyncio.create_task(
-    #                 self.processing_service.process_stream_with_sharing(
-    #                     stream_id=stream_id,
-    #                     camera_name=camera_name,
-    #                     source=source,
-    #                     owner_username=owner_username,
-    #                     owner_id=owner_id,
-    #                     workspace_id=workspace_id,
-    #                     stop_event=stop_event,
-    #                     location_info=location_info
-    #                 )
-    #             )
-    #             task.set_name(f"process_stream_{stream_id_str}")
-    #             task.add_done_callback(
-    #                 lambda t: asyncio.create_task(
-    #                     self._handle_stream_task_completion(stream_id_str, t)
-    #                 )
-    #             )
-    #             logger.info(f"✅ Processing task created: {task.get_name()}")
-
-    #             # Update stream info
-    #             async with self._lock:
-    #                 self.active_streams[stream_id_str].update({
-    #                     'stop_event': stop_event,
-    #                     'task': task,
-    #                     'status': 'active_pending'
-    #                 })
-                
-    #             # Register with shared stream manager
-    #             self._shared_stream_registry[source].add(stream_id_str)
-    #             logger.info(f"✅ Registered with shared stream manager")
-                
-    #             # Transition to ACTIVE state
-    #             await self._transition_stream_state(stream_id_str, StreamState.ACTIVE)
-    #             logger.info(f"✅ Transitioned to ACTIVE state")
-
-    #             # Notify workspace members
-    #             await self._notify_workspace_stream_started(workspace_id, camera_name, owner_username)
-    #             logger.info(f"✅ Workspace members notified")
-                
-    #             # Update metrics
-    #             self.metrics['total_streams_started'] += 1
-    #             logger.info(f"✅ ✅ ✅ Stream {stream_id_str} SUCCESSFULLY STARTED")
-                
-    #             logger.info(f"✅ Stream {stream_id_str} started in workspace {workspace_id_str}")
-
-    #         except Exception as e:
-    #             logger.error(f"Failed to start stream {stream_id_str}: {e}", exc_info=True)
-                
-    #             # Cleanup on failure
-    #             async with self._lock:
-    #                 self.active_streams.pop(stream_id_str, None)
-    #                 self.workspace_streams[workspace_id_str].discard(stream_id_str)
-    #                 self.stream_workspaces.pop(stream_id_str, None)
-                
-    #             self.stream_processing_stats.pop(stream_id_str, None)
-    #             self._shared_stream_registry[source].discard(stream_id_str)
-                
-    #             # Update state
-    #             await self._transition_stream_state(stream_id_str, StreamState.ERROR, force=True)
-                
-    #             # Update database
-    #             await self.video_stream_service.update_stream_status(
-    #                 stream_id, 'error', is_streaming=True, last_activity=datetime.now(ZoneInfo("Africa/Cairo"))  
-    #             )
-
-    #             logger.warning(
-    #                 f"⚠️ Stream {stream_id_str} encountered error but is_streaming=True "
-    #                 f"to allow automatic restart by management loop"
-    #             )
-                
-    #             raise
 
     async def _handle_stream_task_completion(self, stream_id_str: str, task: asyncio.Task):
         """
@@ -2397,8 +2127,8 @@ class StreamManager:
 
     async def _check_stream_health(self):
         """
-        health check with better diagnostics.
-        ENHANCED: Better detection and recovery logic.
+        Health check with proper database state verification.
+        FIXED: Always checks database state to avoid reporting stopped cameras as active.
         """
         async with self._health_lock:
             # Prevent concurrent health checks
@@ -2416,13 +2146,13 @@ class StreamManager:
                 try:
                     stream_id_uuid = UUID(stream_id_str)
                     
-                    # Check database state
+                    # ✅ CRITICAL FIX: ALWAYS check database state first
                     db_stream_state = await self.db_manager.execute_query(
-                        """SELECT vs.is_streaming, vs.status, vs.workspace_id, 
-                                  w.is_active as workspace_active
-                           FROM video_stream vs
-                           JOIN workspaces w ON vs.workspace_id = w.workspace_id
-                           WHERE vs.stream_id = $1""",
+                        """SELECT vs.is_streaming, vs.status, vs.workspace_id, vs.stop_reason,
+                                w.is_active as workspace_active
+                        FROM video_stream vs
+                        JOIN workspaces w ON vs.workspace_id = w.workspace_id
+                        WHERE vs.stream_id = $1""",
                         (stream_id_uuid,), 
                         fetch_one=True
                     )
@@ -2432,18 +2162,23 @@ class StreamManager:
                         await self._stop_stream(stream_id_str, for_restart=False)
                         continue
                     
+                    # ✅ FIX: Stop if database says is_streaming=FALSE (user stopped)
+                    if not db_stream_state.get('is_streaming', False):
+                        logger.warning(
+                            f"🛑 Camera {stream_id_str} in memory but database says is_streaming=FALSE "
+                            f"(stop_reason: {db_stream_state.get('stop_reason')}). Cleaning up from memory."
+                        )
+                        health_issues.append(f"{stream_id_str}: database says not streaming")
+                        await self._stop_stream(stream_id_str, for_restart=False)
+                        continue
+                    
                     # Stop if workspace is inactive
                     if not db_stream_state.get('workspace_active'):
                         health_issues.append(f"{stream_id_str}: workspace inactive")
                         await self._stop_stream(stream_id_str, for_restart=False)
                         continue
                     
-                    # Stop if stream should not be running
-                    if not db_stream_state.get('is_streaming', False):
-                        health_issues.append(f"{stream_id_str}: externally stopped")
-                        await self._stop_stream(stream_id_str, for_restart=False)
-                        continue
-                    
+                    # Get memory state
                     async with self._lock:
                         stream_info_mem = self.active_streams.get(stream_id_str)
                     
@@ -2500,117 +2235,6 @@ class StreamManager:
                 logger.debug(f"✅ Health check passed for {len(active_stream_ids_copy)} streams")
             
             self.last_healthcheck = datetime.now(ZoneInfo("Africa/Cairo"))
-
-    # async def _check_stream_health(self):
-    #     """
-    #     Health check with proper database state verification.
-    #     FIXED: Always checks database state to avoid reporting stopped cameras as active.
-    #     """
-    #     async with self._health_lock:
-    #         # Prevent concurrent health checks
-    #         if (datetime.now(ZoneInfo("Africa/Cairo")) - self.last_healthcheck).total_seconds() <= self.healthcheck_interval / 2:
-    #             return
-
-    #         current_time_utc = datetime.now(ZoneInfo("Africa/Cairo"))
-    #         streams_to_restart_ids = []
-    #         health_issues = []
-            
-    #         async with self._lock:
-    #             active_stream_ids_copy = list(self.active_streams.keys())
-
-    #         for stream_id_str in active_stream_ids_copy:
-    #             try:
-    #                 stream_id_uuid = UUID(stream_id_str)
-                    
-    #                 # ✅ CRITICAL FIX: ALWAYS check database state first
-    #                 db_stream_state = await self.db_manager.execute_query(
-    #                     """SELECT vs.is_streaming, vs.status, vs.workspace_id, vs.stop_reason,
-    #                             w.is_active as workspace_active
-    #                     FROM video_stream vs
-    #                     JOIN workspaces w ON vs.workspace_id = w.workspace_id
-    #                     WHERE vs.stream_id = $1""",
-    #                     (stream_id_uuid,), 
-    #                     fetch_one=True
-    #                 )
-
-    #                 if not db_stream_state:
-    #                     health_issues.append(f"{stream_id_str}: not found in database")
-    #                     await self._stop_stream(stream_id_str, for_restart=False)
-    #                     continue
-                    
-    #                 # ✅ FIX: Stop if database says is_streaming=FALSE (user stopped)
-    #                 if not db_stream_state.get('is_streaming', False):
-    #                     logger.warning(
-    #                         f"🛑 Camera {stream_id_str} in memory but database says is_streaming=FALSE "
-    #                         f"(stop_reason: {db_stream_state.get('stop_reason')}). Cleaning up from memory."
-    #                     )
-    #                     health_issues.append(f"{stream_id_str}: database says not streaming")
-    #                     await self._stop_stream(stream_id_str, for_restart=False)
-    #                     continue
-                    
-    #                 # Stop if workspace is inactive
-    #                 if not db_stream_state.get('workspace_active'):
-    #                     health_issues.append(f"{stream_id_str}: workspace inactive")
-    #                     await self._stop_stream(stream_id_str, for_restart=False)
-    #                     continue
-                    
-    #                 # Get memory state
-    #                 async with self._lock:
-    #                     stream_info_mem = self.active_streams.get(stream_id_str)
-                    
-    #                 if not stream_info_mem:
-    #                     continue
-
-    #                 # Check for stale frames
-    #                 last_activity_time_mem = (
-    #                     stream_info_mem.get('last_frame_time') or 
-    #                     stream_info_mem.get('start_time')
-    #                 )
-    #                 time_since_last_frame = float('inf')
-                    
-    #                 if last_activity_time_mem:
-    #                     if last_activity_time_mem.tzinfo is None:
-    #                         last_activity_time_mem = last_activity_time_mem.replace(tzinfo=ZoneInfo("Africa/Cairo"))
-    #                     time_since_last_frame = (
-    #                         current_time_utc - last_activity_time_mem
-    #                     ).total_seconds()
-
-    #                 stale_threshold = config.get("stream_stale_threshold_seconds", 300.0)
-    #                 if time_since_last_frame > stale_threshold:
-    #                     health_issues.append(
-    #                         f"{stream_id_str}: frozen ({time_since_last_frame:.0f}s since last frame)"
-    #                     )
-    #                     streams_to_restart_ids.append(stream_id_str)
-                    
-    #                 # Check task health
-    #                 task = stream_info_mem.get('task')
-    #                 if task and task.done():
-    #                     exc = task.exception()
-    #                     if exc:
-    #                         health_issues.append(f"{stream_id_str}: task failed - {exc}")
-    #                         streams_to_restart_ids.append(stream_id_str)
-                        
-    #             except Exception as e:
-    #                 logger.error(
-    #                     f"Error during health check for stream {stream_id_str}: {e}", 
-    #                     exc_info=True
-    #                 )
-    #                 health_issues.append(f"{stream_id_str}: health check error - {e}")
-
-    #         # Restart frozen streams
-    #         if streams_to_restart_ids:
-    #             logger.warning(f"⚠️ Health check found {len(streams_to_restart_ids)} streams to restart")
-    #             for stream_id_to_restart_str in streams_to_restart_ids:
-    #                 logger.info(f"🔄 Restarting frozen stream: {stream_id_to_restart_str}")
-    #                 await self._stop_stream(stream_id_to_restart_str, for_restart=True)
-            
-    #         # Log health summary
-    #         if health_issues:
-    #             logger.warning(f"Health check issues:\n" + "\n".join(f"  - {issue}" for issue in health_issues))
-    #         else:
-    #             logger.debug(f"✅ Health check passed for {len(active_stream_ids_copy)} streams")
-            
-    #         self.last_healthcheck = datetime.now(ZoneInfo("Africa/Cairo"))
             
     # ==================== Frame Updates ====================
 
