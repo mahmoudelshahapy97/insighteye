@@ -8,8 +8,8 @@ logger = logging.getLogger(__name__)
 
 class TokenExpirationStrategy:
     def __init__(self, 
-                access_token_expire_minutes: int = config.get("ACCESS_TOKEN_EXPIRE_MINUTES", 30), 
-                refresh_token_expire_days: int = config.get("REFRESH_TOKEN_EXPIRE_DAYS", 7),
+                access_token_expire_minutes: int = config.access_token_expire_minutes, 
+                refresh_token_expire_days: int = config.refresh_token_expire_days,
                 sliding_window: bool = True,
                 minimum_remaining_time_percent: float = 0.2):
         """

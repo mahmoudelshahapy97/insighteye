@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 
 class OTPManager:
     def __init__(self):
-        self.rate_limit_seconds = config.get("otp_rate_limit_seconds", 60)
-        self.otp_expiration_seconds = config.get("otp_expiration_seconds", 300)  # 5 minutes default
+        self.rate_limit_seconds = config.otp_rate_limit_seconds
+        self.otp_expiration_seconds = config.otp_expiration_seconds
         self.db_manager = db_manager
 
     def _hash_otp(self, otp: str) -> str:

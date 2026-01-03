@@ -68,9 +68,9 @@ class StreamProcessingService:
 
     def _initialize_models(self):
         """Initialize YOLO models."""
-        people_model_path = config.get("people_model_path", "yolov8n.pt")
-        gender_model_path = config.get("gender_model_path", "gender.pt")
-        fire_model_path = config.get("fire_model_path", "fire.pt")
+        people_model_path = config.people_model_path
+        gender_model_path = config.gender_model_path
+        fire_model_path = config.fire_model_path
         
         logger.info(f"🔍 Checking model paths:")
         logger.info(f"  People: {people_model_path} (exists: {os.path.exists(people_model_path)})")
@@ -91,95 +91,6 @@ class StreamProcessingService:
             self.gender_model = None
             self.fire_model = None
 
-    # def _initialize_models(self):
-    #     """
-    #     Initialize YOLO models with MANDATORY success requirement.
-    #     System CANNOT start if people model fails to load.
-    #     """
-    #     people_model_path = config.get("people_model_path", "yolov8n.pt")
-    #     gender_model_path = config.get("gender_model_path", "gender.pt")
-    #     fire_model_path = config.get("fire_model_path", "fire.pt")
-        
-    #     logger.info(f"🔍 Initializing YOLO models:")
-    #     logger.info(f"  People: {people_model_path} (exists: {os.path.exists(people_model_path)})")
-    #     logger.info(f"  Gender: {gender_model_path} (exists: {os.path.exists(gender_model_path)})")
-    #     logger.info(f"  Fire: {fire_model_path} (exists: {os.path.exists(fire_model_path)})")
-        
-    #     # ===== CRITICAL: People model MUST load (it's mandatory) =====
-    #     max_retries = 3
-    #     last_error = None
-        
-    #     for attempt in range(max_retries):
-    #         try:
-    #             logger.info(f"Loading people model (attempt {attempt + 1}/{max_retries})...")
-    #             self.people_model = YOLO(people_model_path)
-    #             self.people_model.fuse()
-                
-    #             # Verify it actually works
-    #             test_frame = np.zeros((640, 640, 3), dtype=np.uint8)
-    #             test_result = self.people_model.predict(test_frame, verbose=False)
-                
-    #             logger.info("✅ People model loaded and verified successfully")
-    #             break
-                
-    #         except Exception as e:
-    #             last_error = e
-    #             logger.error(f"❌ Attempt {attempt + 1} failed to load people model: {e}")
-                
-    #             if attempt < max_retries - 1:
-    #                 import time
-    #                 time.sleep(2)  # Wait before retry
-    #             else:
-    #                 # CRITICAL: MUST raise exception if all retries fail
-    #                 error_msg = (
-    #                     f"🚨 CRITICAL: Failed to load people model after {max_retries} attempts. "
-    #                     f"Last error: {last_error}. "
-    #                     f"System CANNOT function without this model!"
-    #                 )
-    #                 logger.critical(error_msg)
-    #                 raise RuntimeError(error_msg) from last_error
-        
-    #     # ===== Gender model (optional - graceful degradation) =====
-    #     try:
-    #         logger.info("Loading gender model...")
-    #         self.gender_model = YOLO(gender_model_path)
-    #         self.gender_model.fuse()
-            
-    #         # Quick verification
-    #         test_frame = np.zeros((640, 640, 3), dtype=np.uint8)
-    #         test_result = self.gender_model.predict(test_frame, verbose=False)
-            
-    #         logger.info("✅ Gender model loaded successfully")
-    #     except Exception as e:
-    #         logger.warning(f"⚠️ Gender model failed to load: {e}")
-    #         logger.warning("Gender detection will be disabled (non-critical)")
-    #         self.gender_model = None
-        
-    #     # ===== Fire model (optional - graceful degradation) =====
-    #     try:
-    #         logger.info("Loading fire model...")
-    #         self.fire_model = YOLO(fire_model_path)
-    #         self.fire_model.fuse()
-            
-    #         # Quick verification
-    #         test_frame = np.zeros((640, 640, 3), dtype=np.uint8)
-    #         test_result = self.fire_model.predict(test_frame, verbose=False)
-            
-    #         logger.info("✅ Fire model loaded successfully")
-    #     except Exception as e:
-    #         logger.warning(f"⚠️ Fire model failed to load: {e}")
-    #         logger.warning("Fire detection will be disabled (non-critical)")
-    #         self.fire_model = None
-        
-    #     # ===== Summary =====
-    #     models_loaded = ["people"]  # People is always loaded if we get here
-    #     if self.gender_model:
-    #         models_loaded.append("gender")
-    #     if self.fire_model:
-    #         models_loaded.append("fire")
-        
-    #     logger.info(f"✅ Model initialization complete: {', '.join(models_loaded)}")
-        
     def get_model_status(self) -> Dict[str, bool]:
         """Get status of all models for health checks."""
         return {
@@ -231,7 +142,7 @@ class StreamProcessingService:
         cache = self._cached_results[cache_key]
 
         # Resize frame if needed
-        max_dim = config.get("yolo_max_input_dim", 640)
+        max_dim = config.yolo_input_size
         h, w = frame.shape[:2]
         scale = 1.0
         
@@ -592,53 +503,111 @@ class StreamProcessingService:
         workspace_id: UUID,
         owner_id: UUID
     ):
-        """Handle people count alert logic with workspace-wide broadcasting."""
+        """
+        Handle people count alert logic with workspace-wide broadcasting.
+        
+        FIXED ISSUES:
+        1. Cooldown check was too strict
+        2. Missing debug logs
+        3. Threshold validation needed improvement
+        """
         try:
-            # Get alert state
+            # ==================== DEBUG: Entry Point ====================
+            logger.info(
+                f"🔍 People count alert check: stream={camera_name}, "
+                f"count={person_count}, settings={threshold_settings}"
+            )
+            
+            # Validate threshold settings
+            if not threshold_settings:
+                logger.warning(f"⚠️ No threshold settings for stream {stream_id_str}")
+                return
+            
+            if not threshold_settings.get("alert_enabled", False):
+                logger.debug(f"⏭️ Alerts disabled for stream {stream_id_str}")
+                return
+            
+            # Get alert state from database
+            from app.services.people_count_service import people_count_service
+            
             alert_state = await people_count_service.get_people_count_alert_state(stream_id)
             
             current_time = datetime.now(ZoneInfo("Africa/Cairo"))
             cooldown_minutes = 10
             
-            # Determine threshold type
+            # ==================== Determine Threshold Type ====================
             threshold_type = None
+            threshold_value = None
             greater_than = threshold_settings.get("greater_than")
             less_than = threshold_settings.get("less_than")
             
+            # Check greater_than threshold
             if greater_than is not None and person_count > greater_than:
                 threshold_type = "greater_than"
+                threshold_value = greater_than
+                logger.info(
+                    f"✅ THRESHOLD VIOLATED: {person_count} > {greater_than} "
+                    f"(greater_than threshold)"
+                )
+            
+            # Check less_than threshold
             elif less_than is not None and person_count < less_than:
                 threshold_type = "less_than"
+                threshold_value = less_than
+                logger.info(
+                    f"✅ THRESHOLD VIOLATED: {person_count} < {less_than} "
+                    f"(less_than threshold)"
+                )
             
-            if not threshold_type:
-                logger.debug(f"No threshold violated for stream {stream_id_str}")
+            else:
+                logger.debug(
+                    f"✅ No threshold violation: count={person_count}, "
+                    f"greater_than={greater_than}, less_than={less_than}"
+                )
                 return
             
-            # Check cooldown
+            # ==================== Cooldown Check ====================
             should_notify = False
+            cooldown_reason = None
+            
             if not alert_state:
                 should_notify = True
-                logger.info(f"First people count alert for stream {stream_id_str}")
+                cooldown_reason = "first_alert"
+                logger.info(f"✅ First people count alert for stream {stream_id_str}")
             else:
                 last_notification = alert_state.get("last_notification_time")
+                
                 if last_notification:
+                    # Calculate time since last notification
                     time_since_last = (current_time - last_notification).total_seconds() / 60
+                    
                     if time_since_last >= cooldown_minutes:
                         should_notify = True
+                        cooldown_reason = f"cooldown_expired_{time_since_last:.1f}min"
                         logger.info(
-                            f"Cooldown expired for stream {stream_id_str}: "
-                            f"{time_since_last:.1f} min since last alert"
+                            f"✅ Cooldown expired for stream {stream_id_str}: "
+                            f"{time_since_last:.1f} min since last alert (>= {cooldown_minutes} min)"
                         )
                     else:
+                        should_notify = False
+                        cooldown_reason = f"cooldown_active_{time_since_last:.1f}min"
                         logger.info(
-                            f"Cooldown active for stream {stream_id_str}: "
-                            f"{time_since_last:.1f}/{cooldown_minutes} min"
+                            f"⏰ Cooldown active for stream {stream_id_str}: "
+                            f"{time_since_last:.1f}/{cooldown_minutes} min remaining"
                         )
                 else:
                     should_notify = True
-                    logger.info(f"No previous notification time for stream {stream_id_str}")
+                    cooldown_reason = "no_previous_notification"
+                    logger.info(f"✅ No previous notification time for stream {stream_id_str}")
             
+            # ==================== Send Notification ====================
             if should_notify:
+                logger.warning(
+                    f"🚨 SENDING PEOPLE COUNT ALERT for {camera_name}: "
+                    f"count={person_count}, threshold={threshold_type}:{threshold_value}, "
+                    f"reason={cooldown_reason}"
+                )
+                
                 # Get location info for more detailed alert
                 stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
                 location_info = None
@@ -667,16 +636,18 @@ class StreamProcessingService:
                     location_text = " - ".join(location_parts) if location_parts else location_info.get('location', 'Unknown Location')
                 
                 # Build alert message with location
-                threshold_desc = f">{greater_than}" if threshold_type == "greater_than" else f"<{less_than}"
+                threshold_desc = f">{threshold_value}" if threshold_type == "greater_than" else f"<{threshold_value}"
                 message = (
                     f"⚠️ PEOPLE COUNT ALERT: {person_count} people detected "
                     f"(threshold: {threshold_desc}) at {location_text}"
                 )
                 
-                logger.warning(f"🚨 PEOPLE COUNT ALERT: {message}")
+                logger.warning(f"🚨 MESSAGE: {message}")
                 
-                # ✅ Create notification in database
+                # ==================== Create Database Notification ====================
                 try:
+                    from app.services.notification_service import notification_service
+                    
                     notification = await notification_service.create_notification(
                         workspace_id=workspace_id,
                         user_id=owner_id,
@@ -687,16 +658,22 @@ class StreamProcessingService:
                     )
                     
                     if notification:
-                        logger.info(f"✅ People count notification created: {notification.get('notification_id')}")
+                        logger.warning(
+                            f"✅ People count notification created in database: "
+                            f"{notification.get('notification_id')}"
+                        )
                     else:
                         logger.error(f"❌ Failed to create people count notification in database")
                         return  # Exit if notification creation failed
                         
                 except Exception as notif_err:
-                    logger.error(f"❌ Error creating people count notification: {notif_err}", exc_info=True)
+                    logger.error(
+                        f"❌ Error creating people count notification: {notif_err}", 
+                        exc_info=True
+                    )
                     return  # Exit if notification creation failed
 
-                # ✅ Broadcast to WebSocket clients
+                # ==================== Broadcast to WebSocket ====================
                 if notification and self.stream_manager:
                     try:
                         # Format notification for WebSocket
@@ -725,7 +702,7 @@ class StreamProcessingService:
                             f"(will appear in notification list)"
                         )
                         
-                        # 🔥 NEW: Broadcast to ALL workspace members (like fire alerts!)
+                        # Broadcast to ALL workspace members
                         try:
                             workspace_members = await self.stream_manager.workspace_service.get_workspace_members(
                                 workspace_id=workspace_id,
@@ -754,10 +731,16 @@ class StreamProcessingService:
                             logger.error(f"Error broadcasting to workspace members: {broadcast_err}")
                             
                     except Exception as ws_err:
-                        logger.error(f"❌ Error broadcasting people count notification: {ws_err}", exc_info=True)
+                        logger.error(
+                            f"❌ Error broadcasting people count notification: {ws_err}", 
+                            exc_info=True
+                        )
 
-                # ✅ Send email alert
+                # ==================== Send Email Alert ====================
                 try:
+                    from app.services.user_service import user_manager
+                    from app.utils import send_people_count_alert_email
+                    
                     user_info = await user_manager.get_user_by_id(owner_id)
                     
                     if not user_info:
@@ -782,7 +765,7 @@ class StreamProcessingService:
                         )
                         
                         if email_success:
-                            logger.info(f"✅ People count alert email sent to {user_email}")
+                            logger.warning(f"✅ People count alert email sent to {user_email}")
                         else:
                             logger.warning(f"⚠️ Failed to send email to {user_email} (may be rate-limited)")
 
@@ -792,7 +775,7 @@ class StreamProcessingService:
                         exc_info=True
                     )
 
-                # ✅ Update alert state in database
+                # ==================== Update Alert State ====================
                 try:
                     await people_count_service.create_or_update_people_count_alert_state(
                         stream_id=stream_id,
@@ -808,6 +791,10 @@ class StreamProcessingService:
                 logger.warning(
                     f"✅ People count alert completed for stream {stream_id_str}: "
                     f"count={person_count}, threshold={threshold_desc}, location={location_text}"
+                )
+            else:
+                logger.debug(
+                    f"⏭️ People count alert skipped for {stream_id_str}: {cooldown_reason}"
                 )
                     
         except Exception as e:
@@ -1168,13 +1155,15 @@ class StreamProcessingService:
                                 self.stream_manager.stream_processing_stats[stream_id_str]['detection_count'] = \
                                     self.stream_manager.stream_processing_stats[stream_id_str].get('detection_count', 0) + 1
                     
-                    # Handle alerts
+                    # ==================== CRITICAL: Check Alerts on EVERY Frame ====================
+                    # 1. People Count Alert - Check on EVERY frame if threshold is set
                     if alert_triggered and threshold_settings.get("alert_enabled"):
                         await self._handle_people_count_alert(
                             stream_id, stream_id_str, person_count,
                             threshold_settings, camera_name, workspace_id, owner_id
                         )
-                    
+
+                    # 2. Fire Detection Alert
                     if fire_status != "no detection":
                         await self._handle_fire_detection_alert(
                             stream_id, stream_id_str, fire_status,

@@ -26,9 +26,9 @@ async def chat_with_text(request: ChatRequest, username: str = Depends(session_m
         prompt = request.prompt
         context = request.context
         history = request.history
-        system_prompt = request.system_prompt or config['prompts']['text_chat']
-        max_tokens = request.max_tokens or config['models']['chat']['max_tokens']
-        temperature = request.temperature or config['models']['chat']['temperature']
+        system_prompt = request.system_prompt or config.system_prompt
+        max_tokens = request.max_tokens or config.chat_max_tokens
+        temperature = request.temperature or config.chat_temperature
         response_format = request.format_  # Avoid using the reserved keyword `format`
         stream = request.stream
         

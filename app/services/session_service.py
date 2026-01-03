@@ -23,10 +23,10 @@ logger = logging.getLogger(__name__)
 security = HTTPBearer()
 
 class SessionManager:
-    ACCESS_TOKEN_EXPIRE_MINUTES = config.get("ACCESS_TOKEN_EXPIRE_MINUTES", 30)
-    REFRESH_TOKEN_EXPIRE_DAYS = config.get("REFRESH_TOKEN_EXPIRE_DAYS", 7)
-    SECRET_KEY = config.get("SECRET_KEY")
-    ALGORITHM = config.get("ALGORITHM", "HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES = config.access_token_expire_minutes
+    REFRESH_TOKEN_EXPIRE_DAYS = config.refresh_token_expire_days
+    SECRET_KEY = config.secret_key
+    ALGORITHM = config.algorithm
 
     def __init__(self):
         self.db_manager = db_manager 

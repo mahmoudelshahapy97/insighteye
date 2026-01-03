@@ -176,16 +176,16 @@ class StreamManager:
         
         # Cooldown tracking with expiration
         self.people_count_notification_cooldowns: Dict[str, float] = {}
-        self.people_count_cooldown_duration = config.get("people_count_cooldown_seconds", 300.0)
+        self.people_count_cooldown_duration = config.people_count_cooldown_duration_seconds
         
         # Fire detection tracking
         self.fire_detection_states: Dict[str, Dict[str, Any]] = {}
         self.fire_detection_frame_counts: Dict[str, int] = {}
-        self.fire_cooldown_duration = config.get("fire_cooldown_seconds", 600.0)
+        self.fire_cooldown_duration = config.fire_cooldown_seconds
         
         # Health check configuration
         self.last_healthcheck = datetime.now(ZoneInfo("Africa/Cairo"))
-        self.healthcheck_interval = config.get("stream_healthcheck_interval_seconds", 60)
+        self.healthcheck_interval = config.stream_healthcheck_interval_seconds
         
         # Background tasks with monitoring
         self.background_task: Optional[asyncio.Task] = None
@@ -205,8 +205,8 @@ class StreamManager:
         }
         
         # Resource limits (NEW)
-        self.max_concurrent_streams = config.get("max_concurrent_streams", 100)
-        self.max_streams_per_workspace = config.get("max_streams_per_workspace", 50)
+        self.max_concurrent_streams = config.max_concurrent_streams
+        self.max_streams_per_workspace = config.max_streams_per_workspace
         
         # Initialize processing service
         self.processing_service.initialize(
@@ -1258,8 +1258,16 @@ class StreamManager:
 
     async def _stop_stream(self, stream_id_str: str, for_restart: bool = False):
         """
-        Stop stream with thorough cleanup.
-        FIXED: Always removes from active_streams, even if not found initially.
+        Stop stream with distributed lock release.
+        
+        CRITICAL CHANGES:
+        1. Always releases server lock when stopping
+        2. Prevents other servers from claiming stopped cameras
+        3. Handles both user stops and system errors correctly
+        
+        Args:
+            stream_id_str: Stream ID as string
+            for_restart: If True, camera will be restarted (don't release lock)
         """
         logger.info(f"🛑 Stopping stream {stream_id_str} (for_restart={for_restart})")
         
@@ -1305,6 +1313,67 @@ class StreamManager:
                     self._shared_stream_registry[source].discard(stream_id_str)
                     if not self._shared_stream_registry[source]:
                         del self._shared_stream_registry[source]
+            
+            # ==================== CRITICAL: Release Distributed Lock ====================
+            # This is the KEY change for distributed systems
+            # Must release lock so other servers can claim camera if needed
+            
+            if not for_restart:
+                try:
+                    from app.services.distributed_stream_manager import distributed_stream_manager
+                    
+                    # Determine release reason
+                    release_reason = "normal_stop"
+                    if stream_info:
+                        stop_reason = stream_info.get('stop_reason')
+                        if stop_reason == 'user_action':
+                            release_reason = "user_action"
+                        elif stop_reason in ['connection_error', 'timeout', 'system_error']:
+                            release_reason = stop_reason
+                    
+                    # Release the lock
+                    await distributed_stream_manager.release_camera_lock(
+                        stream_id_str, 
+                        reason=release_reason
+                    )
+                    
+                    logger.info(
+                        f"✅ Released distributed lock for {stream_id_str} "
+                        f"(reason: {release_reason})"
+                    )
+                    
+                except ImportError:
+                    # Fallback: Direct database update if distributed manager not available
+                    logger.warning(
+                        f"⚠️ Distributed manager not available, releasing lock directly"
+                    )
+                    
+                    try:
+                        await self.db_manager.execute_query(
+                            """
+                            UPDATE video_stream
+                            SET locked_by_server = NULL,
+                                server_heartbeat = NULL,
+                                updated_at = NOW()
+                            WHERE stream_id = $1
+                            """,
+                            (UUID(stream_id_str),)
+                        )
+                        logger.info(f"✅ Lock released directly via database for {stream_id_str}")
+                    except Exception as db_err:
+                        logger.error(f"Failed to release lock directly: {db_err}")
+                        
+                except Exception as e:
+                    logger.error(
+                        f"❌ Error releasing distributed lock for {stream_id_str}: {e}",
+                        exc_info=True
+                    )
+            else:
+                logger.info(
+                    f"⏭️ Skipping lock release for {stream_id_str} (restart planned)"
+                )
+            
+            # ==================== End Lock Release ====================
             
             # CRITICAL: Always remove from these dicts, even if stream_info was None
             async with self._lock:
@@ -1406,25 +1475,98 @@ class StreamManager:
     # ==================== Background Tasks ====================
 
     async def start_background_tasks(self):
-        """Start background tasks including retry loop"""
+        """
+        Start background tasks with distributed management integration.
+        
+        CRITICAL CHANGES:
+        1. OLD management loop (manage_streams_with_deduplication) is DISABLED
+        2. NEW distributed manager handles camera claiming
+        3. Only keeps cleanup, monitoring, and retry loops
+        """
         try:
             logging.info("Starting StreamManager background tasks...")
             
-            # Existing tasks
-            await self._start_background_tasks_internal()
-
-            # Start status batcher
-            await self.status_batcher.start()
+            # ==================== CRITICAL: Start Distributed Manager ====================
+            # This replaces the old manage_streams_with_deduplication loop
             
-            # NEW: Start retry loop
-            self.retry_task = asyncio.create_task(self._retry_loop())
-            self.retry_task.set_name("camera_retry_loop")
-            self.retry_task.add_done_callback(self._handle_task_done)
+            try:
+                from app.services.distributed_stream_manager import distributed_stream_manager
+                
+                # Check if distributed manager is already running
+                if not distributed_stream_manager.is_running:
+                    await distributed_stream_manager.start_management_loop()
+                    logger.info("✅ Distributed stream manager started")
+                else:
+                    logger.info("ℹ️ Distributed stream manager already running")
+                    
+            except ImportError as e:
+                logger.error(
+                    f"❌ CRITICAL: Cannot import distributed_stream_manager: {e}\n"
+                    f"Distributed camera management will NOT work!"
+                )
+                # Don't start old loop - fail loudly instead
+                raise RuntimeError(
+                    "Distributed stream manager is required but not available. "
+                    "Please ensure app/services/distributed_stream_manager.py exists."
+                )
+            except Exception as e:
+                logger.error(
+                    f"❌ Failed to start distributed manager: {e}",
+                    exc_info=True
+                )
+                raise
+            
+            # ==================== Start Supporting Tasks ====================
+            
+            # 1. Status Batcher (for efficient database updates)
+            await self.status_batcher.start()
+            logger.info("✅ Status batcher started")
+            
+            # 2. Cleanup Task (periodic maintenance)
+            if self.cleanup_task is None or self.cleanup_task.done():
+                self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
+                self.cleanup_task.set_name("periodic_cleanup_loop")
+                self.cleanup_task.add_done_callback(self._handle_task_done)
+                logger.info("✅ Cleanup task started")
+            
+            # 3. Resource Monitor (performance tracking)
+            if self.monitor_task is None or self.monitor_task.done():
+                self.monitor_task = asyncio.create_task(self._resource_monitor())
+                self.monitor_task.set_name("resource_monitor_loop")
+                self.monitor_task.add_done_callback(self._handle_task_done)
+                logger.info("✅ Resource monitor started")
+            
+            # 4. Retry Loop (handles failed cameras)
+            if self.retry_task is None or self.retry_task.done():
+                self.retry_task = asyncio.create_task(self._retry_loop())
+                self.retry_task.set_name("camera_retry_loop")
+                self.retry_task.add_done_callback(self._handle_task_done)
+                logger.info("✅ Retry loop started")
+            
+            # ==================== OLD MANAGEMENT LOOP - DISABLED ====================
+            # ❌ DO NOT START THIS - Distributed manager replaces it
+            #
+            # self.background_task = asyncio.create_task(
+            #     self.manage_streams_with_deduplication()
+            # )
+            #
+            # Why disabled?
+            # - Old loop doesn't understand distributed locking
+            # - Would conflict with distributed_stream_manager
+            # - Could cause duplicate camera starts
+            # =========================================================================
             
             logging.info("✅ StreamManager background tasks started successfully")
+            logging.info(
+                "ℹ️ Camera claiming is now handled by DistributedStreamManager"
+            )
             return True
+            
         except Exception as e:
-            logging.error(f"❌ Failed to start StreamManager background tasks: {e}", exc_info=True)
+            logging.error(
+                f"❌ Failed to start StreamManager background tasks: {e}", 
+                exc_info=True
+            )
             return False
 
     async def _retry_loop(self):
@@ -1579,7 +1721,7 @@ class StreamManager:
         """
         while True:
             try:
-                await asyncio.sleep(config.get("resource_monitor_interval", 300))  # 5 minutes
+                await asyncio.sleep(config.resource_monitor_interval)  # 5 minutes
                 
                 # Collect metrics
                 metrics = {
@@ -1626,8 +1768,73 @@ class StreamManager:
         consecutive_errors = 0
         max_consecutive_errors = 5
         zombie_check_counter = 0
+
+        server_id = config.server_id
+        max_capacity = config.max_local_streams
         
         while True:
+
+            try:
+                # 1. Update heartbeat for cameras I already own
+                async with self._lock:
+                    my_active_ids = list(self.active_streams.keys())
+                
+                if my_active_ids:
+                    heartbeat_query = """
+                        UPDATE video_stream 
+                        SET server_heartbeat = NOW() 
+                        WHERE stream_id = ANY($1::uuid[]) AND locked_by_server = $2
+                    """
+                    await self.db_manager.execute_query(heartbeat_query, (my_active_ids, server_id))
+
+                # 2. Identify "Orphaned" or "Available" cameras
+                # A camera is available if:
+                # - is_streaming is TRUE AND
+                # - (locked_by_server is NULL OR server_heartbeat is older than 2 minutes)
+                # - AND stop_reason is NOT user_action
+                
+                # Find how many slots I have left
+                current_count = len(my_active_ids)
+                slots_available = max_capacity - current_count
+
+                if slots_available > 0:
+                    claim_query = """
+                        WITH available_cameras AS (
+                            SELECT stream_id 
+                            FROM video_stream 
+                            WHERE is_streaming = TRUE 
+                            AND (locked_by_server IS NULL OR server_heartbeat < NOW() - INTERVAL '2 minutes')
+                            AND (stop_reason IS NULL OR stop_reason != 'user_action')
+                            LIMIT $1
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE video_stream
+                        SET locked_by_server = $2,
+                            server_heartbeat = NOW(),
+                            status = 'processing'
+                        FROM available_cameras
+                        WHERE video_stream.stream_id = available_cameras.stream_id
+                        RETURNING video_stream.stream_id, video_stream.name, video_stream.path, video_stream.workspace_id, video_stream.user_id
+                    """
+                    
+                    newly_claimed = await self.db_manager.execute_query(claim_query, (slots_available, server_id), fetch_all=True)
+                    
+                    if newly_claimed:
+                        logger.info(f"🚀 Server {server_id} claimed {len(newly_claimed)} new streams")
+                        for camera in newly_claimed:
+                            # Logic to trigger self.start_stream_background(...)
+                            # Similar to your current start logic
+                            pass
+
+                # 3. Clean up: If a camera is assigned to me in DB but NOT running in memory (crashed)
+                # Or if it's running in memory but assigned to someone else in DB (stolen)
+                # This handles the "Zombie" logic you already have but uses server_id
+                
+            except Exception as e:
+                logger.error(f"Error in distributed management loop: {e}")
+            
+            await asyncio.sleep(20) # Check every 20 seconds
+
             try:
 
                  # Every 5 cycles, run zombie detection
@@ -1755,11 +1962,8 @@ class StreamManager:
                             ))
                             
                             # Check file-level concurrency limits
-                            enable_sharing = config.get("enable_stream_sharing", True)
-                            max_streams_per_file = config.get(
-                                "max_streams_per_file", 
-                                5 if enable_sharing else 1
-                            )
+                            enable_sharing = config.enable_stream_sharing
+                            max_streams_per_file = config.max_streams_per_file if enable_sharing else 1
                             
                             active_streams_for_path = [
                                 s for s in streams_for_path
@@ -1933,7 +2137,7 @@ class StreamManager:
             
             # ==================== STEP 8: Sleep ====================
             # Longer sleep to prevent interference with active streams
-            configured_sleep = config.get("stream_manager_poll_interval_seconds", 30.0)
+            configured_sleep = config.stream_manager_poll_interval_seconds
             sleep_time = max(30.0, configured_sleep)  # Minimum 30 seconds
             
             logger.info(f"💤 Management loop sleeping for {sleep_time}s")
@@ -2083,7 +2287,7 @@ class StreamManager:
             except Exception as e:
                 logger.error(f"Error in periodic cleanup: {e}", exc_info=True)
 
-            await asyncio.sleep(config.get("stream_cleanup_interval_seconds", 60.0))
+            await asyncio.sleep(config.stream_cleanup_interval_seconds)
 
     async def _clean_websocket_connections(self):
         """
@@ -2199,7 +2403,7 @@ class StreamManager:
                             current_time_utc - last_activity_time_mem
                         ).total_seconds()
 
-                    stale_threshold = config.get("stream_stale_threshold_seconds", 120.0)
+                    stale_threshold = config.stream_stale_threshold_seconds
                     if time_since_last_frame > stale_threshold:
                         health_issues.append(
                             f"{stream_id_str}: frozen ({time_since_last_frame:.0f}s since last frame)"
@@ -2342,7 +2546,7 @@ class StreamManager:
 
     async def _restart_background_task_if_needed(self, failed_task_name: Optional[str] = None):
         """Restart failed background tasks."""
-        await asyncio.sleep(config.get("stream_manager_restart_delay_seconds", 15.0))
+        await asyncio.sleep(config.stream_manager_restart_delay_seconds)
         logging.info(f"🔄 Attempting to restart background task: {failed_task_name or 'Unknown'}")
         
         # Restart management task
@@ -2403,11 +2607,37 @@ class StreamManager:
             logging.error(f"Error in _handle_task_done: {e}", exc_info=True)
 
     async def stop_background_tasks(self):
-        """Stop all background tasks."""
+        """
+        Stop all background tasks including distributed manager.
+        
+        UPDATED: Now also stops distributed manager
+        """
+        logger.info("🛑 Stopping StreamManager background tasks...")
+        
+        # 1. Stop distributed manager first
+        try:
+            from app.services.distributed_stream_manager import distributed_stream_manager
+
+            if distributed_stream_manager.is_running:
+                await distributed_stream_manager.stop_management_loop()
+                logger.info("✅ Distributed stream manager stopped")
+        except ImportError:
+            logger.warning("⚠️ Distributed manager not available for shutdown")
+        except Exception as e:
+            logger.error(f"Error stopping distributed manager: {e}")
+        
+        # 2. Stop status batcher
+        try:
+            await self.status_batcher.stop()
+            logger.info("✅ Status batcher stopped")
+        except Exception as e:
+            logger.error(f"Error stopping status batcher: {e}")
+        
+        # 3. Stop other tasks
         tasks_to_stop = [
-            ("background_task", self.background_task),
             ("cleanup_task", self.cleanup_task),
             ("monitor_task", self.monitor_task),
+            ("retry_task", self.retry_task),
         ]
         
         for name, task_instance in tasks_to_stop:
@@ -2424,9 +2654,11 @@ class StreamManager:
                 except Exception as e:
                     logging.error(f"❌ Error cancelling {name} ({task_name_str}): {e}", exc_info=True)
         
-        self.background_task = None
         self.cleanup_task = None
         self.monitor_task = None
+        self.retry_task = None
+        
+        logger.info("✅ All background tasks stopped")
 
     async def _ensure_collection_for_stream_workspace(self, workspace_id: UUID):
         """Ensure Qdrant collection exists for workspace."""
@@ -2438,10 +2670,14 @@ class StreamManager:
     # ==================== Shutdown ====================
 
     async def shutdown(self):
-        """shutdown with better cleanup."""
+        """
+        Graceful shutdown with distributed lock release.
+        
+        UPDATED: Ensures all locks are released before shutdown
+        """
         logging.info("🛑 Shutting down StreamManager...")
         
-        # Stop background tasks first
+        # Stop background tasks first (includes distributed manager)
         await self.stop_background_tasks()
         
         # Get all active streams
@@ -2451,6 +2687,8 @@ class StreamManager:
         # Stop all streams with timeout
         if active_stream_ids:
             logging.info(f"Stopping {len(active_stream_ids)} active streams...")
+            
+            # Stop streams (this will release locks automatically via _stop_stream)
             stop_tasks = [
                 self._stop_stream(stream_id, for_restart=False) 
                 for stream_id in active_stream_ids
@@ -2461,8 +2699,26 @@ class StreamManager:
                     asyncio.gather(*stop_tasks, return_exceptions=True),
                     timeout=30.0
                 )
+                logger.info("✅ All streams stopped")
             except asyncio.TimeoutError:
                 logging.warning("⚠️ Stream shutdown timed out after 30s")
+                
+                # Force release any remaining locks
+                try:
+                    from app.services.distributed_stream_manager import distributed_stream_manager
+                    
+                    for stream_id_str in active_stream_ids:
+                        try:
+                            await distributed_stream_manager.release_camera_lock(
+                                stream_id_str,
+                                reason="forced_shutdown"
+                            )
+                        except:
+                            pass
+                    
+                    logger.info("✅ Force-released remaining locks")
+                except:
+                    pass
         
         # Clear all state
         async with self._lock:
@@ -2509,45 +2765,6 @@ class StreamManager:
         # Clean up disconnected sockets
         for ws in disconnected_sockets:
             self.notification_subscribers[user_id_str].discard(ws)
-
-    # async def broadcast_notification(self, user_id_str: str, notification_data: dict):
-    #     """
-    #     Broadcast a notification to a specific user's WebSocket connections.
-        
-    #     Args:
-    #         user_id_str: User ID as string
-    #         notification_data: Notification data dictionary
-    #     """
-    #     if user_id_str not in self.notification_subscribers:
-    #         logger.debug(f"No WebSocket subscribers for user {user_id_str}")
-    #         return
-        
-    #     disconnected_sockets = []
-    #     sent_count = 0
-        
-    #     async with self._notification_lock:
-    #         websockets = list(self.notification_subscribers.get(user_id_str, set()))
-        
-    #     for websocket in websockets:
-    #         try:
-    #             if websocket.client_state == WebSocketState.CONNECTED:
-    #                 await websocket.send_json(notification_data)
-    #                 sent_count += 1
-    #                 logger.info(f"✅ Sent notification (type={notification_data.get('type')}) to user {user_id_str}")
-    #             else:
-    #                 disconnected_sockets.append(websocket)
-    #         except Exception as e:
-    #             logger.error(f"Error broadcasting notification to user {user_id_str}: {e}")
-    #             disconnected_sockets.append(websocket)
-        
-    #     # Clean up disconnected sockets
-    #     if disconnected_sockets:
-    #         async with self._notification_lock:
-    #             for ws in disconnected_sockets:
-    #                 self.notification_subscribers[user_id_str].discard(ws)
-        
-    #     logger.info(f"📤 Broadcasted to {sent_count} WebSocket(s) for user {user_id_str}")
-    #     return sent_count
 
     async def broadcast_fire_alert_popup(
         self,

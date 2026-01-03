@@ -36,23 +36,23 @@ class ElasticsearchService:
         self.workspace_service = workspace_service
         self.db_manager = db_manager
         self.user_manager = user_manager
-        self.BASE_INDEX_NAME = config.get("elasticsearch_index_name", "person_counts")
+        self.BASE_INDEX_NAME = config.elasticsearch_index_name
         self._workspace_index_init_cache: Dict[str, bool] = {}
-        self.fire_state_cleanup_interval = config.get("fire_state_cleanup_interval_seconds", 3600)
+        self.fire_state_cleanup_interval = config.fire_state_cleanup_interval_seconds
         
     def get_client(self) -> AsyncElasticsearch:
         """Get or initialize Elasticsearch client"""
         if self.es_client is None:
-            hosts = config.get("elasticsearch_hosts", ["http://localhost:9200"])
+            hosts = config.elasticsearch_hosts
 
             client_options = {
                 "hosts": hosts,
-                "request_timeout": config.get("elasticsearch_timeout", 60.0),
+                "request_timeout": config.elasticsearch_timeout,
                 "max_retries": 3,
                 "retry_on_timeout": True,
             }
             
-            es_version = config.get("elasticsearch_version", "8")  # Default to 8
+            es_version = config.elasticsearch_version  # Default to 8
             if es_version in ["7", "8"]:
                 # For elasticsearch-py 9.x connecting to ES 7.x/8.x servers
                 client_options["headers"] = {
@@ -978,7 +978,7 @@ class ElasticsearchService:
                 result = await client.search(
                     index=index_name,
                     query=es_query,
-                    size=config.get("prediction_data_points_limit", 250),
+                    size=config.gprediction_data_points_limit,
                     sort=[{"timestamp": {"order": "desc"}}],
                     _source=["timestamp", "person_count", "male_count", "female_count", "fire_status"]
                 )

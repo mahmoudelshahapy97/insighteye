@@ -187,7 +187,7 @@ class UnifiedDataService:
     """
     
     def __init__(self):
-        self.backend_type = config.get("data_backend", "qdrant").lower()
+        self.backend_type = config.data_backend.lower()
         
         if self.backend_type == "elasticsearch":
             self.backend = ElasticsearchBackend()
@@ -736,7 +736,7 @@ class UnifiedDataService:
                 mappings=mappings
             )
         else:
-            vector_size = kwargs.get('vector_size', config.get("qdrant_vector_size", 1))
+            vector_size = kwargs.get('vector_size', config.qdrant_vector_size)
             distance = kwargs.get('distance', 'DOT')
             return await self.backend.service.create_collection(
                 collection_name=name,

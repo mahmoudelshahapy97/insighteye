@@ -82,12 +82,12 @@ async def chat_with_qdrant(
         context = request.context or ""
         history = request.history or []
         system_prompt = request.system_prompt or generate_qdrant_system_prompt()
-        max_tokens = request.max_tokens or config['models']['chat']['max_tokens']
-        temperature = request.temperature if request.temperature is not None else config['models']['chat']['temperature']
+        max_tokens = request.max_tokens or config.chat_max_tokens
+        temperature = request.temperature if request.temperature is not None else config.chat_temperature
         response_format = request.format_
         stream = request.stream
 
-        model_id = config['models']['chat']['llama']
+        model_id = config.chat_llama
         model = get_ChatOllama_model(model_id, temperature, max_tokens, response_format)
 
         messages = format_chat_history(history, system_prompt, context)

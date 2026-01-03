@@ -28,18 +28,6 @@ pool_stats = {
     'last_health_check': None
 }
 
-def validate_db_config(config: Dict[str, Any]) -> None:
-    """Validate database configuration parameters."""
-    required_keys = ['host', 'port', 'dbname', 'user', 'password']
-    for key in required_keys:
-        if key not in config['database'] and not os.environ.get(f"DB_{key.upper()}"):
-            raise ValueError(f"Missing database configuration for '{key}'")
-    try:
-        port = config['database'].get('port', os.environ.get('DB_PORT', '6432'))
-        int(port)  # Ensure port is a valid integer
-    except ValueError:
-        raise ValueError("Database port must be a valid integer")
-
 @retry(
     stop=stop_after_attempt(10),  # Increased from 3 to 10
     wait=wait_exponential(multiplier=2, min=2, max=30),  # Exponential backoff
@@ -67,14 +55,13 @@ async def init_db_pool(
         return
 
     try:
-        validate_db_config(config)
         
         # Get configuration with optimized defaults
-        DB_HOST = config['database'].get('host', os.environ.get('DB_HOST', 'localhost'))
-        DB_PORT = int(config['database'].get('port', os.environ.get('DB_PORT', '6432')))
-        POSTGRES_DB = config['database'].get('dbname', os.environ.get('POSTGRES_DB', 'appdb'))
-        DB_USER = config['database'].get('user', os.environ.get('POSTGRES_USER', 'postgres'))
-        POSTGRES_PASSWORD = config['database'].get('password', os.environ.get('POSTGRES_PASSWORD', 'postgres'))
+        DB_HOST = config.db_host
+        DB_PORT = int(config.db_port)
+        POSTGRES_DB = config.postgres_db
+        DB_USER = config.postgres_user
+        POSTGRES_PASSWORD = config.postgres_password
         
         # Optimized pool settings for remote database
         min_size = min_connections or int(os.environ.get('DB_MIN_POOL_SIZE', '50'))

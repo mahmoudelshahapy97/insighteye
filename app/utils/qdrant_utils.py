@@ -13,7 +13,7 @@ from app.config.settings import config
 
 logger = logging.getLogger(__name__)
 
-BASE_QDRANT_COLLECTION_NAME = config.get("qdrant_collection_name", "person_counts")
+BASE_QDRANT_COLLECTION_NAME = config.qdrant_collection_name
 _workspace_collection_init_cache: Dict[str, bool] = {}
 
 

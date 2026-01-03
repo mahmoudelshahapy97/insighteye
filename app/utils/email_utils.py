@@ -116,10 +116,10 @@ def _send_email_sync(
     html_body: Optional[str] = None
 ) -> bool:
     """Synchronous helper for sending email."""
-    app_sender_email = config.get("otp_sender_email", config.get("sender_email"))
-    app_sender_password = config.get("smtp_password", config.get("sender_password"))
-    smtp_server_host = config.get("smtp_server")
-    smtp_server_port = int(config.get("smtp_port", 587))
+    app_sender_email = config.sender_email
+    app_sender_password = config.sender_password
+    smtp_server_host = config.smtp_server
+    smtp_server_port = int(config.smtp_port)
 
     if not all([app_sender_email, app_sender_password, smtp_server_host, smtp_server_port]):
         logger.error("SMTP server, port, or credentials not fully configured for send_email.")
@@ -136,7 +136,7 @@ def _send_email_sync(
 
     context = ssl.create_default_context()
     try:
-        with smtplib.SMTP(smtp_server_host, smtp_server_port, timeout=config.get("smtp_timeout", 30)) as server:
+        with smtplib.SMTP(smtp_server_host, smtp_server_port, timeout=config.smtp_timeout) as server:
             server.ehlo_or_helo_if_needed()
             if server.has_extn('STARTTLS'):
                 server.starttls(context=context)
@@ -197,10 +197,10 @@ def _send_email_from_client_to_admin_sync(
     reply_to_email: Optional[str] = None
 ) -> bool:
     """Synchronous helper for sending admin notification email."""
-    app_sender_email = config.get("otp_sender_email", config.get("sender_email"))
-    app_sender_password = config.get("smtp_password", config.get("sender_password"))
-    smtp_server_host = config.get("smtp_server")
-    smtp_server_port = int(config.get("smtp_port", 587))
+    app_sender_email = config.sender_email
+    app_sender_password = config.sender_password
+    smtp_server_host = config.smtp_server
+    smtp_server_port = int(config.smtp_port)
 
     if not all([app_sender_email, app_sender_password, smtp_server_host, smtp_server_port]):
         logger.error("SMTP config incomplete for send_email_from_client_to_admin.")
@@ -217,7 +217,7 @@ def _send_email_from_client_to_admin_sync(
 
     context = ssl.create_default_context()
     try:
-        with smtplib.SMTP(smtp_server_host, smtp_server_port, timeout=config.get("smtp_timeout", 30)) as server:
+        with smtplib.SMTP(smtp_server_host, smtp_server_port, timeout=config.smtp_timeout) as server:
             server.ehlo_or_helo_if_needed()
             if server.has_extn('STARTTLS'):
                 server.starttls(context=context)

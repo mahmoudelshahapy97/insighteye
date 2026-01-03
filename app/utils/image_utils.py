@@ -34,7 +34,7 @@ def frame_to_base64(frame: np.ndarray) -> str:
     success, buffer = cv2.imencode(
         '.jpg', 
         frame, 
-        [int(cv2.IMWRITE_JPEG_QUALITY), config.get("jpeg_quality", 85)]
+        [int(cv2.IMWRITE_JPEG_QUALITY), config.jpeg_quality]
     )
     if not success:
         logger.error("cv2.imencode failed during frame_to_base64 conversion.")

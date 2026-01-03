@@ -630,7 +630,7 @@ async def update_password_route(
 async def create_contact_route(contact: ContactCreate, request_obj: FastAPIRequest): # Renamed for consistency
     log_action_type_prefix = "Contact_Form"
     try:
-        admin_email_recipient = config.get("sender_email", "insighteye@gateworx.net") 
+        admin_email_recipient = config.sender_email
         if not admin_email_recipient:
             logger.error("Admin contact email not configured. Cannot process contact form.")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="System configuration error for contact form.")

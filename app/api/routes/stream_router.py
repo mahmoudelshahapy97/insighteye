@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from app.utils import frame_to_base64, check_workspace_access, safe_close_websocket, send_ping, handle_mark_read_message
-from app.services.stream_service_3 import stream_manager
+from app.services.stream_service import stream_manager
 from app.services.session_service import session_manager 
 from app.services.workspace_service import workspace_service
 from app.config.settings import config
@@ -1019,7 +1019,7 @@ async def websocket_workspace_stream(websocket: WebSocket):
                 await stream_manager.start_stream_in_workspace(stream_id_str, requester_user_id_str)
                 
                 # Wait for stream to become active
-                for _ in range(config.get("stream_ws_start_wait_attempts", 10)):
+                for _ in range(config.stream_ws_start_wait_attempts):
                     async with stream_manager._lock:
                         current_stream_info_manager = stream_manager.active_streams.get(stream_id_str)
                     if current_stream_info_manager and current_stream_info_manager.get('status') == 'active':
@@ -1064,7 +1064,7 @@ async def websocket_workspace_stream(websocket: WebSocket):
         
         ping_task = asyncio.create_task(send_ping(websocket))
         
-        target_fps = config.get("websocket_client_fps", 15.0)
+        target_fps = config.websocket_client_fps
         target_frame_interval = 1.0 / target_fps if target_fps > 0 else 0.066
 
         # Main streaming loop
@@ -1237,7 +1237,7 @@ async def websocket_notify(websocket: WebSocket):
         
         while websocket.client_state == WebSocketState.CONNECTED and consecutive_errors < max_consecutive_errors:
             try:
-                receive_timeout = float(config.get("websocket_receive_timeout", 60.0))
+                receive_timeout = config.websocket_receive_timeout
                 message = await asyncio.wait_for(websocket.receive_json(), timeout=receive_timeout)
                 
                 # Reset error counter on successful message
@@ -2052,9 +2052,9 @@ async def check_model_health(
         model_status = stream_processing_service.get_model_status()
         
         # Get model paths from config
-        people_path = config.get("people_model_path", "yolov8n.pt")
-        gender_path = config.get("gender_model_path", "gender.pt")
-        fire_path = config.get("fire_model_path", "fire.pt")
+        people_path = config.people_model_path
+        gender_path = config.gender_model_path
+        fire_path = config.fire_model_path
         
         # Check file existence
         files_exist = {

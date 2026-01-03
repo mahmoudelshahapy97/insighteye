@@ -70,17 +70,15 @@ async def generate_chat_response(
 ):
     """Core logic for generating a chat response using Ollama models."""
     
-    model_config = config['models']['chat']
-    
     if not image:
-        model_id = model_config.get('llama', 'llama3')
+        model_id = config.chat_llama
         model = get_ChatOllama_model(model_id, temperature, max_tokens, format_)
         logger.info(f"Using Ollama model {model_id} for text chat.")
 
         messages = format_chat_history(history, system_prompt=system_prompt, context=context)
         messages.append({"role": "human", "content": prompt})
     else:
-        model_id = model_config.get('llava', 'llava')
+        model_id = config.chat_llama
         model = get_ChatOllama_model(model_id, temperature, max_tokens, format_)
         logger.info(f"Using Ollama model {model_id} for image chat.")
 

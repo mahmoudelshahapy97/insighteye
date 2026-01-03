@@ -660,7 +660,7 @@ class PostgresService:
                 where_clause = " AND ".join(conditions)
                 
                 # Get limited data points for prediction
-                limit = config.get("prediction_data_points_limit", 250)
+                limit = config.prediction_data_points_limit
                 query = f"""
                     SELECT timestamp, person_count, male_count, female_count, fire_status
                     FROM stream_results

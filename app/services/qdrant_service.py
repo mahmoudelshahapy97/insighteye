@@ -35,17 +35,17 @@ class QdrantService:
         self.workspace_service = workspace_service
         self.db_manager = db_manager
         self.user_manager = user_manager
-        self.BASE_COLLECTION_NAME = config.get("qdrant_collection_name", "person_counts")
+        self.BASE_COLLECTION_NAME = config.qdrant_collection_name
         self._workspace_collection_init_cache: Dict[str, bool] = {}
-        self.fire_state_cleanup_interval = config.get("fire_state_cleanup_interval_seconds", 3600)  # 1 hour
+        self.fire_state_cleanup_interval = config.fire_state_cleanup_interval_seconds
         self.qdrant_client = self._initialize_client()  # Direct initialization
         
     def _initialize_client(self) -> QdrantClient:
         """Initialize Qdrant client"""
         client = QdrantClient(
-            url=config.get("qdrant_url", "localhost"),
-            port=config.get("qdrant_port", 6333),
-            timeout=config.get("qdrant_timeout", 60.0)
+            url=config.qdrant_url,
+            port=config.qdrant_port_http,
+            timeout=config.qdrant_query_timeout
         )
         logger.info("Qdrant client initialized.")
         return client
@@ -121,7 +121,7 @@ class QdrantService:
                     "longitude": float(location_info['longitude']) if location_info.get('longitude') else None,
                 })
             
-            vector_size = config.get("qdrant_vector_size", 1)
+            vector_size = config.qdrant_vector_size
             point = qdrant_models.PointStruct(
                 id=point_id_str, 
                 vector=[0.0] * vector_size, 
@@ -158,7 +158,7 @@ class QdrantService:
             await ensure_workspace_qdrant_collection_exists(client, workspace_id)
             
             points = []
-            vector_size = config.get("qdrant_vector_size", 1)
+            vector_size = config.qdrant_vector_size
             
             for detection in detection_batch:
                 point_id_str = str(uuid4())
@@ -845,7 +845,7 @@ class QdrantService:
                 points, _ = client.scroll(
                     collection_name=collection_name,
                     scroll_filter=filter_obj,
-                    limit=config.get("prediction_data_points_limit", 250),
+                    limit=config.prediction_data_points_limit,
                     with_payload=["timestamp", "person_count", "male_count", "female_count", "fire_status"],
                     with_vectors=False,
                     order_by=qdrant_models.OrderBy(

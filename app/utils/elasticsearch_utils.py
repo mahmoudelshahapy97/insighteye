@@ -13,7 +13,7 @@ from app.config.settings import config
 
 logger = logging.getLogger(__name__)
 
-BASE_ELASTICSEARCH_INDEX_NAME = config.get("elasticsearch_index_name", "personcounts")
+BASE_ELASTICSEARCH_INDEX_NAME = config.elasticsearch_index_name
 _workspace_index_init_cache: Dict[str, bool] = {}
 
 
@@ -206,9 +206,9 @@ async def ensure_workspace_elasticsearch_index_exists(
         
         # Define index settings
         settings = {
-            "number_of_shards": config.get("elasticsearch_shards", 1),
-            "number_of_replicas": config.get("elasticsearch_replicas", 1),
-            "refresh_interval": config.get("elasticsearch_refresh_interval", "1s")
+            "number_of_shards": config.elasticsearch_shards,
+            "number_of_replicas": config.elasticsearch_replicas,
+            "refresh_interval": config.elasticsearch_refresh_interval
         }
         
         # Create index with mappings and settings

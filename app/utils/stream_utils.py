@@ -51,7 +51,7 @@ async def safe_close_websocket(websocket: WebSocket, username_for_log: Optional[
 async def send_ping(websocket: WebSocket):
     """Send periodic pings to keep WebSocket connection alive."""
     try:
-        ping_interval = float(config.get("websocket_ping_interval", 30.0))
+        ping_interval = float(config.websocket_ping_interval)
         while websocket.client_state == WebSocketState.CONNECTED:
             await asyncio.sleep(ping_interval)
             if websocket.client_state == WebSocketState.CONNECTED:
@@ -114,7 +114,7 @@ async def handle_mark_read_message(message: dict, user_id_str: str, username_for
 
 async def send_ping_with_stability_check(websocket: WebSocket, username_for_log: str):
     try:
-        ping_interval = float(config.get("websocket_ping_interval", 45.0))  # Longer interval
+        ping_interval = float(config.websocket_ping_interval)  # Longer interval
         consecutive_ping_failures = 0
         max_ping_failures = 3
         

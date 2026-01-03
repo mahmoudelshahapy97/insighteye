@@ -9,8 +9,9 @@ from app.config.settings import config
 from app.utils.logging_config import setup_logging
 
 from app.api.routes import router
-from app.services.stream_service_3 import stream_manager, initialize_stream_manager
+from app.services.stream_service import stream_manager, initialize_stream_manager
 from app.services.stream_processing_service import stream_processing_service
+from app.services.distributed_stream_manager import initialize_distributed_stream_manager
 
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ from app.services.database import (
     check_postgres_health
 )
 
-setup_logging(config.get("log_file_path", "/app/logs/app.log"))
+setup_logging(config.log_file_path)
 logger = logging.getLogger(__name__)
 logger.info("Logging initialized successfully!")
 
@@ -55,6 +56,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize StreamManager: {e}", exc_info=True)
 
+    try:
+        await initialize_distributed_stream_manager() 
+        logger.info("Stream manager initialized and background tasks started.")
+    except Exception as e:
+        logger.error(f"Failed to initialize StreamManager: {e}", exc_info=True)
 
     logger.info("Application startup complete (async).")
     yield
@@ -63,6 +69,10 @@ async def lifespan(app: FastAPI):
 
     if stream_manager:
         try:
+
+            # Stop distributed manager first
+            await distributed_stream_manager.stop_management_loop()
+
             await stream_manager.shutdown() # Already async
             logger.info("Stream manager shutdown complete.")
         except Exception as e:
@@ -81,34 +91,34 @@ from starlette.middleware.base import BaseHTTPMiddleware
 class CacheControlMiddleware(BaseHTTPMiddleware): 
     async def dispatch(self, request, call_next):
         response = await call_next(request)
-        static_path = config.get("static_path_prefix", "/static/")
-        api_prefix = config.get("api_path_prefix", "/api/")
-        auth_prefix = config.get("auth_path_prefix", "/auth/")
+        static_path = config.static_path_prefix
+        api_prefix = config.api_path_prefix
+        auth_prefix = config.auth_path_prefix
 
         if request.url.path.startswith(static_path):
-            response.headers['Cache-Control'] = config.get("static_cache_control", "public, max-age=604800")
+            response.headers['Cache-Control'] = config.static_cache_control
         elif request.url.path.startswith(api_prefix) or request.url.path.startswith(auth_prefix):
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, proxy-revalidate'
         return response
 
 app = FastAPI(
-    root_path=config.get("fastapi_root_path", "/insighteye"),
+    # root_path=config.fastapi_root_path,
     lifespan=lifespan,
-    title=config.get("fastapi_title", "InsightEye API"),
-    description=config.get("fastapi_description", "API for managing cameras, users, and insights."),
-    version=config.get("fastapi_version", "1.0.0"),
-    openapi_url=f"{config.get('fastapi_docs_prefix', '')}/openapi.json",
-    docs_url=f"{config.get('fastapi_docs_prefix', '')}/docs",
-    redoc_url=f"{config.get('fastapi_docs_prefix', '')}/redoc",
+    title=config.app_name,
+    description=config.app_description,
+    version=config.app_version,
+    # openapi_url=f"{config.fastapi_root_path}/openapi.json",
+    # docs_url=f"{config.fastapi_root_path}/docs",
+    # redoc_url=f"{config.fastapi_root_path}/redoc",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
-    allow_credentials=config.get("cors_allow_credentials", True),
-    allow_methods=config.get("cors_allow_methods", ["*"]),
-    allow_headers=config.get("cors_allow_headers", ["*"]),
-    expose_headers=config.get("cors_expose_headers", ["X-Request-ID"])
+    allow_credentials=config.cors_allow_credentials,
+    allow_methods=config.cors_allow_methods,
+    allow_headers=config.cors_allow_headers,
+    expose_headers=config.cors_expose_headers
 )
 
 @app.middleware("http")
@@ -118,7 +128,7 @@ async def add_security_headers(request: Request, call_next): # Identical to main
     x_forwarded_proto = request.headers.get("x-forwarded-proto")
     is_behind_secure_proxy = x_forwarded_proto == "https"
 
-    if is_secure_scheme or is_behind_secure_proxy or config.get("force_hsts", False):
+    if is_secure_scheme or is_behind_secure_proxy or config.force_hsts:
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
 
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -192,18 +202,18 @@ async def shutdown_event():
     """Application shutdown"""
     
     logging.info("Shutting down application...")
+
+    # Stop distributed manager first
+    await distributed_stream_manager.stop_management_loop()
+    # Then existing cleanup...
     await stream_manager.shutdown()
     logging.info("✅ Application shutdown complete")
 
 if __name__ == "__main__":
-    server_host = config.get("server_host", "0.0.0.0")
-    server_port = config.get("server_port", 8000)
-    reload_app = config.get("debug_reload", False) 
 
-    logger.info(f"Starting Uvicorn server on {server_host}:{server_port} with reload: {reload_app}")
     uvicorn.run(
         "main:app", 
-        host=server_host,
-        port=server_port,
+        host=config.app_host,
+        port=config.app_port,
     )
     
