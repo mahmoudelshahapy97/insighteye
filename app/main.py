@@ -102,7 +102,7 @@ class CacheControlMiddleware(BaseHTTPMiddleware):
         return response
 
 app = FastAPI(
-    # root_path=config.fastapi_root_path,
+    root_path=config.fastapi_root_path,
     lifespan=lifespan,
     title=config.app_name,
     description=config.app_description,
