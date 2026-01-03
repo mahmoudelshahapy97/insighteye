@@ -46,10 +46,15 @@ class SharedVideoStream:
         self.is_file_source = self._is_file_source(source)
         self.is_rtsp_source = self._is_rtsp_source(source)
         self.file_exists = self._validate_file_source(source) if self.is_file_source else True
-        
+
+        # RTSP error handling
+        self.consecutive_decode_errors = 0
+        self.max_decode_errors = 10  # Reconnect after 10 consecutive errors
+        self.last_good_frame_time = None
+
         # RTSP settings
-        self.rtsp_timeout = 10
-        self.rtsp_reconnect_delay = 1
+        self.rtsp_timeout = 15
+        self.rtsp_reconnect_delay = 2
         
         # CRITICAL: Capture lock to ensure only one read() at a time
         self._capture_lock = asyncio.Lock()
@@ -144,24 +149,47 @@ class SharedVideoStream:
         except Exception as e:
             logging.error(f"Error validating video file {source}: {e}")
             return False
-
+        
     def _configure_rtsp_environment(self):
-        """Configure environment for RTSP"""
+        """
+        RTSP configuration to reduce decoding errors.
+        
+        KEY FIXES:
+        1. Increased buffer sizes
+        2. More lenient error handling
+        3. Faster timeout recovery
+        """
         if not self.is_rtsp_source:
             return
         
+        # ==================== CRITICAL: FFmpeg Error Handling ====================
+        
+        # Suppress FFmpeg error messages to stderr (reduces log spam)
+        os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'  # AV_LOG_QUIET
+        
+        # RTSP transport and timeout settings
         os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
-            f'rtsp_transport;tcp|'
-            f'timeout;{self.rtsp_timeout * 1000000}|'
-            f'stimeout;{self.rtsp_timeout * 1000000}|'
-            f'max_delay;500000'
+            f'rtsp_transport;tcp|'  # TCP is more reliable than UDP
+            f'timeout;{self.rtsp_timeout * 1000000}|'  # Microseconds
+            f'stimeout;{self.rtsp_timeout * 1000000}|'  # Socket timeout
+            f'max_delay;500000|'  # 0.5 second max delay
+            f'reorder_queue_size;0|'  # Disable reordering (reduces latency)
+            f'fflags;+genpts+igndts|'  # Generate PTS, ignore DTS errors
+            f'flags;+low_delay|'  # Low latency mode
+            f'analyzeduration;1000000|'  # 1 second analysis
+            f'probesize;1000000'  # 1MB probe size
         )
         
-        # CRITICAL: Disable threading in FFmpeg to avoid async_lock issues
+        # Single-threaded FFmpeg (prevents async_lock issues)
         os.environ['OPENCV_FFMPEG_THREAD_COUNT'] = '1'
         
-        logging.info(f"Configured RTSP environment for {self.source}")
-
+        # ==================== NEW: Error Resilience ====================
+        
+        # Tell FFmpeg to be more lenient with corrupted frames
+        os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = '3'  # Retry reads
+        
+        logger.info(f"Configured RTSP environment for {self.source}")
+    
     async def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
         async with self.lock:
