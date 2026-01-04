@@ -373,7 +373,7 @@ async def start_all_workspace_streams(
                     requester_user_id=UUID(user_id)
                 )
                 started_count += 1
-                logger.info(f"Started stream {stream_id} ({stream_name}) in workspace {workspace_id}")
+                logger.info(f"Started stream {stream_id} ({stream_name}) in workspace {ws_id}")
                 
                 # Small delay to avoid overwhelming the system
                 await asyncio.sleep(0.1)
@@ -391,7 +391,7 @@ async def start_all_workspace_streams(
         cache_key = f"ws_limits_{ws_id}"
         if hasattr(stream_manager, '_limits_cache') and cache_key in stream_manager._limits_cache:
             del stream_manager._limits_cache[cache_key]
-            logger.debug(f"Invalidated limits cache for workspace {workspace_id}")
+            logger.debug(f"Invalidated limits cache for workspace {ws_id}")
         
         # Calculate remaining quota after this operation
         remaining_slots = available_slots - started_count
@@ -495,7 +495,7 @@ async def stop_all_workspace_streams(
                     additional_context=f"Workspace-wide stop by admin {user_id}"
                 )
                 stopped_count += 1
-                logger.info(f"Stopped stream {stream_id} ({stream_name}) in workspace {workspace_id}")
+                logger.info(f"Stopped stream {stream_id} ({stream_name}) in workspace {ws_id}")
                 
             except Exception as e:
                 logger.error(f"Failed to stop stream {stream_id}: {e}")
