@@ -44,16 +44,7 @@ class DistributedStreamManager:
         """
         Atomically claim available cameras using FOR UPDATE SKIP LOCKED.
         
-        This is the CRITICAL function that prevents race conditions:
-        - Server A locks Row 1, 2, 3
-        - Server B SKIPS those rows, locks Row 4, 5, 6
-        - No conflict!
-        
-        Args:
-            slots_available: How many cameras this server can handle
-            
-        Returns:
-            List of camera records that were successfully claimed
+        CRITICAL FIX: Exclude cameras with stop_reason='user_action'
         """
         if slots_available <= 0:
             return []
@@ -62,24 +53,26 @@ class DistributedStreamManager:
             WITH available_cameras AS (
                 -- Find cameras that should be running but aren't assigned
                 SELECT vs.stream_id, vs.name, vs.path, vs.workspace_id, 
-                       vs.user_id, vs.location, vs.area, vs.building,
-                       vs.floor_level, vs.zone, vs.latitude, vs.longitude,
-                       u.username, u.role
+                    vs.user_id, vs.location, vs.area, vs.building,
+                    vs.floor_level, vs.zone, vs.latitude, vs.longitude,
+                    u.username, u.role
                 FROM video_stream vs
                 JOIN users u ON vs.user_id = u.user_id
                 JOIN workspaces w ON vs.workspace_id = w.workspace_id
                 WHERE vs.is_streaming = TRUE
-                  -- Camera should be running
-                  AND u.is_active = TRUE
-                  AND w.is_active = TRUE
-                  AND (u.is_subscribed = TRUE OR u.role = 'admin')
-                  -- Not user-stopped
-                  AND (vs.stop_reason IS NULL OR vs.stop_reason != 'user_action')
-                  -- Not currently claimed OR claimed by dead server
-                  AND (
-                      vs.locked_by_server IS NULL 
-                      OR vs.server_heartbeat < NOW() - INTERVAL '2 minutes'
-                  )
+                -- Camera should be running
+                AND u.is_active = TRUE
+                AND w.is_active = TRUE
+                AND (u.is_subscribed = TRUE OR u.role = 'admin')
+                -- ✅ CRITICAL FIX: Exclude user-stopped cameras
+                AND (vs.stop_reason IS NULL OR vs.stop_reason != 'user_action')
+                -- ✅ ALSO: Respect auto_retry_enabled flag
+                AND vs.auto_retry_enabled = TRUE
+                -- Not currently claimed OR claimed by dead server
+                AND (
+                    vs.locked_by_server IS NULL 
+                    OR vs.server_heartbeat < NOW() - INTERVAL '2 minutes'
+                )
                 LIMIT $1
                 -- ⚡ CRITICAL: This prevents multiple servers from grabbing same rows
                 FOR UPDATE SKIP LOCKED
@@ -126,7 +119,7 @@ class DistributedStreamManager:
         except Exception as e:
             logger.error(f"Error claiming cameras: {e}", exc_info=True)
             return []
-
+            
     async def update_heartbeat_for_owned_cameras(self) -> int:
         """
         Update heartbeat for cameras owned by this server.
@@ -206,6 +199,35 @@ class DistributedStreamManager:
         stream_id_str = str(stream_id)
         
         try:
+
+            # ✅ SAFETY: Verify camera wasn't just user-stopped
+            verify_query = """
+                SELECT stop_reason, auto_retry_enabled 
+                FROM video_stream 
+                WHERE stream_id = $1
+            """
+            
+            verify = await self.db_manager.execute_query(
+                verify_query, (stream_id,), fetch_one=True
+            )
+            
+            if verify:
+                if verify['stop_reason'] == 'user_action':
+                    logger.warning(
+                        f"⚠️ Camera {stream_id_str} was user-stopped after claim, "
+                        f"releasing lock and skipping start"
+                    )
+                    await self.release_camera_lock(stream_id_str, reason="user_stopped_after_claim")
+                    return
+                
+                if not verify.get('auto_retry_enabled', True):
+                    logger.warning(
+                        f"⚠️ Camera {stream_id_str} has auto_retry_enabled=FALSE, "
+                        f"releasing lock and skipping start"
+                    )
+                    await self.release_camera_lock(stream_id_str, reason="auto_retry_disabled")
+                    return
+                    
             # Build location info
             location_info = {
                 'location': camera_data.get('location'),
@@ -347,9 +369,19 @@ class DistributedStreamManager:
         logger.info(f"🔄 Management loop started for server {self.server_id}")
         
         zombie_check_counter = 0
+        zombie_lock_counter = 0
         
         while self.is_running:
             try:
+
+                # ==================== STEP 1: Cleanup Zombie Locks ====================
+                zombie_lock_counter += 1
+                if zombie_lock_counter >= 3:  # Every 2 cycles (60 seconds)
+                    released = await self.cleanup_zombie_locks()
+                    if released > 0:
+                        logger.warning(f"🧹 Cleaned up {released} zombie server locks")
+                    zombie_lock_counter = 0
+                
                 # ==================== STEP 1: Heartbeat Update ====================
                 await self.update_heartbeat_for_owned_cameras()
                 
@@ -482,7 +514,30 @@ class DistributedStreamManager:
         
         logger.info(f"✅ Management loop stopped for server {self.server_id}")
 
-
+    async def cleanup_zombie_locks(self):
+        """
+        Clean up locks from dead servers.
+        Called periodically by management loop.
+        """
+        try:
+            result = await self.db_manager.execute_query(
+                "SELECT * FROM cleanup_zombie_server_locks()",
+                fetch_one=True
+            )
+            
+            if result and result['released_count'] > 0:
+                logger.warning(
+                    f"🧹 Released {result['released_count']} zombie locks: "
+                    f"{result['affected_cameras']}"
+                )
+                return result['released_count']
+            
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Error cleaning zombie locks: {e}", exc_info=True)
+            return 0
+            
 # ==================== Global Instance ====================
 
 distributed_stream_manager = DistributedStreamManager()

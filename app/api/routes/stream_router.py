@@ -2247,3 +2247,32 @@ async def reload_models(
     except Exception as e:
         logger.error(f"Error reloading models: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/admin/cleanup-zombie-locks")
+async def cleanup_zombie_locks(
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Manually clean up zombie server locks.
+    Requires admin privileges.
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        from app.services.distributed_stream_manager import distributed_stream_manager
+        
+        released = await distributed_stream_manager.cleanup_zombie_locks()
+        
+        return {
+            "success": True,
+            "released_locks": released,
+            "message": f"Released {released} zombie locks"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in manual cleanup: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
