@@ -36,6 +36,19 @@ thread_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=min(32, (os.cpu_count() or 1) * 2 + 4)
 )
 
+async def get_workspace_id_for_user(username: str) -> UUID:
+    """
+    Helper function to get workspace_id for a user.
+    Raises HTTPException if no active workspace found.
+    """
+    _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+    if not workspace_id_obj:
+        raise HTTPException(
+            status_code=400, 
+            detail="No active workspace. Please set an active workspace."
+        )
+    return workspace_id_obj
+
 # ==================== Stream Lifecycle Endpoints ====================
 
 @router.post("/start", status_code=status.HTTP_200_OK)
@@ -50,7 +63,19 @@ async def start_stream(
     """
     try:
         user_id = str(current_user["user_id"])
+        username = current_user["username"]
         stream_id = str(request.stream_id)
+
+        # Get workspace_id for the user
+        workspace_id_obj = await get_workspace_id_for_user(username)
+        
+        # Verify user has access to this workspace
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id),
+            workspace_id_obj,
+            required_role=None
+        )
         
         # Start stream with workspace validation
         result = await stream_manager.start_stream_in_workspace(
@@ -88,7 +113,19 @@ async def stop_stream(
     """
     try:
         user_id = str(current_user["user_id"])
+        username = current_user["username"]
         stream_id = str(request.stream_id)
+
+        # Get workspace_id for the user
+        workspace_id_obj = await get_workspace_id_for_user(username)
+        
+        # Verify user has access to this workspace
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id),
+            workspace_id_obj,
+            required_role=None
+        )
         
         # FIXED: Pass stop_reason='user_action' and additional context
         result = await stream_manager.stop_stream_in_workspace(
@@ -129,9 +166,20 @@ async def restart_stream(
     """
     try:
         user_id = str(current_user["user_id"])
+        username = current_user["username"]
         stream_uuid = UUID(stream_id)
+
+        # Get workspace_id for the user
+        workspace_id_obj = await get_workspace_id_for_user(username)
         
-        # FIXED: Use restart_stream_in_workspace instead of stop+start
+        # Verify user has access to this workspace
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id),
+            workspace_id_obj,
+            required_role=None
+        )
+        
         # This handles the stop_reason internally
         result = await stream_manager.restart_stream_in_workspace(
             stream_id=stream_uuid,
@@ -160,7 +208,6 @@ async def restart_stream(
 
 @router.get("/list")
 async def list_user_streams(
-    workspace_id: Optional[str] = Query(None),
     current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -170,12 +217,23 @@ async def list_user_streams(
     """
     try:
         user_id = str(current_user["user_id"])
-        ws_id = UUID(workspace_id) if workspace_id else None
+        username = current_user["username"]
+
+        # Get workspace_id for the user
+        workspace_id_obj = await get_workspace_id_for_user(username)
         
+        # Verify user has access to this workspace
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id),
+            workspace_id_obj,
+            required_role=None
+        )
+
         # Get streams
         result = await stream_manager.get_workspace_streams_for_user(
             user_id=user_id,
-            workspace_id=ws_id
+            workspace_id=workspace_id_obj
         )
         
         return JSONResponse(
@@ -195,9 +253,8 @@ async def list_user_streams(
 
 # ==================== Workspace Stream Management ====================
 
-@router.post("/workspace/{workspace_id}/start-all")
+@router.post("/workspace/start-all")
 async def start_all_workspace_streams(
-    workspace_id: str,
     current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -208,8 +265,19 @@ async def start_all_workspace_streams(
     """
     try:
         user_id = str(current_user["user_id"])
-        ws_id = UUID(workspace_id)
+        username = current_user["username"]
         
+        # Get workspace_id for the user
+        ws_id = await get_workspace_id_for_user(username)
+        
+        # Verify user has access to this workspace
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id),
+            ws_id,
+            required_role="admin"
+        )
+
         # Validate admin access
         membership = await workspace_service.check_workspace_membership_and_get_role(
             user_id=user_id,
@@ -355,9 +423,8 @@ async def start_all_workspace_streams(
             detail=f"Failed to start workspace streams: {str(e)}"
         )
 
-@router.post("/workspace/{workspace_id}/stop-all")
+@router.post("/workspace/stop-all")
 async def stop_all_workspace_streams(
-    workspace_id: str,
     current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """
@@ -367,7 +434,18 @@ async def stop_all_workspace_streams(
     """
     try:
         user_id = str(current_user["user_id"])
-        ws_id = UUID(workspace_id)
+        username = current_user["username"]
+        
+        # Get workspace_id for the user
+        ws_id = await get_workspace_id_for_user(username)
+        
+        # Verify user has access to this workspace
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id),
+            ws_id,
+            required_role="admin"
+        )
         
         # Validate admin access
         membership = await workspace_service.check_workspace_membership_and_get_role(
@@ -667,6 +745,19 @@ async def batch_start_streams(
     """
     try:
         user_id = str(current_user["user_id"])
+        username = current_user["username"]
+        
+        # Get workspace_id for the user
+        workspace_id_obj = await get_workspace_id_for_user(username)
+        
+        # Verify user has access to this workspace
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id),
+            workspace_id_obj,
+            required_role=None
+        )
+
         results = []
         
         for stream_id_str in request.stream_ids:
@@ -723,6 +814,19 @@ async def batch_stop_streams(
     """
     try:
         user_id = str(current_user["user_id"])
+        username = current_user["username"]
+        
+        # Get workspace_id for the user
+        workspace_id_obj = await get_workspace_id_for_user(username)
+        
+        # Verify user has access to this workspace
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id),
+            workspace_id_obj,
+            required_role=None
+        )
+
         results = []
         
         for stream_id_str in request.stream_ids:
