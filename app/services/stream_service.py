@@ -1652,17 +1652,13 @@ class StreamManager:
         """
         Start background tasks with distributed management integration.
         
-        CRITICAL CHANGES:
-        1. OLD management loop (manage_streams_with_deduplication) is DISABLED
-        2. NEW distributed manager handles camera claiming
-        3. Only keeps cleanup, monitoring, and retry loops
+        ✅ UPDATED: Disabled old management loop to prevent conflicts
         """
         try:
             logging.info("Starting StreamManager background tasks...")
             
             # ==================== CRITICAL: Start Distributed Manager ====================
-            # This replaces the old manage_streams_with_deduplication loop
-            
+            # 1. Start Distributed Manager (handles camera claiming)
             try:
                 from app.services.distributed_stream_manager import distributed_stream_manager
                 
@@ -1681,7 +1677,6 @@ class StreamManager:
                 # Don't start old loop - fail loudly instead
                 raise RuntimeError(
                     "Distributed stream manager is required but not available. "
-                    "Please ensure app/services/distributed_stream_manager.py exists."
                 )
             except Exception as e:
                 logger.error(
@@ -1692,42 +1687,34 @@ class StreamManager:
             
             # ==================== Start Supporting Tasks ====================
             
-            # 1. Status Batcher (for efficient database updates)
+            # 2. Status Batcher
             await self.status_batcher.start()
             logger.info("✅ Status batcher started")
             
-            # 2. Cleanup Task (periodic maintenance)
+            # 3. Cleanup Task
             if self.cleanup_task is None or self.cleanup_task.done():
                 self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
                 self.cleanup_task.set_name("periodic_cleanup_loop")
                 self.cleanup_task.add_done_callback(self._handle_task_done)
                 logger.info("✅ Cleanup task started")
             
-            # 3. Resource Monitor (performance tracking)
+            # 4. Resource Monitor
             if self.monitor_task is None or self.monitor_task.done():
                 self.monitor_task = asyncio.create_task(self._resource_monitor())
                 self.monitor_task.set_name("resource_monitor_loop")
                 self.monitor_task.add_done_callback(self._handle_task_done)
                 logger.info("✅ Resource monitor started")
             
-            # 4. Retry Loop (handles failed cameras)
-            if self.retry_task is None or self.retry_task.done():
-                self.retry_task = asyncio.create_task(self._retry_loop())
-                self.retry_task.set_name("camera_retry_loop")
-                self.retry_task.add_done_callback(self._handle_task_done)
-                logger.info("✅ Retry loop started")
+            # # 5. Retry Loop
+            # if self.retry_task is None or self.retry_task.done():
+            #     self.retry_task = asyncio.create_task(self._retry_loop())
+            #     self.retry_task.set_name("camera_retry_loop")
+            #     self.retry_task.add_done_callback(self._handle_task_done)
+            #     logger.info("✅ Retry loop started")
             
-            # ==================== OLD MANAGEMENT LOOP - DISABLED ====================
-            # ❌ DO NOT START THIS - Distributed manager replaces it
-            #
             # self.background_task = asyncio.create_task(
             #     self.manage_streams_with_deduplication()
             # )
-            #
-            # Why disabled?
-            # - Old loop doesn't understand distributed locking
-            # - Would conflict with distributed_stream_manager
-            # - Could cause duplicate camera starts
             # =========================================================================
             
             logging.info("✅ StreamManager background tasks started successfully")

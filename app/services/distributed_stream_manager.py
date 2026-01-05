@@ -40,22 +40,102 @@ class DistributedStreamManager:
 
     # ==================== Atomic Camera Claiming ====================
 
+    # async def claim_available_cameras(self, slots_available: int) -> List[Dict[str, Any]]:
+    #     """
+    #     Atomically claim available cameras using FOR UPDATE SKIP LOCKED.
+        
+    #     CRITICAL FIX: Exclude cameras with stop_reason='user_action'
+    #     """
+    #     if slots_available <= 0:
+    #         return []
+        
+    #     claim_query = """
+    #         WITH available_cameras AS (
+    #             -- Find cameras that should be running but aren't assigned
+    #             SELECT vs.stream_id, vs.name, vs.path, vs.workspace_id, 
+    #                 vs.user_id, vs.location, vs.area, vs.building,
+    #                 vs.floor_level, vs.zone, vs.latitude, vs.longitude,
+    #                 u.username, u.role
+    #             FROM video_stream vs
+    #             JOIN users u ON vs.user_id = u.user_id
+    #             JOIN workspaces w ON vs.workspace_id = w.workspace_id
+    #             WHERE vs.is_streaming = TRUE
+    #             -- Camera should be running
+    #             AND u.is_active = TRUE
+    #             AND w.is_active = TRUE
+    #             AND (u.is_subscribed = TRUE OR u.role = 'admin')
+    #             -- ✅ CRITICAL FIX: Exclude user-stopped cameras
+    #             AND (vs.stop_reason IS NULL OR vs.stop_reason != 'user_action')
+    #             -- ✅ ALSO: Respect auto_retry_enabled flag
+    #             AND vs.auto_retry_enabled = TRUE
+    #             -- Not currently claimed OR claimed by dead server
+    #             AND (
+    #                 vs.locked_by_server IS NULL 
+    #                 OR vs.server_heartbeat < NOW() - INTERVAL '2 minutes'
+    #             )
+    #             LIMIT $1
+    #             -- ⚡ CRITICAL: This prevents multiple servers from grabbing same rows
+    #             FOR UPDATE SKIP LOCKED
+    #         )
+    #         UPDATE video_stream
+    #         SET locked_by_server = $2,
+    #             server_heartbeat = NOW(),
+    #             status = 'processing',
+    #             updated_at = NOW()
+    #         FROM available_cameras
+    #         WHERE video_stream.stream_id = available_cameras.stream_id
+    #         RETURNING 
+    #             video_stream.stream_id,
+    #             video_stream.name,
+    #             video_stream.path,
+    #             video_stream.workspace_id,
+    #             video_stream.user_id,
+    #             video_stream.location,
+    #             video_stream.area,
+    #             video_stream.building,
+    #             video_stream.floor_level,
+    #             video_stream.zone,
+    #             video_stream.latitude,
+    #             video_stream.longitude,
+    #             available_cameras.username,
+    #             available_cameras.role
+    #     """
+        
+    #     try:
+    #         claimed_cameras = await self.db_manager.execute_query(
+    #             claim_query,
+    #             (slots_available, self.server_id),
+    #             fetch_all=True
+    #         )
+            
+    #         if claimed_cameras:
+    #             logger.info(
+    #                 f"✅ Server {self.server_id} claimed {len(claimed_cameras)} cameras: "
+    #                 f"{[c['name'] for c in claimed_cameras]}"
+    #             )
+            
+    #         return claimed_cameras or []
+            
+    #     except Exception as e:
+    #         logger.error(f"Error claiming cameras: {e}", exc_info=True)
+    #         return []
+
     async def claim_available_cameras(self, slots_available: int) -> List[Dict[str, Any]]:
         """
         Atomically claim available cameras using FOR UPDATE SKIP LOCKED.
         
-        CRITICAL FIX: Exclude cameras with stop_reason='user_action'
+        ✅ FIXED: Now respects retry timing (next_retry_at)
         """
         if slots_available <= 0:
             return []
         
         claim_query = """
             WITH available_cameras AS (
-                -- Find cameras that should be running but aren't assigned
                 SELECT vs.stream_id, vs.name, vs.path, vs.workspace_id, 
                     vs.user_id, vs.location, vs.area, vs.building,
                     vs.floor_level, vs.zone, vs.latitude, vs.longitude,
-                    u.username, u.role
+                    u.username, u.role,
+                    vs.retry_count, vs.next_retry_at  -- ✅ Include retry info
                 FROM video_stream vs
                 JOIN users u ON vs.user_id = u.user_id
                 JOIN workspaces w ON vs.workspace_id = w.workspace_id
@@ -64,17 +144,21 @@ class DistributedStreamManager:
                 AND u.is_active = TRUE
                 AND w.is_active = TRUE
                 AND (u.is_subscribed = TRUE OR u.role = 'admin')
-                -- ✅ CRITICAL FIX: Exclude user-stopped cameras
+                -- ✅ Exclude user-stopped cameras
                 AND (vs.stop_reason IS NULL OR vs.stop_reason != 'user_action')
-                -- ✅ ALSO: Respect auto_retry_enabled flag
+                -- ✅ Respect auto_retry_enabled flag
                 AND vs.auto_retry_enabled = TRUE
+                -- ✅ CRITICAL: Respect retry timing
+                AND (
+                    vs.next_retry_at IS NULL  -- Never attempted
+                    OR vs.next_retry_at <= NOW()  -- Time to retry
+                )
                 -- Not currently claimed OR claimed by dead server
                 AND (
                     vs.locked_by_server IS NULL 
                     OR vs.server_heartbeat < NOW() - INTERVAL '2 minutes'
                 )
                 LIMIT $1
-                -- ⚡ CRITICAL: This prevents multiple servers from grabbing same rows
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE video_stream
@@ -98,7 +182,9 @@ class DistributedStreamManager:
                 video_stream.latitude,
                 video_stream.longitude,
                 available_cameras.username,
-                available_cameras.role
+                available_cameras.role,
+                available_cameras.retry_count,
+                available_cameras.next_retry_at
         """
         
         try:
@@ -109,17 +195,24 @@ class DistributedStreamManager:
             )
             
             if claimed_cameras:
-                logger.info(
-                    f"✅ Server {self.server_id} claimed {len(claimed_cameras)} cameras: "
-                    f"{[c['name'] for c in claimed_cameras]}"
-                )
+                # Log retry attempts
+                for camera in claimed_cameras:
+                    retry_count = camera.get('retry_count', 0)
+                    if retry_count > 0:
+                        logger.info(
+                            f"✅ Claimed camera {camera['name']} for retry attempt #{retry_count}"
+                        )
+                    else:
+                        logger.info(
+                            f"✅ Claimed camera {camera['name']} for first start"
+                        )
             
             return claimed_cameras or []
             
         except Exception as e:
             logger.error(f"Error claiming cameras: {e}", exc_info=True)
             return []
-            
+                        
     async def update_heartbeat_for_owned_cameras(self) -> int:
         """
         Update heartbeat for cameras owned by this server.

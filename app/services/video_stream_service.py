@@ -550,6 +550,108 @@ class VideoStreamService:
     #         logger.error(f"Error recording camera stop: {e}", exc_info=True)
     #         return False
 
+    # async def record_camera_stop(
+    #     self,
+    #     stream_id: UUID,
+    #     stop_reason: str,
+    #     stopped_by: Optional[UUID] = None,
+    #     additional_context: Optional[str] = None
+    # ) -> bool:
+    #     """
+    #     Record why and when a camera was stopped.
+        
+    #     CRITICAL RULES:
+    #     1. If stop_reason='user_action': Clear server lock
+    #     2. If stop_reason='system_*': Keep server lock (will retry)
+    #     """
+    #     valid_reasons = [
+    #         'user_action', 'connection_error', 'system_error', 
+    #         'timeout', 'manual_restart'
+    #     ]
+        
+    #     if stop_reason not in valid_reasons:
+    #         logger.error(f"Invalid stop_reason: {stop_reason}. Must be one of {valid_reasons}")
+    #         return False
+        
+    #     try:
+    #         # First, check current state
+    #         current_state = await self.db_manager.execute_query(
+    #             """SELECT stop_reason, is_streaming, status 
+    #             FROM video_stream 
+    #             WHERE stream_id = $1""",
+    #             (stream_id,),
+    #             fetch_one=True
+    #         )
+            
+    #         if not current_state:
+    #             logger.error(f"Camera {stream_id} not found for record_camera_stop")
+    #             return False
+            
+    #         # ✅ If already user-stopped, NEVER overwrite
+    #         if current_state['stop_reason'] == 'user_action':
+    #             logger.info(
+    #                 f"⏭️ Camera {stream_id} already user-stopped. "
+    #                 f"Ignoring record_camera_stop call with reason '{stop_reason}'"
+    #             )
+    #             return True
+            
+    #         if stop_reason == 'user_action':
+    #             # ✅ User stop: Clear server lock
+    #             query = """
+    #                 UPDATE video_stream 
+    #                 SET stop_reason = $1::VARCHAR(50),
+    #                     stopped_by = $2,
+    #                     stopped_at = NOW(),
+    #                     status = 'inactive',
+    #                     is_streaming = FALSE,
+    #                     retry_count = 0,
+    #                     next_retry_at = NULL,
+    #                     last_retry_at = NULL,
+    #                     locked_by_server = NULL,
+    #                     server_heartbeat = NULL,
+    #                     updated_at = NOW()
+    #                 WHERE stream_id = $3
+    #             """
+                
+    #             await self.db_manager.execute_query(
+    #                 query, 
+    #                 (stop_reason, stopped_by, stream_id)
+    #             )
+                
+    #             logger.info(
+    #                 f"✅ User stop recorded for {stream_id}: "
+    #                 f"is_streaming=FALSE, server lock CLEARED, will NOT restart"
+    #             )
+                
+    #         else:
+    #             # System stop: Keep server lock for retry
+    #             query = """
+    #                 UPDATE video_stream 
+    #                 SET stop_reason = $1::VARCHAR(50),
+    #                     stopped_by = $2,
+    #                     stopped_at = NOW(),
+    #                     status = 'error',
+    #                     is_streaming = TRUE,
+    #                     updated_at = NOW()
+    #                 WHERE stream_id = $3
+    #             """
+                
+    #             await self.db_manager.execute_query(
+    #                 query, 
+    #                 (stop_reason, stopped_by, stream_id)
+    #             )
+                
+    #             logger.info(
+    #                 f"⚠️ System stop recorded for {stream_id}: "
+    #                 f"is_streaming=TRUE, server lock KEPT, will retry (reason: {stop_reason})"
+    #             )
+                
+    #         return True
+            
+    #     except Exception as e:
+    #         logger.error(f"Error recording camera stop: {e}", exc_info=True)
+    #         return False
+
     async def record_camera_stop(
         self,
         stream_id: UUID,
@@ -560,9 +662,7 @@ class VideoStreamService:
         """
         Record why and when a camera was stopped.
         
-        CRITICAL RULES:
-        1. If stop_reason='user_action': Clear server lock
-        2. If stop_reason='system_*': Keep server lock (will retry)
+        ✅ FIXED: Proper state transitions for all stop reasons
         """
         valid_reasons = [
             'user_action', 'connection_error', 'system_error', 
@@ -570,13 +670,13 @@ class VideoStreamService:
         ]
         
         if stop_reason not in valid_reasons:
-            logger.error(f"Invalid stop_reason: {stop_reason}. Must be one of {valid_reasons}")
+            logger.error(f"Invalid stop_reason: {stop_reason}")
             return False
         
         try:
-            # First, check current state
+            # ✅ Check current state
             current_state = await self.db_manager.execute_query(
-                """SELECT stop_reason, is_streaming, status 
+                """SELECT stop_reason, is_streaming, status, retry_count
                 FROM video_stream 
                 WHERE stream_id = $1""",
                 (stream_id,),
@@ -584,22 +684,22 @@ class VideoStreamService:
             )
             
             if not current_state:
-                logger.error(f"Camera {stream_id} not found for record_camera_stop")
+                logger.error(f"Camera {stream_id} not found")
                 return False
             
             # ✅ If already user-stopped, NEVER overwrite
             if current_state['stop_reason'] == 'user_action':
                 logger.info(
                     f"⏭️ Camera {stream_id} already user-stopped. "
-                    f"Ignoring record_camera_stop call with reason '{stop_reason}'"
+                    f"Ignoring record_camera_stop with reason '{stop_reason}'"
                 )
                 return True
             
             if stop_reason == 'user_action':
-                # ✅ User stop: Clear server lock
+                # ✅ User stop: Complete shutdown
                 query = """
                     UPDATE video_stream 
-                    SET stop_reason = $1::VARCHAR(50),
+                    SET stop_reason = $1,
                         stopped_by = $2,
                         stopped_at = NOW(),
                         status = 'inactive',
@@ -607,6 +707,7 @@ class VideoStreamService:
                         retry_count = 0,
                         next_retry_at = NULL,
                         last_retry_at = NULL,
+                        auto_retry_enabled = FALSE,
                         locked_by_server = NULL,
                         server_heartbeat = NULL,
                         updated_at = NOW()
@@ -619,33 +720,41 @@ class VideoStreamService:
                 )
                 
                 logger.info(
-                    f"✅ User stop recorded for {stream_id}: "
-                    f"is_streaming=FALSE, server lock CLEARED, will NOT restart"
+                    f"✅ User stop recorded: {stream_id} -> "
+                    f"is_streaming=FALSE, will NOT restart"
                 )
                 
             else:
-                # System stop: Keep server lock for retry
+                # ✅ System error: Keep running, schedule retry
+                current_retry = current_state.get('retry_count', 0)
+                
                 query = """
                     UPDATE video_stream 
-                    SET stop_reason = $1::VARCHAR(50),
+                    SET stop_reason = $1,
                         stopped_by = $2,
                         stopped_at = NOW(),
                         status = 'error',
                         is_streaming = TRUE,
+                        retry_count = $3,
+                        last_retry_at = NOW(),
                         updated_at = NOW()
-                    WHERE stream_id = $3
+                    WHERE stream_id = $4
                 """
                 
                 await self.db_manager.execute_query(
                     query, 
-                    (stop_reason, stopped_by, stream_id)
+                    (stop_reason, stopped_by, current_retry, stream_id)
                 )
                 
-                logger.info(
-                    f"⚠️ System stop recorded for {stream_id}: "
-                    f"is_streaming=TRUE, server lock KEPT, will retry (reason: {stop_reason})"
-                )
+                # ✅ Trigger retry scheduling via database trigger
+                # (auto_schedule_retry trigger will set next_retry_at)
                 
+                logger.warning(
+                    f"⚠️ System error recorded: {stream_id} -> "
+                    f"is_streaming=TRUE, will retry (reason: {stop_reason}, "
+                    f"attempt #{current_retry + 1})"
+                )
+            
             return True
             
         except Exception as e:
