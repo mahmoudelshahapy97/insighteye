@@ -1355,6 +1355,50 @@ class StreamProcessingService:
                         additional_context="Stream ended unexpectedly without signal"
                     )
                     
+                # # ✅ NEW CHECK: If stop event was set gracefully (like from stop API)
+                # # Check if database was already updated by the API call
+                # if stop_event.is_set():
+                #     # Double-check database - API might have already updated it
+                #     current_db_state = await video_stream_service.db_manager.execute_query(
+                #         "SELECT stop_reason, is_streaming FROM video_stream WHERE stream_id = $1",
+                #         (stream_id,),
+                #         fetch_one=True
+                #     )
+                    
+                #     if current_db_state and current_db_state['stop_reason'] == 'user_action':
+                #         logger.info(
+                #             f"✅ Stop event set AND database shows user_action. "
+                #             f"API already handled database update. Skipping."
+                #         )
+                #         return
+                
+                # if stop_event.is_set():
+                #     # Graceful stop (but not user-initiated based on checks above)
+                #     logger.info(
+                #         f"Stream {stream_id_str} stopped gracefully (system-initiated). "
+                #         f"Recording as system_error to allow retry."
+                #     )
+                    
+                #     await video_stream_service.record_camera_stop(
+                #         stream_id=stream_id,
+                #         stop_reason='system_error',
+                #         stopped_by=None,
+                #         additional_context="Stream stopped cleanly by system"
+                #     )
+                # else:
+                    # Unexpected termination
+                    logger.warning(
+                        f"⚠️ Stream {stream_id_str} ended unexpectedly. "
+                        f"Recording as system_error."
+                    )
+                    
+                    await video_stream_service.record_camera_stop(
+                        stream_id=stream_id,
+                        stop_reason='system_error',
+                        stopped_by=None,
+                        additional_context="Stream ended unexpectedly"
+                    )
+                
             except Exception as e:
                 logger.error(f"Error in finally block for {stream_id_str}: {e}", exc_info=True)
             
