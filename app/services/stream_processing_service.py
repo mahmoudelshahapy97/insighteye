@@ -1144,7 +1144,7 @@ class StreamProcessingService:
                             male_count=male_count,
                             female_count=female_count,
                             fire_status=fire_status,
-                            frame=frame,
+                            frame=annotated_frame,
                             workspace_id=workspace_id,
                             location_info=location_info
                         )
