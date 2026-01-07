@@ -277,7 +277,7 @@ class AnalyticsService:
             
             data = [{
                 **dict(row),
-                'avg_person_count': float(row['avg_person_count']) if row['avg_person_count'] else 0
+                'avg_person_count': int(round(row['avg_person_count'])) if row['avg_person_count'] else 0
             } for row in results] if results else []
             
             return {
@@ -351,7 +351,7 @@ class AnalyticsService:
             
             data = [{
                 **dict(row),
-                'avg_count': float(row['avg_count']) if row['avg_count'] else 0,
+                'avg_count': int(round(row['avg_count'])) if row['avg_count'] else 0,
                 'gender': gender
             } for row in results] if results else []
             
@@ -445,7 +445,7 @@ class AnalyticsService:
             
             data = [{
                 **dict(row),
-                'avg_frame_count': float(row['avg_frame_count']) if row['avg_frame_count'] else 0,
+                'avg_frame_count': int(round(row['avg_frame_count'])) if row['avg_frame_count'] else 0,
                 'percent_difference': float(row['percent_difference']) if row['percent_difference'] else 0
             } for row in results] if results else []
             
@@ -525,7 +525,7 @@ class AnalyticsService:
             
             data = [{
                 **dict(row),
-                'avg_count': float(row['avg_count']) if row['avg_count'] else 0,
+                'avg_count': int(round(row['avg_count'])) if row['avg_count'] else 0,
                 'gender': gender,
                 'weekday_name': row['weekday_name'].strip()
             } for row in results] if results else []
@@ -615,7 +615,7 @@ class AnalyticsService:
             data = [{
                 **dict(row),
                 'weekday_name': row['weekday_name'].strip(),
-                'avg_person_count': float(row['avg_person_count']) if row['avg_person_count'] else 0
+                'avg_person_count': int(round(row['avg_person_count'])) if row['avg_person_count'] else 0
             } for row in results] if results else []
             
             return {
@@ -682,7 +682,7 @@ class AnalyticsService:
             
             data = [{
                 **dict(row),
-                'avg_person_count': float(row['avg_person_count']) if row['avg_person_count'] else 0
+                'avg_person_count': int(round(row['avg_person_count'])) if row['avg_person_count'] else 0
             } for row in results] if results else []
             
             return {
@@ -749,7 +749,7 @@ class AnalyticsService:
             data = [{
                 **dict(row),
                 'weekday_name': row['weekday_name'].strip(),
-                'avg_person_count': float(row['avg_person_count']) if row['avg_person_count'] else 0
+                'avg_person_count': int(round(row['avg_person_count'])) if row['avg_person_count'] else 0
             } for row in results] if results else []
             
             return {
@@ -814,7 +814,7 @@ class AnalyticsService:
             
             data = [{
                 **dict(row),
-                'avg_person_count': float(row['avg_person_count']) if row['avg_person_count'] else 0
+                'avg_person_count': int(round(row['avg_person_count'])) if row['avg_person_count'] else 0
             } for row in results] if results else []
             
             return {
@@ -1083,7 +1083,7 @@ class AnalyticsService:
             
             data = [{
                 **dict(row),
-                'fire_detection_rate': float(row['fire_detection_rate']) if row['fire_detection_rate'] else 0
+                'fire_detection_rate': round(float(row['fire_detection_rate']), 2) if row['fire_detection_rate'] else 0
             } for row in results] if results else []
             
             return {
@@ -1151,7 +1151,7 @@ class AnalyticsService:
             data = [{
                 **dict(row),
                 'group_type': group_by,
-                'fire_detection_rate': float(row['fire_detection_rate']) if row['fire_detection_rate'] else 0
+                'fire_detection_rate': round(float(row['fire_detection_rate']), 2) if row['fire_detection_rate'] else 0
             } for row in results] if results else []
             
             return {
@@ -1228,7 +1228,7 @@ class AnalyticsService:
             data = [{
                 **dict(row),
                 'time_period': row['time_period'].isoformat(),
-                'fire_detection_rate': float(row['fire_detection_rate']) if row['fire_detection_rate'] else 0
+                'fire_detection_rate': round(float(row['fire_detection_rate']), 2) if row['fire_detection_rate'] else 0
             } for row in results] if results else []
             
             return {
@@ -1297,7 +1297,7 @@ class AnalyticsService:
             data = [{
                 **dict(row),
                 'weekday_name': row['weekday_name'].strip(),
-                'fire_detection_rate': float(row['fire_detection_rate']) if row['fire_detection_rate'] else 0
+                'fire_detection_rate': round(float(row['fire_detection_rate']), 2) if row['fire_detection_rate'] else 0
             } for row in results] if results else []
             
             return {
@@ -1365,7 +1365,7 @@ class AnalyticsService:
             
             data = [{
                 **dict(row),
-                'fire_detection_rate': float(row['fire_detection_rate']) if row['fire_detection_rate'] else 0,
+                'fire_detection_rate': round(float(row['fire_detection_rate']), 2) if row['fire_detection_rate'] else 0,
                 'avg_detections_per_day': float(row['avg_detections_per_day']) if row['avg_detections_per_day'] else 0
             } for row in results] if results else []
             
@@ -1530,7 +1530,7 @@ class AnalyticsService:
             data = [{
                 **dict(row),
                 'stream_id': str(row['stream_id']),
-                'fire_detection_rate': float(row['fire_detection_rate']) if row['fire_detection_rate'] else 0
+                'fire_detection_rate': round(float(row['fire_detection_rate']), 2) if row['fire_detection_rate'] else 0
             } for row in results] if results else []
             
             return {
@@ -1805,7 +1805,7 @@ class AnalyticsService:
                     ((row['above_max_count'] + row['below_min_count']) / row['total_checks'] * 100), 
                     2
                 ) if row['total_checks'] > 0 else 0,
-                'avg_person_count': float(row['avg_person_count']) if row['avg_person_count'] else 0,
+                'avg_person_count': int(round(row['avg_person_count'])) if row['avg_person_count'] else 0,
                 'max_person_count': row['max_person_count'],
                 'min_person_count': row['min_person_count'],
                 'last_above_max_time': row['last_above_max_time'].isoformat() if row['last_above_max_time'] else None,
