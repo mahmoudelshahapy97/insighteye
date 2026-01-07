@@ -187,10 +187,16 @@ class StreamProcessingService:
                     if fire_results and len(fire_results) > 0 and fire_results[0].boxes is not None:
                         # classes = [int(box.cls) for box in fire_results[0].boxes]
                         classes = [int(box.cls[0]) for box in fire_results[0].boxes]
+
+                        if classes:
+                            logger.info(f"🔥 Fire model detected classes: {classes} on stream {stream_id_str}")
+                        
                         if 0 in classes:
                             current_fire_status = "fire"
+                            logger.warning(f"🔥🔥 FIRE DETECTED on stream {stream_id_str}")
                         elif 1 in classes:
                             current_fire_status = "smoke"
+                            logger.warning(f"💨 SMOKE DETECTED on stream {stream_id_str}")
 
                     previous_fire_status = cache['fire_status']
                     cache['fire_status'] = current_fire_status
