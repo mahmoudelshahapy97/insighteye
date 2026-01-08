@@ -986,6 +986,180 @@ class StreamManager:
             "message": "Stream start initiated (management loop will start processing)"
         }
 
+    # async def stop_stream_in_workspace(
+    #     self,
+    #     stream_id: UUID,
+    #     requester_user_id: UUID,
+    #     stop_reason: str = 'user_action',
+    #     additional_context: Optional[str] = None
+    # ) -> Dict[str, Any]:
+    #     """
+    #     Stop stream with proper database updates.
+        
+    #     CRITICAL FIX: Clear server lock on user stop.
+    #     """
+    #     # Validate access
+    #     stream_info, membership_info = await self.validate_workspace_stream_access(
+    #         user_id=requester_user_id,
+    #         stream_id=stream_id,
+    #         required_role=None
+    #     )
+        
+    #     # Check permissions for user-initiated stops
+    #     if stop_reason == 'user_action':
+    #         is_owner = stream_info['user_id'] == requester_user_id
+    #         is_workspace_admin = membership_info['role'] in ['admin', 'owner']
+            
+    #         if not is_owner and not is_workspace_admin:
+    #             raise HTTPException(
+    #                 status_code=403,
+    #                 detail="Only stream owner or workspace admin can stop streams"
+    #             )
+        
+    #     stream_id_str = str(stream_id)
+    #     workspace_id = stream_info['workspace_id']
+        
+    #     logger.warning(
+    #         f"🛑 STOP REQUESTED: stream={stream_id}, reason={stop_reason}, "
+    #         f"requester={requester_user_id}, context={additional_context}"
+    #     )
+        
+    #     # ===== CRITICAL FIX: Update DATABASE FIRST =====
+        
+    #     if stop_reason == 'user_action':
+    #         # ✅ User stop: Clear EVERYTHING including server lock
+    #         update_query = """
+    #             UPDATE video_stream 
+    #             SET is_streaming = FALSE,
+    #                 status = 'inactive',
+    #                 stop_reason = 'user_action',
+    #                 stopped_by = $1,
+    #                 stopped_at = NOW(),
+    #                 retry_count = 0,
+    #                 next_retry_at = NULL,
+    #                 last_retry_at = NULL,
+    #                 auto_retry_enabled = FALSE,
+    #                 locked_by_server = NULL,
+    #                 server_heartbeat = NULL,
+    #                 updated_at = NOW(),
+    #                 last_activity = NOW()
+    #             WHERE stream_id = $2
+    #         """
+    #         await self.db_manager.execute_query(update_query, (requester_user_id, stream_id))
+                    
+    #         # ✅ VERIFY the update worked
+    #         verify = await self.db_manager.execute_query(
+    #             """SELECT is_streaming, stop_reason, status, locked_by_server 
+    #             FROM video_stream 
+    #             WHERE stream_id = $1""",
+    #             (stream_id,),
+    #             fetch_one=True
+    #         )
+            
+    #         logger.info(
+    #             f"✅ Stop verified: {stream_id_str} -> "
+    #             f"is_streaming={verify['is_streaming']}, "
+    #             f"status={verify['status']}, "
+    #             f"stop_reason={verify['stop_reason']}, "
+    #             f"locked_by_server={verify['locked_by_server']}"
+    #         )
+            
+    #         if verify['locked_by_server'] is not None:
+    #             logger.error(
+    #                 f"❌ SERVER LOCK NOT CLEARED! "
+    #                 f"locked_by_server still shows: {verify['locked_by_server']}"
+    #             )
+    #             raise RuntimeError("Failed to clear server lock")
+
+    #         logger.info(f"✅ Database updated FIRST and VERIFIED: {stream_id_str}")
+
+    #         await asyncio.sleep(0.1)
+
+    #         # Cancel any pending retries (don't fail if this errors)
+    #         try:
+    #             await self.retry_service.cancel_retry(stream_id, "user_action")
+    #         except Exception as retry_err:
+    #             logger.warning(
+    #                 f"⚠️ Failed to cancel retry (non-critical): {retry_err}"
+    #             )
+            
+    #     else:
+    #         # System error: Schedule retry, keep is_streaming=TRUE, KEEP server lock
+    #         update_query = """
+    #             UPDATE video_stream 
+    #             SET is_streaming = TRUE,
+    #                 status = 'error',
+    #                 stop_reason = $1,
+    #                 stopped_at = NOW(),
+    #                 updated_at = NOW(),
+    #                 last_activity = NOW()
+    #             WHERE stream_id = $2
+    #         """
+    #         await self.db_manager.execute_query(update_query, (stop_reason, stream_id))
+            
+    #         logger.warning(
+    #             f"⚠️ Database updated: {stream_id_str} -> "
+    #             f"is_streaming=TRUE (will auto-retry), stop_reason='{stop_reason}', "
+    #             f"locked_by_server UNCHANGED (server will retry)"
+    #         )
+        
+    #     await asyncio.sleep(0.1)
+
+    #     # ===== NOW stop in memory =====
+    #     async with self._lock:
+    #         if stream_id_str in self.active_streams:
+    #             stop_event = self.active_streams[stream_id_str].get('stop_event')
+    #             if stop_event:
+    #                 stop_event.set()
+                
+    #             self.active_streams[stream_id_str]['status'] = 'stopping'
+    #             self.active_streams[stream_id_str]['stop_reason'] = stop_reason
+        
+    #     # # Record stop in history
+    #     # await self.video_stream_service.record_camera_stop(
+    #     #     stream_id=stream_id,
+    #     #     stop_reason=stop_reason,
+    #     #     stopped_by=requester_user_id if stop_reason == 'user_action' else None,
+    #     #     additional_context=additional_context
+    #     # )
+
+    #     # Clean up in memory (this won't change database anymore)
+    #     await self._stop_stream(stream_id_str, for_restart=False)
+
+    #     # Determine response based on stop reason
+    #     if stop_reason == 'user_action':
+    #         return {
+    #             "stream_id": str(stream_id),
+    #             "name": stream_info['name'],
+    #             "workspace_id": str(workspace_id),
+    #             "stop_reason": stop_reason,
+    #             "will_auto_restart": False,
+    #             "server_lock_released": True,  # ✅ NEW
+    #             "message": "Camera stopped by user - will NOT auto-restart, server lock released"
+    #         }
+    #     else:
+    #         # System error: Schedule retry
+    #         stream_info_db = await self.video_stream_service.get_video_stream_by_id(stream_id)
+    #         current_retry_count = stream_info_db.get('retry_count', 0) if stream_info_db else 0
+            
+    #         await self.retry_service.schedule_retry(
+    #             stream_id=stream_id,
+    #             stop_reason=stop_reason,
+    #             current_retry_count=current_retry_count,
+    #             error_context=additional_context
+    #         )
+            
+    #         return {
+    #             "stream_id": str(stream_id),
+    #             "name": stream_info['name'],
+    #             "workspace_id": str(workspace_id),
+    #             "stop_reason": stop_reason,
+    #             "will_auto_restart": True,
+    #             "retry_strategy": "infinite_with_backoff",
+    #             "server_lock_kept": True,  # ✅ NEW
+    #             "message": f"Camera stopped due to {stop_reason} - will keep trying to reconnect"
+    #         }
+
     async def stop_stream_in_workspace(
         self,
         stream_id: UUID,
@@ -996,7 +1170,10 @@ class StreamManager:
         """
         Stop stream with proper database updates.
         
-        CRITICAL FIX: Clear server lock on user stop.
+        CRITICAL FIX: 
+        1. Database update is ATOMIC and BLOCKS distributed manager
+        2. Verification ensures is_streaming=FALSE
+        3. Small delay prevents race conditions
         """
         # Validate access
         stream_info, membership_info = await self.validate_workspace_stream_access(
@@ -1024,10 +1201,11 @@ class StreamManager:
             f"requester={requester_user_id}, context={additional_context}"
         )
         
-        # ===== CRITICAL FIX: Update DATABASE FIRST =====
+        # ==================== CRITICAL FIX: Single Atomic Database Update ====================
+        # This MUST happen as a single transaction to prevent race conditions
         
         if stop_reason == 'user_action':
-            # ✅ User stop: Clear EVERYTHING including server lock
+            # ✅ ATOMIC UPDATE: All fields in one query
             update_query = """
                 UPDATE video_stream 
                 SET is_streaming = FALSE,
@@ -1044,47 +1222,67 @@ class StreamManager:
                     updated_at = NOW(),
                     last_activity = NOW()
                 WHERE stream_id = $2
+                RETURNING is_streaming, status, stop_reason, locked_by_server, auto_retry_enabled
             """
-            await self.db_manager.execute_query(update_query, (requester_user_id, stream_id))
-                    
-            # ✅ VERIFY the update worked
-            verify = await self.db_manager.execute_query(
-                """SELECT is_streaming, stop_reason, status, locked_by_server 
-                FROM video_stream 
-                WHERE stream_id = $1""",
-                (stream_id,),
+            
+            result = await self.db_manager.execute_query(
+                update_query, 
+                (requester_user_id, stream_id),
                 fetch_one=True
             )
             
+            if not result:
+                raise HTTPException(status_code=404, detail="Camera not found")
+            
+            # ✅ CRITICAL VERIFICATION
             logger.info(
-                f"✅ Stop verified: {stream_id_str} -> "
-                f"is_streaming={verify['is_streaming']}, "
-                f"status={verify['status']}, "
-                f"stop_reason={verify['stop_reason']}, "
-                f"locked_by_server={verify['locked_by_server']}"
+                f"📊 Database update result: is_streaming={result['is_streaming']}, "
+                f"status={result['status']}, stop_reason={result['stop_reason']}, "
+                f"locked_by_server={result['locked_by_server']}, "
+                f"auto_retry_enabled={result['auto_retry_enabled']}"
             )
             
-            if verify['locked_by_server'] is not None:
+            # ✅ FAIL-SAFE: Verify the update actually worked
+            if result['is_streaming'] != False:
                 logger.error(
-                    f"❌ SERVER LOCK NOT CLEARED! "
-                    f"locked_by_server still shows: {verify['locked_by_server']}"
+                    f"❌ CRITICAL: is_streaming is still TRUE after update! "
+                    f"Database state: {result}"
+                )
+                raise RuntimeError(
+                    f"Failed to stop camera - database update failed. "
+                    f"is_streaming={result['is_streaming']}"
+                )
+            
+            if result['locked_by_server'] is not None:
+                logger.error(
+                    f"❌ CRITICAL: locked_by_server not cleared! "
+                    f"Still locked by: {result['locked_by_server']}"
                 )
                 raise RuntimeError("Failed to clear server lock")
-
-            logger.info(f"✅ Database updated FIRST and VERIFIED: {stream_id_str}")
-
-            await asyncio.sleep(0.1)
-
+            
+            if result['auto_retry_enabled'] != False:
+                logger.error(
+                    f"❌ CRITICAL: auto_retry_enabled not disabled!"
+                )
+                raise RuntimeError("Failed to disable auto-retry")
+            
+            logger.info(f"✅ ✅ ✅ Database verified: Camera {stream_id_str} FULLY STOPPED")
+            
+            # ✅ ADDITIONAL SAFETY: Wait 1 second for distributed manager to see changes
+            # This ensures the next management cycle sees the updated state
+            await asyncio.sleep(1.0)
+            
             # Cancel any pending retries (don't fail if this errors)
             try:
                 await self.retry_service.cancel_retry(stream_id, "user_action")
+                logger.info(f"✅ Retry cancelled for {stream_id_str}")
             except Exception as retry_err:
                 logger.warning(
                     f"⚠️ Failed to cancel retry (non-critical): {retry_err}"
                 )
             
         else:
-            # System error: Schedule retry, keep is_streaming=TRUE, KEEP server lock
+            # System error: Schedule retry, keep is_streaming=TRUE
             update_query = """
                 UPDATE video_stream 
                 SET is_streaming = TRUE,
@@ -1094,18 +1292,21 @@ class StreamManager:
                     updated_at = NOW(),
                     last_activity = NOW()
                 WHERE stream_id = $2
+                RETURNING is_streaming, status, stop_reason
             """
-            await self.db_manager.execute_query(update_query, (stop_reason, stream_id))
+            
+            result = await self.db_manager.execute_query(
+                update_query, 
+                (stop_reason, stream_id),
+                fetch_one=True
+            )
             
             logger.warning(
                 f"⚠️ Database updated: {stream_id_str} -> "
-                f"is_streaming=TRUE (will auto-retry), stop_reason='{stop_reason}', "
-                f"locked_by_server UNCHANGED (server will retry)"
+                f"is_streaming=TRUE (will auto-retry), stop_reason='{stop_reason}'"
             )
         
-        await asyncio.sleep(0.1)
-
-        # ===== NOW stop in memory =====
+        # ===== SECOND: Stop in memory =====
         async with self._lock:
             if stream_id_str in self.active_streams:
                 stop_event = self.active_streams[stream_id_str].get('stop_event')
@@ -1115,17 +1316,40 @@ class StreamManager:
                 self.active_streams[stream_id_str]['status'] = 'stopping'
                 self.active_streams[stream_id_str]['stop_reason'] = stop_reason
         
-        # # Record stop in history
-        # await self.video_stream_service.record_camera_stop(
-        #     stream_id=stream_id,
-        #     stop_reason=stop_reason,
-        #     stopped_by=requester_user_id if stop_reason == 'user_action' else None,
-        #     additional_context=additional_context
-        # )
-
-        # Clean up in memory (this won't change database anymore)
+        # Clean up in memory
         await self._stop_stream(stream_id_str, for_restart=False)
-
+        
+        # ✅ FINAL VERIFICATION: Double-check database state
+        if stop_reason == 'user_action':
+            final_check = await self.db_manager.execute_query(
+                """SELECT is_streaming, stop_reason, locked_by_server, auto_retry_enabled 
+                FROM video_stream WHERE stream_id = $1""",
+                (stream_id,),
+                fetch_one=True
+            )
+            
+            logger.info(
+                f"🔍 Final verification: is_streaming={final_check['is_streaming']}, "
+                f"stop_reason={final_check['stop_reason']}, "
+                f"locked_by_server={final_check['locked_by_server']}, "
+                f"auto_retry_enabled={final_check['auto_retry_enabled']}"
+            )
+            
+            if final_check['is_streaming']:
+                logger.error(
+                    f"❌❌❌ FINAL CHECK FAILED: Camera {stream_id_str} still has is_streaming=TRUE!"
+                )
+                # Force one more update
+                await self.db_manager.execute_query(
+                    """UPDATE video_stream 
+                    SET is_streaming = FALSE, 
+                        locked_by_server = NULL,
+                        auto_retry_enabled = FALSE
+                    WHERE stream_id = $1""",
+                    (stream_id,)
+                )
+                logger.warning(f"🔧 Forced final update to ensure is_streaming=FALSE")
+        
         # Determine response based on stop reason
         if stop_reason == 'user_action':
             return {
@@ -1134,8 +1358,9 @@ class StreamManager:
                 "workspace_id": str(workspace_id),
                 "stop_reason": stop_reason,
                 "will_auto_restart": False,
-                "server_lock_released": True,  # ✅ NEW
-                "message": "Camera stopped by user - will NOT auto-restart, server lock released"
+                "server_lock_released": True,
+                "is_streaming": False,
+                "message": "Camera stopped successfully - will NOT auto-restart"
             }
         else:
             # System error: Schedule retry
@@ -1156,7 +1381,7 @@ class StreamManager:
                 "stop_reason": stop_reason,
                 "will_auto_restart": True,
                 "retry_strategy": "infinite_with_backoff",
-                "server_lock_kept": True,  # ✅ NEW
+                "server_lock_kept": True,
                 "message": f"Camera stopped due to {stop_reason} - will keep trying to reconnect"
             }
 
@@ -1756,6 +1981,7 @@ class StreamManager:
         consecutive_errors = 0
         max_consecutive_errors = 5
         zombie_check_counter = 0
+        stuck_cleanup_counter = 0
 
         server_id = config.server_id
         max_capacity = config.max_local_streams

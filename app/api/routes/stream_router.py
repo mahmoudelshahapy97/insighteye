@@ -2276,3 +2276,24 @@ async def cleanup_zombie_locks(
             "success": False,
             "error": str(e)
         }
+
+@router.post("/admin/clear-stuck-cameras")
+async def clear_stuck_cameras_endpoint(
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Admin endpoint to manually clear stuck cameras.
+    Use this when cameras won't start after being stopped.
+    """
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from app.services.distributed_stream_manager import distributed_stream_manager
+    
+    cleared_count = await distributed_stream_manager.clear_stuck_user_stopped_cameras()
+    
+    return {
+        "success": True,
+        "cameras_cleared": cleared_count,
+        "message": f"Cleared {cleared_count} stuck cameras"
+    }

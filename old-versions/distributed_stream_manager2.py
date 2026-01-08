@@ -40,14 +40,104 @@ class DistributedStreamManager:
 
     # ==================== Atomic Camera Claiming ====================
 
+    # async def claim_available_cameras(self, slots_available: int) -> List[Dict[str, Any]]:
+    #     """
+    #     Atomically claim available cameras using FOR UPDATE SKIP LOCKED.
+        
+    #     ✅ FIXED: Now respects retry timing (next_retry_at)
+    #     """
+    #     if slots_available <= 0:
+    #         return []
+        
+    #     claim_query = """
+    #         WITH available_cameras AS (
+    #             SELECT vs.stream_id, vs.name, vs.path, vs.workspace_id, 
+    #                 vs.user_id, vs.location, vs.area, vs.building,
+    #                 vs.floor_level, vs.zone, vs.latitude, vs.longitude,
+    #                 u.username, u.role,
+    #                 vs.retry_count, vs.next_retry_at  -- ✅ Include retry info
+    #             FROM video_stream vs
+    #             JOIN users u ON vs.user_id = u.user_id
+    #             JOIN workspaces w ON vs.workspace_id = w.workspace_id
+    #             WHERE vs.is_streaming = TRUE
+    #             -- Camera should be running
+    #             AND u.is_active = TRUE
+    #             AND w.is_active = TRUE
+    #             AND (u.is_subscribed = TRUE OR u.role = 'admin')
+    #             -- ✅ Exclude user-stopped cameras
+    #             AND (vs.stop_reason IS NULL OR vs.stop_reason != 'user_action')
+    #             -- ✅ Respect auto_retry_enabled flag
+    #             AND vs.auto_retry_enabled = TRUE
+    #             -- ✅ CRITICAL: Respect retry timing
+    #             AND (
+    #                 vs.next_retry_at IS NULL  -- Never attempted
+    #                 OR vs.next_retry_at <= NOW()  -- Time to retry
+    #             )
+    #             -- Not currently claimed OR claimed by dead server
+    #             AND (
+    #                 vs.locked_by_server IS NULL 
+    #                 OR vs.server_heartbeat < NOW() - INTERVAL '2 minutes'
+    #             )
+    #             LIMIT $1
+    #             FOR UPDATE SKIP LOCKED
+    #         )
+    #         UPDATE video_stream
+    #         SET locked_by_server = $2,
+    #             server_heartbeat = NOW(),
+    #             status = 'processing',
+    #             updated_at = NOW()
+    #         FROM available_cameras
+    #         WHERE video_stream.stream_id = available_cameras.stream_id
+    #         RETURNING 
+    #             video_stream.stream_id,
+    #             video_stream.name,
+    #             video_stream.path,
+    #             video_stream.workspace_id,
+    #             video_stream.user_id,
+    #             video_stream.location,
+    #             video_stream.area,
+    #             video_stream.building,
+    #             video_stream.floor_level,
+    #             video_stream.zone,
+    #             video_stream.latitude,
+    #             video_stream.longitude,
+    #             available_cameras.username,
+    #             available_cameras.role,
+    #             available_cameras.retry_count,
+    #             available_cameras.next_retry_at
+    #     """
+        
+    #     try:
+    #         claimed_cameras = await self.db_manager.execute_query(
+    #             claim_query,
+    #             (slots_available, self.server_id),
+    #             fetch_all=True
+    #         )
+            
+    #         if claimed_cameras:
+    #             # Log retry attempts
+    #             for camera in claimed_cameras:
+    #                 retry_count = camera.get('retry_count', 0)
+    #                 if retry_count > 0:
+    #                     logger.info(
+    #                         f"✅ Claimed camera {camera['name']} for retry attempt #{retry_count}"
+    #                     )
+    #                 else:
+    #                     logger.info(
+    #                         f"✅ Claimed camera {camera['name']} for first start"
+    #                     )
+            
+    #         return claimed_cameras or []
+            
+    #     except Exception as e:
+    #         logger.error(f"Error claiming cameras: {e}", exc_info=True)
+    #         return []
+
     async def claim_available_cameras(self, slots_available: int) -> List[Dict[str, Any]]:
         """
         Atomically claim available cameras using FOR UPDATE SKIP LOCKED.
         
-        ✅ FIXED: 
-        1. Stricter filtering to exclude user-stopped cameras
-        2. Double-check after claiming to prevent race conditions
-        3. Immediate release if claimed camera shouldn't be running
+        ✅ FIXED: Now properly excludes user-stopped cameras
         """
         if slots_available <= 0:
             return []
@@ -58,8 +148,7 @@ class DistributedStreamManager:
                     vs.user_id, vs.location, vs.area, vs.building,
                     vs.floor_level, vs.zone, vs.latitude, vs.longitude,
                     u.username, u.role,
-                    vs.retry_count, vs.next_retry_at,
-                    vs.stop_reason, vs.auto_retry_enabled  -- ✅ Include these for verification
+                    vs.retry_count, vs.next_retry_at
                 FROM video_stream vs
                 JOIN users u ON vs.user_id = u.user_id
                 JOIN workspaces w ON vs.workspace_id = w.workspace_id
@@ -68,14 +157,12 @@ class DistributedStreamManager:
                 AND u.is_active = TRUE
                 AND w.is_active = TRUE
                 AND (u.is_subscribed = TRUE OR u.role = 'admin')
-                -- ✅ CRITICAL: Multiple checks for user stops
-                AND vs.stop_reason IS DISTINCT FROM 'user_action'
-                AND vs.stop_reason IS DISTINCT FROM 'user_stop'
-                AND vs.stop_reason IS DISTINCT FROM 'manual_stop'
-                AND vs.stop_reason IS DISTINCT FROM 'admin_stop'
-                -- ✅ CRITICAL: Must have auto-retry enabled
+                -- ✅ CRITICAL FIX: Exclude ALL user-initiated stops
+                AND (vs.stop_reason IS NULL 
+                    OR vs.stop_reason NOT IN ('user_action', 'user_stop', 'manual_stop', 'admin_stop'))
+                -- ✅ Respect auto_retry_enabled flag
                 AND vs.auto_retry_enabled = TRUE
-                -- ✅ CRITICAL: Respect retry timing
+                -- ✅ Respect retry timing
                 AND (
                     vs.next_retry_at IS NULL  -- Never attempted
                     OR vs.next_retry_at <= NOW()  -- Time to retry
@@ -111,10 +198,7 @@ class DistributedStreamManager:
                 available_cameras.username,
                 available_cameras.role,
                 available_cameras.retry_count,
-                available_cameras.next_retry_at,
-                video_stream.stop_reason,        -- ✅ Return for verification
-                video_stream.auto_retry_enabled, -- ✅ Return for verification
-                video_stream.is_streaming        -- ✅ Return for verification
+                available_cameras.next_retry_at
         """
         
         try:
@@ -124,71 +208,24 @@ class DistributedStreamManager:
                 fetch_all=True
             )
             
-            if not claimed_cameras:
-                return []
+            if claimed_cameras:
+                for camera in claimed_cameras:
+                    retry_count = camera.get('retry_count', 0)
+                    if retry_count > 0:
+                        logger.info(
+                            f"✅ Claimed camera {camera['name']} for retry attempt #{retry_count}"
+                        )
+                    else:
+                        logger.info(
+                            f"✅ Claimed camera {camera['name']} for first start"
+                        )
             
-            # ✅ POST-CLAIM VERIFICATION: Double-check each claimed camera
-            verified_cameras = []
-            
-            for camera in claimed_cameras:
-                stream_id = str(camera['stream_id'])
-                
-                # Check 1: is_streaming must be TRUE
-                if not camera.get('is_streaming', True):
-                    logger.error(
-                        f"❌ POST-CLAIM CHECK FAILED: {stream_id} ({camera['name']}) "
-                        f"has is_streaming=FALSE! Releasing immediately."
-                    )
-                    await self.release_camera_lock(stream_id, reason="claimed_but_not_streaming")
-                    continue
-                
-                # Check 2: stop_reason must NOT be user_action
-                if camera.get('stop_reason') in ('user_action', 'user_stop', 'manual_stop', 'admin_stop'):
-                    logger.error(
-                        f"❌ POST-CLAIM CHECK FAILED: {stream_id} ({camera['name']}) "
-                        f"has stop_reason={camera.get('stop_reason')}! Releasing immediately."
-                    )
-                    await self.release_camera_lock(stream_id, reason="claimed_but_user_stopped")
-                    continue
-                
-                # Check 3: auto_retry_enabled must be TRUE
-                if not camera.get('auto_retry_enabled', True):
-                    logger.error(
-                        f"❌ POST-CLAIM CHECK FAILED: {stream_id} ({camera['name']}) "
-                        f"has auto_retry_enabled=FALSE! Releasing immediately."
-                    )
-                    await self.release_camera_lock(stream_id, reason="claimed_but_retry_disabled")
-                    continue
-                
-                # ✅ All checks passed
-                retry_count = camera.get('retry_count', 0)
-                if retry_count > 0:
-                    logger.info(
-                        f"✅ Claimed camera {camera['name']} for retry attempt #{retry_count} "
-                        f"(verified: is_streaming=TRUE, stop_reason={camera.get('stop_reason')}, "
-                        f"auto_retry=TRUE)"
-                    )
-                else:
-                    logger.info(
-                        f"✅ Claimed camera {camera['name']} for first start "
-                        f"(verified: is_streaming=TRUE, auto_retry=TRUE)"
-                    )
-                
-                verified_cameras.append(camera)
-            
-            if len(verified_cameras) != len(claimed_cameras):
-                logger.warning(
-                    f"⚠️ Post-claim verification: {len(claimed_cameras)} claimed, "
-                    f"{len(verified_cameras)} verified, "
-                    f"{len(claimed_cameras) - len(verified_cameras)} rejected"
-                )
-            
-            return verified_cameras
+            return claimed_cameras or []
             
         except Exception as e:
             logger.error(f"Error claiming cameras: {e}", exc_info=True)
             return []
-                            
+
     async def update_heartbeat_for_owned_cameras(self) -> int:
         """
         Update heartbeat for cameras owned by this server.
@@ -258,20 +295,105 @@ class DistributedStreamManager:
 
     # ==================== Stream Lifecycle ====================
 
+    # async def start_camera_locally(self, camera_data: Dict[str, Any]):
+    #     """
+    #     Start a camera that this server has successfully claimed.
+        
+    #     This is called AFTER claim_available_cameras() succeeds.
+    #     """
+    #     stream_id = camera_data['stream_id']
+    #     stream_id_str = str(stream_id)
+        
+    #     try:
+
+    #         # ✅ SAFETY: Verify camera wasn't just user-stopped
+    #         verify_query = """
+    #             SELECT stop_reason, auto_retry_enabled 
+    #             FROM video_stream 
+    #             WHERE stream_id = $1
+    #         """
+            
+    #         verify = await self.db_manager.execute_query(
+    #             verify_query, (stream_id,), fetch_one=True
+    #         )
+            
+    #         if verify:
+    #             if verify['stop_reason'] == 'user_action':
+    #                 logger.warning(
+    #                     f"⚠️ Camera {stream_id_str} was user-stopped after claim, "
+    #                     f"releasing lock and skipping start"
+    #                 )
+    #                 await self.release_camera_lock(stream_id_str, reason="user_stopped_after_claim")
+    #                 return
+                
+    #             if not verify.get('auto_retry_enabled', True):
+    #                 logger.warning(
+    #                     f"⚠️ Camera {stream_id_str} has auto_retry_enabled=FALSE, "
+    #                     f"releasing lock and skipping start"
+    #                 )
+    #                 await self.release_camera_lock(stream_id_str, reason="auto_retry_disabled")
+    #                 return
+                    
+    #         # Build location info
+    #         location_info = {
+    #             'location': camera_data.get('location'),
+    #             'area': camera_data.get('area'),
+    #             'building': camera_data.get('building'),
+    #             'zone': camera_data.get('zone'),
+    #             'floor_level': camera_data.get('floor_level'),
+    #             'latitude': camera_data.get('latitude'),
+    #             'longitude': camera_data.get('longitude')
+    #         }
+            
+    #         # Register in local state
+    #         async with self._lock:
+    #             self.active_streams[stream_id_str] = {
+    #                 'stream_id': stream_id,
+    #                 'name': camera_data['name'],
+    #                 'workspace_id': camera_data['workspace_id'],
+    #                 'user_id': camera_data['user_id'],
+    #                 'start_time': datetime.now(ZoneInfo("Africa/Cairo")),
+    #                 'status': 'starting'
+    #             }
+            
+    #         # Start actual processing (import your existing start logic)
+    #         from app.services.stream_service import stream_manager
+            
+    #         await stream_manager.start_stream_background(
+    #             stream_id=stream_id,
+    #             owner_id=camera_data['user_id'],
+    #             owner_username=camera_data['username'],
+    #             camera_name=camera_data['name'],
+    #             source=camera_data['path'],
+    #             workspace_id=camera_data['workspace_id'],
+    #             location_info=location_info
+    #         )
+            
+    #         logger.info(f"✅ Started camera {camera_data['name']} on server {self.server_id}")
+            
+    #     except Exception as e:
+    #         logger.error(f"Error starting camera {stream_id_str}: {e}", exc_info=True)
+            
+    #         # Release lock on failure
+    #         await self.release_camera_lock(stream_id_str, reason="start_failed")
+            
+    #         # Remove from local state
+    #         async with self._lock:
+    #             self.active_streams.pop(stream_id_str, None)
+
     async def start_camera_locally(self, camera_data: Dict[str, Any]):
         """
         Start a camera that this server has successfully claimed.
         
-        This is called AFTER claim_available_cameras() succeeds.
+        ✅ FIXED: Double-check stop_reason before starting
         """
         stream_id = camera_data['stream_id']
         stream_id_str = str(stream_id)
         
         try:
-
-            # ✅ SAFETY: Verify camera wasn't just user-stopped
+            # ✅ CRITICAL SAFETY CHECK: Verify camera wasn't just user-stopped
             verify_query = """
-                SELECT stop_reason, auto_retry_enabled 
+                SELECT stop_reason, auto_retry_enabled, is_streaming 
                 FROM video_stream 
                 WHERE stream_id = $1
             """
@@ -280,23 +402,35 @@ class DistributedStreamManager:
                 verify_query, (stream_id,), fetch_one=True
             )
             
-            if verify:
-                if verify['stop_reason'] == 'user_action':
-                    logger.warning(
-                        f"⚠️ Camera {stream_id_str} was user-stopped after claim, "
-                        f"releasing lock and skipping start"
-                    )
-                    await self.release_camera_lock(stream_id_str, reason="user_stopped_after_claim")
-                    return
-                
-                if not verify.get('auto_retry_enabled', True):
-                    logger.warning(
-                        f"⚠️ Camera {stream_id_str} has auto_retry_enabled=FALSE, "
-                        f"releasing lock and skipping start"
-                    )
-                    await self.release_camera_lock(stream_id_str, reason="auto_retry_disabled")
-                    return
-                    
+            if not verify:
+                logger.error(f"❌ Camera {stream_id_str} not found in database")
+                return
+            
+            # ✅ FIX: Check for ANY user-stop reason
+            if verify['stop_reason'] in ('user_action', 'user_stop', 'manual_stop', 'admin_stop'):
+                logger.warning(
+                    f"⚠️ Camera {stream_id_str} was user-stopped (reason: {verify['stop_reason']}). "
+                    f"Releasing lock and skipping start."
+                )
+                await self.release_camera_lock(stream_id_str, reason="user_stopped_after_claim")
+                return
+            
+            if not verify.get('auto_retry_enabled', True):
+                logger.warning(
+                    f"⚠️ Camera {stream_id_str} has auto_retry_enabled=FALSE. "
+                    f"Releasing lock and skipping start."
+                )
+                await self.release_camera_lock(stream_id_str, reason="auto_retry_disabled")
+                return
+            
+            if not verify.get('is_streaming', False):
+                logger.warning(
+                    f"⚠️ Camera {stream_id_str} has is_streaming=FALSE. "
+                    f"Releasing lock and skipping start."
+                )
+                await self.release_camera_lock(stream_id_str, reason="not_supposed_to_stream")
+                return
+            
             # Build location info
             location_info = {
                 'location': camera_data.get('location'),
@@ -319,7 +453,7 @@ class DistributedStreamManager:
                     'status': 'starting'
                 }
             
-            # Start actual processing (import your existing start logic)
+            # Start actual processing
             from app.services.stream_service import stream_manager
             
             await stream_manager.start_stream_background(
@@ -439,17 +573,9 @@ class DistributedStreamManager:
         
         zombie_check_counter = 0
         zombie_lock_counter = 0
-        stuck_cleanup_counter = 0
         
         while self.is_running:
             try:
-                # Every 10 cycles (every ~5 minutes), clean stuck cameras
-                stuck_cleanup_counter += 1
-                if stuck_cleanup_counter >= 10:
-                    cleared = await self.clear_stuck_user_stopped_cameras()
-                    if cleared > 0:
-                        logger.warning(f"🧹 Auto-cleaned {cleared} stuck user-stopped cameras")
-                    stuck_cleanup_counter = 0
 
                 # ==================== STEP 1: Cleanup Zombie Locks ====================
                 zombie_lock_counter += 1
@@ -614,52 +740,7 @@ class DistributedStreamManager:
         except Exception as e:
             logger.error(f"Error cleaning zombie locks: {e}", exc_info=True)
             return 0
-
-    async def clear_stuck_user_stopped_cameras(self):
-        """
-        Clean up cameras that are stuck with user_action but is_streaming=TRUE.
-        This fixes the issue where stopped cameras try to restart.
-        
-        Call this function when you see cameras trying to restart after being stopped.
-        """
-        query = """
-            WITH stuck_cameras AS (
-                SELECT stream_id, name, workspace_id
-                FROM video_stream
-                WHERE is_streaming = TRUE
-                AND stop_reason IN ('user_action', 'user_stop', 'manual_stop', 'admin_stop')
-                AND auto_retry_enabled = FALSE
-            )
-            UPDATE video_stream
-            SET is_streaming = FALSE,
-                status = 'inactive',
-                locked_by_server = NULL,
-                server_heartbeat = NULL,
-                next_retry_at = NULL,
-                retry_count = 0,
-                updated_at = NOW()
-            FROM stuck_cameras
-            WHERE video_stream.stream_id = stuck_cameras.stream_id
-            RETURNING video_stream.stream_id, video_stream.name
-        """
-        
-        try:
-            result = await self.db_manager.execute_query(query, fetch_all=True)
             
-            if result:
-                camera_names = [r['name'] for r in result]
-                logger.info(
-                    f"✅ Cleared {len(result)} stuck user-stopped cameras: {camera_names}"
-                )
-                return len(result)
-            else:
-                logger.info("✅ No stuck cameras found")
-                return 0
-                
-        except Exception as e:
-            logger.error(f"Error clearing stuck cameras: {e}", exc_info=True)
-            return 0
-
 # ==================== Global Instance ====================
 
 distributed_stream_manager = DistributedStreamManager()
