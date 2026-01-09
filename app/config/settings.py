@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # capacity 
     max_local_streams: int = 8
 
+    # Grace periods (adjust based on your RTSP cameras)
+    rtsp_grace_period_seconds: int = 360  # 6 minutes
+    file_grace_period_seconds: int = 120  # 2 minutes
+
     # Balanced heartbeat
     management_loop_sleep: int = 20  # seconds
     server_heartbeat_threshold: int = 120  # seconds
