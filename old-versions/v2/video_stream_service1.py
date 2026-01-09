@@ -435,7 +435,7 @@ class VideoStreamService:
         """
         Record why and when a camera was stopped.
         
-        ✅ ENHANCED: Prevents race conditions and state conflicts
+        ✅ FIXED: Proper state transitions for all stop reasons
         """
         valid_reasons = [
             'user_action', 'connection_error', 'system_error', 
@@ -447,17 +447,11 @@ class VideoStreamService:
             return False
         
         try:
-            # ✅ CRITICAL: Check current state FIRST
+            # ✅ Check current state
             current_state = await self.db_manager.execute_query(
-                """SELECT 
-                    stop_reason, 
-                    is_streaming, 
-                    status, 
-                    retry_count,
-                    auto_retry_enabled
+                """SELECT stop_reason, is_streaming, status, retry_count
                 FROM video_stream 
-                WHERE stream_id = $1
-                FOR UPDATE""",  # ✅ Lock row to prevent race conditions
+                WHERE stream_id = $1""",
                 (stream_id,),
                 fetch_one=True
             )
@@ -466,7 +460,7 @@ class VideoStreamService:
                 logger.error(f"Camera {stream_id} not found")
                 return False
             
-            # ✅ CRITICAL: If already user-stopped, NEVER overwrite
+            # ✅ If already user-stopped, NEVER overwrite
             if current_state['stop_reason'] == 'user_action':
                 logger.info(
                     f"⏭️ Camera {stream_id} already user-stopped. "
@@ -475,7 +469,7 @@ class VideoStreamService:
                 return True
             
             if stop_reason == 'user_action':
-                # ✅ User stop: Complete shutdown, disable retries
+                # ✅ User stop: Complete shutdown
                 query = """
                     UPDATE video_stream 
                     SET stop_reason = $1,
@@ -491,30 +485,20 @@ class VideoStreamService:
                         server_heartbeat = NULL,
                         updated_at = NOW()
                     WHERE stream_id = $3
-                    RETURNING is_streaming, stop_reason, auto_retry_enabled
                 """
                 
-                result = await self.db_manager.execute_query(
+                await self.db_manager.execute_query(
                     query, 
-                    (stop_reason, stopped_by, stream_id),
-                    fetch_one=True
+                    (stop_reason, stopped_by, stream_id)
                 )
                 
-                # ✅ Verify the update worked
-                if result and result['is_streaming'] == False:
-                    logger.info(
-                        f"✅ User stop recorded: {stream_id} -> "
-                        f"is_streaming=FALSE, auto_retry=FALSE, will NOT restart"
-                    )
-                else:
-                    logger.error(
-                        f"❌ CRITICAL: User stop failed to set is_streaming=FALSE! "
-                        f"Result: {result}"
-                    )
-                    return False
+                logger.info(
+                    f"✅ User stop recorded: {stream_id} -> "
+                    f"is_streaming=FALSE, will NOT restart"
+                )
                 
             else:
-                # ✅ System error: Keep is_streaming=TRUE, enable retries
+                # ✅ System error: Keep running, schedule retry
                 current_retry = current_state.get('retry_count', 0)
                 
                 query = """
@@ -524,40 +508,32 @@ class VideoStreamService:
                         stopped_at = NOW(),
                         status = 'error',
                         is_streaming = TRUE,
-                        retry_count = $3 + 1,
+                        retry_count = $3,
                         last_retry_at = NOW(),
-                        auto_retry_enabled = TRUE,
                         updated_at = NOW()
                     WHERE stream_id = $4
-                    RETURNING is_streaming, stop_reason, retry_count, auto_retry_enabled
                 """
                 
-                result = await self.db_manager.execute_query(
+                await self.db_manager.execute_query(
                     query, 
-                    (stop_reason, stopped_by, current_retry, stream_id),
-                    fetch_one=True
+                    (stop_reason, stopped_by, current_retry, stream_id)
                 )
                 
-                # ✅ Verify the update worked
-                if result and result['is_streaming'] == True:
-                    logger.warning(
-                        f"⚠️ System error recorded: {stream_id} -> "
-                        f"is_streaming=TRUE, retry_count={result['retry_count']}, "
-                        f"auto_retry=TRUE, will retry (reason: {stop_reason})"
-                    )
-                else:
-                    logger.error(
-                        f"❌ CRITICAL: System error failed to keep is_streaming=TRUE! "
-                        f"Result: {result}"
-                    )
-                    return False
+                # ✅ Trigger retry scheduling via database trigger
+                # (auto_schedule_retry trigger will set next_retry_at)
+                
+                logger.warning(
+                    f"⚠️ System error recorded: {stream_id} -> "
+                    f"is_streaming=TRUE, will retry (reason: {stop_reason}, "
+                    f"attempt #{current_retry + 1})"
+                )
             
             return True
             
         except Exception as e:
             logger.error(f"Error recording camera stop: {e}", exc_info=True)
             return False
-            
+
     async def _log_camera_issue(
         self, 
         stream_id: UUID, 

@@ -1,5 +1,4 @@
 # app/services/shared_stream_service.py
-# 🔧 FIXED VERSION - Solves RTSP disconnection issues
 import time
 import logging
 import asyncio
@@ -14,14 +13,8 @@ logger = logging.getLogger(__name__)
 
 class SharedVideoStream:
     """
-    FIXED: Async-based shared video stream with improved RTSP stability.
-    
-    KEY FIXES:
-    1. Increased timeouts and buffer sizes
-    2. Better frame buffer management
-    3. Smarter reconnection with exponential backoff
-    4. Connection recovery instead of full restart
-    5. Reduced aggressive error handling
+    Async-based shared video stream with single-threaded reading.
+    CRITICAL: Only ONE asyncio task reads from cv2.VideoCapture to avoid FFmpeg async_lock errors.
     """
     
     def __init__(self, source: str, max_subscribers: int = 10):
@@ -31,7 +24,7 @@ class SharedVideoStream:
         self.latest_frame: Optional[np.ndarray] = None
         self.is_running = False
         
-        # Use asyncio primitives
+        # Use asyncio primitives instead of threading
         self.lock = asyncio.Lock()
         self.frame_available = asyncio.Event()
         self.max_subscribers = max_subscribers
@@ -40,7 +33,7 @@ class SharedVideoStream:
         
         self.last_frame_time = time.time()
         self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10  # ✅ Increased from 5 to 10
+        self.max_reconnect_attempts = 5
         
         # Error tracking
         self.frame_count = 0
@@ -54,24 +47,17 @@ class SharedVideoStream:
         self.is_rtsp_source = self._is_rtsp_source(source)
         self.file_exists = self._validate_file_source(source) if self.is_file_source else True
 
-        # ✅ FIX #1: More lenient RTSP error handling
+        # RTSP error handling
         self.consecutive_decode_errors = 0
-        self.max_decode_errors = 50  # ✅ Increased from 10 to 50
+        self.max_decode_errors = 10  # Reconnect after 10 consecutive errors
         self.last_good_frame_time = None
 
-        # ✅ FIX #2: Increased timeouts
-        self.rtsp_timeout = 60  # ✅ Increased from 15 to 60 seconds
-        self.rtsp_reconnect_delay = 5  # ✅ Increased from 2 to 5 seconds
-        self.read_timeout_seconds = 180  # ✅ New: 3 minutes before giving up
+        # RTSP settings
+        self.rtsp_timeout = 15
+        self.rtsp_reconnect_delay = 2
         
         # CRITICAL: Capture lock to ensure only one read() at a time
         self._capture_lock = asyncio.Lock()
-        
-        # ✅ FIX #3: Connection recovery tracking
-        self.connection_stable_time = None
-        self.min_stable_duration = 60  # Consider connection stable after 60 seconds
-        self.last_reconnect_time = 0
-        self.min_reconnect_interval = 10  # Wait at least 10 seconds between reconnects
         
         logging.info(f"Created SharedVideoStream for source: {source} "
                     f"(file: {self.is_file_source}, rtsp: {self.is_rtsp_source})")
@@ -119,6 +105,7 @@ class SharedVideoStream:
             if self.latest_frame is not None:
                 self.subscribers[stream_id]['frames_received'] += 1
                 self.subscribers[stream_id]['last_frame_time'] = time.time()
+                # Return a copy to avoid race conditions
                 return self.latest_frame.copy()
             
             return None
@@ -165,39 +152,43 @@ class SharedVideoStream:
         
     def _configure_rtsp_environment(self):
         """
-        ✅ FIX #4: Enhanced RTSP configuration for stability.
+        RTSP configuration to reduce decoding errors.
         
-        KEY IMPROVEMENTS:
-        1. Larger buffers to prevent overflow
-        2. Longer timeouts for network recovery
-        3. TCP transport for reliability
-        4. Error tolerance flags
+        KEY FIXES:
+        1. Increased buffer sizes
+        2. More lenient error handling
+        3. Faster timeout recovery
         """
         if not self.is_rtsp_source:
             return
         
-        # Suppress FFmpeg error spam
-        os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'
+        # ==================== CRITICAL: FFmpeg Error Handling ====================
         
-        # ✅ CRITICAL: Optimized RTSP settings for stability
+        # Suppress FFmpeg error messages to stderr (reduces log spam)
+        os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'  # AV_LOG_QUIET
+        
+        # RTSP transport and timeout settings
         os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
-            f'rtsp_transport;tcp|'  # TCP is more reliable
-            f'timeout;{self.rtsp_timeout * 1000000}|'  # 60 seconds
-            f'stimeout;{self.rtsp_timeout * 1000000}|'
-            f'max_delay;5000000|'  # ✅ Increased to 5 seconds
-            f'buffer_size;2048000|'  # ✅ 2MB buffer (was implicit)
-            f'reorder_queue_size;0|'
-            f'fflags;+genpts+igndts+discardcorrupt|'  # ✅ Added discardcorrupt
-            f'flags;+low_delay|'
-            f'analyzeduration;5000000|'  # ✅ Increased to 5 seconds
-            f'probesize;5000000|'  # ✅ 5MB probe
-            f'err_detect;ignore_err'  # ✅ NEW: Ignore minor errors
+            f'rtsp_transport;tcp|'  # TCP is more reliable than UDP
+            f'timeout;{self.rtsp_timeout * 1000000}|'  # Microseconds
+            f'stimeout;{self.rtsp_timeout * 1000000}|'  # Socket timeout
+            f'max_delay;500000|'  # 0.5 second max delay
+            f'reorder_queue_size;0|'  # Disable reordering (reduces latency)
+            f'fflags;+genpts+igndts|'  # Generate PTS, ignore DTS errors
+            f'flags;+low_delay|'  # Low latency mode
+            f'analyzeduration;1000000|'  # 1 second analysis
+            f'probesize;1000000'  # 1MB probe size
         )
         
-        # Single-threaded FFmpeg
+        # Single-threaded FFmpeg (prevents async_lock issues)
         os.environ['OPENCV_FFMPEG_THREAD_COUNT'] = '1'
         
-        logger.info(f"✅ Enhanced RTSP config: timeout={self.rtsp_timeout}s, buffer=2MB")
+        # ==================== NEW: Error Resilience ====================
+        
+        # Tell FFmpeg to be more lenient with corrupted frames
+        os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = '3'  # Retry reads
+        
+        logger.info(f"Configured RTSP environment for {self.source}")
     
     async def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
@@ -211,7 +202,6 @@ class SharedVideoStream:
                 'reconnect_attempts': self.reconnect_attempts,
                 'last_error': self.last_error,
                 'error_count': self.error_count,
-                'connection_stable': self.connection_stable_time is not None,
                 'subscribers': {
                     stream_id: {
                         'frames_received': info['frames_received'],
@@ -222,15 +212,21 @@ class SharedVideoStream:
             }
 
     async def _safe_release_capture(self):
-        """Safely release VideoCapture with proper error handling."""
+        """
+        Safely release VideoCapture with proper error handling.
+        CRITICAL: Prevents "NoneType has no attribute 'release'" errors.
+        Runs blocking operation in executor.
+        """
         if self.cap is None:
             return
         
         try:
+            # Acquire lock to ensure thread safety
             async with self._capture_lock:
-                if self.cap is not None:
+                if self.cap is not None:  # Double-check after acquiring lock
                     try:
                         if self.cap.isOpened():
+                            # Run blocking release in executor
                             loop = asyncio.get_event_loop()
                             await loop.run_in_executor(None, self.cap.release)
                             logging.debug(f"✓ Released VideoCapture for {self.source}")
@@ -239,13 +235,16 @@ class SharedVideoStream:
                     except Exception as e:
                         logging.warning(f"Error during cap.release() for {self.source}: {e}")
                     finally:
-                        self.cap = None
+                        self.cap = None  # Always set to None
         except Exception as e:
             logging.error(f"Error in _safe_release_capture for {self.source}: {e}")
-            self.cap = None
+            self.cap = None  # Ensure it's set to None even on error
     
     async def _stop_capture(self):
-        """Stop the video capture task with safe cleanup."""
+        """
+        Stop the video capture task with safe cleanup.
+        FIXED: Proper None checks and error handling.
+        """
         if not self.is_running:
             return
         
@@ -266,7 +265,9 @@ class SharedVideoStream:
             try:
                 await asyncio.wait_for(self.capture_task, timeout=timeout)
             except asyncio.TimeoutError:
-                logging.warning(f"⚠️ Capture task for {self.source} did not stop within {timeout}s.")
+                logging.warning(
+                    f"⚠️ Capture task for {self.source} did not stop within {timeout}s."
+                )
             except asyncio.CancelledError:
                 pass
         
@@ -275,13 +276,9 @@ class SharedVideoStream:
     
     async def _capture_loop(self):
         """
-        ✅ FIX #5: Improved capture loop with better error recovery.
-        
-        FIXES:
-        1. Connection recovery before full restart
-        2. Longer timeouts before giving up
-        3. Exponential backoff for reconnections
-        4. Buffer flush on errors
+        Main capture loop with safe cleanup in finally block.
+        FIXED: All release() calls now use safe method.
+        Uses asyncio and runs blocking cv2 calls in executor.
         """
         logging.info(f"Capture loop started for {self.source}")
         
@@ -289,6 +286,7 @@ class SharedVideoStream:
         if self.is_rtsp_source:
             self._configure_rtsp_environment()
         
+        # Get event loop
         loop = asyncio.get_event_loop()
         
         # Get video info
@@ -300,11 +298,12 @@ class SharedVideoStream:
                     video_fps = test_cap.get(cv2.CAP_PROP_FPS)
                     total_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
                     logging.info(f"Video: {total_frames} frames, {video_fps:.1f} FPS")
-                test_cap.release()
+                test_cap.release()  # This is safe - we just created it
             except Exception as e:
                 logging.warning(f"Could not get video info: {e}")
         
         last_successful_read = time.time()
+        read_timeout = 30.0
         
         try:
             while not self.stop_capture.is_set() and self.is_running:
@@ -317,74 +316,59 @@ class SharedVideoStream:
                     # Open video source if needed
                     if self.cap is None or not self.cap.isOpened():
                         if not await self._open_video_source_async():
-                            # ✅ FIX #6: Exponential backoff for reconnection
-                            base_delay = self.rtsp_reconnect_delay if self.is_rtsp_source else 2.0
-                            backoff_delay = min(30.0, base_delay * (1.5 ** (self.reconnect_attempts - 1)))
+                            delay = self.rtsp_reconnect_delay if self.is_rtsp_source else 2.0
+                            logging.warning(f"Failed to open {self.source}, retry in {delay}s")
                             
-                            logging.warning(
-                                f"Failed to open {self.source}, retry in {backoff_delay:.1f}s "
-                                f"(attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})"
-                            )
-                            
+                            # Async sleep with stop checks
                             try:
                                 await asyncio.wait_for(
                                     self.stop_capture.wait(), 
-                                    timeout=backoff_delay
+                                    timeout=delay
                                 )
-                                break
+                                break  # Stop was signaled
                             except asyncio.TimeoutError:
-                                pass
+                                pass  # Continue after delay
                             
                             self.reconnect_attempts += 1
-                            
-                            # ✅ FIX #7: Give up after max attempts
-                            if self.reconnect_attempts >= self.max_reconnect_attempts:
-                                logging.error(f"Max reconnect attempts reached for {self.source}")
-                                break
-                            
                             continue
                     
-                    # ✅ FIX #8: Try connection recovery before full restart
-                    if self.is_rtsp_source and self.consecutive_failures > 5:
-                        if await self._try_connection_recovery():
-                            logging.info(f"✅ Connection recovered for {self.source}")
-                            self.consecutive_failures = 0
-                            last_successful_read = time.time()
-                            continue
-                    
-                    # Thread-safe read
+                    # CRITICAL: Thread-safe read with proper None check
                     frame_read_successful = False
                     ret = False
                     frame = None
                     
+                    # Acquire lock for reading
                     async with self._capture_lock:
+                        # Triple-check everything is valid
                         if (not self.stop_capture.is_set() and 
                             self.is_running and 
                             self.cap is not None and
                             self.cap.isOpened()):
                             
                             try:
-                                ret, frame = await loop.run_in_executor(None, self.cap.read)
+                                # Run blocking cv2.read() in executor
+                                ret, frame = await loop.run_in_executor(
+                                    None,  # Use default executor
+                                    self.cap.read
+                                )
                                 frame_read_successful = True
                             except Exception as read_error:
                                 logging.error(f"Exception during cap.read(): {read_error}")
                                 ret = False
                                 frame = None
                     
+                    # Check stop again after read
                     if self.stop_capture.is_set() or not self.is_running:
                         break
                     
                     if not frame_read_successful or not ret or frame is None:
                         self._handle_read_failure()
                         
-                        # ✅ FIX #9: Increased timeout from 30s to 180s
+                        # Check timeout for RTSP
                         if self.is_rtsp_source:
                             time_since_success = time.time() - last_successful_read
-                            if time_since_success > self.read_timeout_seconds:
-                                logging.error(
-                                    f"No frames for {time_since_success:.1f}s "
-                                    f"(timeout: {self.read_timeout_seconds}s)"
-                                )
+                            if time_since_success > read_timeout:
+                                logging.error(f"No frames for {time_since_success:.1f}s")
                                 break
                         
                         continue
@@ -395,7 +379,7 @@ class SharedVideoStream:
                         self._handle_read_failure()
                         continue
                     
-                    # ✅ Successfully read frame
+                    # Successfully read frame
                     last_successful_read = time.time()
                     self.reconnect_attempts = 0
                     self.consecutive_failures = 0
@@ -403,11 +387,7 @@ class SharedVideoStream:
                     self.last_frame_time = time.time()
                     self.last_successful_read = time.time()
                     
-                    # Track connection stability
-                    if self.connection_stable_time is None:
-                        self.connection_stable_time = time.time()
-                    
-                    # Update latest frame
+                    # Update latest frame (thread-safe)
                     async with self.lock:
                         self.latest_frame = frame
                         self.frame_available.set()
@@ -422,15 +402,16 @@ class SharedVideoStream:
                     else:
                         sleep_time = 0.033
                     
+                    # Async sleep with stop checks
                     if sleep_time > 0:
                         try:
                             await asyncio.wait_for(
                                 self.stop_capture.wait(),
                                 timeout=sleep_time
                             )
-                            break
+                            break  # Stop was signaled
                         except asyncio.TimeoutError:
-                            pass
+                            pass  # Continue after sleep
                     
                 except asyncio.CancelledError:
                     logging.info(f"Capture task cancelled for {self.source}")
@@ -441,11 +422,12 @@ class SharedVideoStream:
                     self.consecutive_failures += 1
                     logging.error(f"Error in capture loop: {e}")
                     
-                    max_failures = 20 if self.is_rtsp_source else 20  # Same for all
+                    max_failures = 10 if self.is_rtsp_source else 20
                     if self.consecutive_failures > max_failures:
-                        logging.error(f"Too many failures ({self.consecutive_failures}), stopping")
+                        logging.error(f"Too many failures, stopping")
                         break
                     
+                    # Async sleep with stop checks
                     try:
                         await asyncio.wait_for(self.stop_capture.wait(), timeout=1.0)
                         break
@@ -456,78 +438,34 @@ class SharedVideoStream:
             logging.error(f"Fatal error in capture loop: {e}", exc_info=True)
         
         finally:
+            # CRITICAL: Safe cleanup in finally block
             logging.info(f"Capture loop cleanup starting for {self.source}")
             await self._safe_release_capture()
             self.is_running = False
-            self.connection_stable_time = None
             logging.info(f"✓ Capture loop ended for {self.source}")
     
-    async def _try_connection_recovery(self) -> bool:
-        """
-        ✅ FIX #10: Try to recover connection without full restart.
-        
-        This is faster than creating a new connection and avoids
-        hitting NVR connection limits.
-        """
-        try:
-            if self.cap is None or not self.cap.isOpened():
-                return False
-            
-            logging.info(f"🔧 Attempting connection recovery for {self.source}")
-            
-            # Get event loop
-            loop = asyncio.get_event_loop()
-            
-            # Step 1: Flush buffer
-            async with self._capture_lock:
-                if self.cap is not None and self.cap.isOpened():
-                    # Clear buffer by setting buffer size to 1
-                    try:
-                        await loop.run_in_executor(
-                            None,
-                            self.cap.set,
-                            cv2.CAP_PROP_BUFFERSIZE,
-                            1
-                        )
-                    except:
-                        pass
-                    
-                    # Read and discard buffered frames
-                    for _ in range(10):
-                        try:
-                            await loop.run_in_executor(None, self.cap.read)
-                        except:
-                            break
-                    
-                    # Test read
-                    try:
-                        ret, test_frame = await loop.run_in_executor(None, self.cap.read)
-                        if ret and test_frame is not None and test_frame.size > 0:
-                            logging.info(f"✅ Connection recovery successful for {self.source}")
-                            return True
-                    except:
-                        pass
-            
-            return False
-            
-        except Exception as e:
-            logging.error(f"Error during connection recovery: {e}")
-            return False
-    
     def _handle_read_failure(self):
-        """Handle read failures with improved logic."""
+        """
+        Handle read failures with safe cleanup.
+        FIXED: Use safe release method.
+        """
         self.consecutive_failures += 1
         
         # Video looping for files
         if self.is_file_source and self.cap is not None:
             try:
+                # Note: We can't use async here, but we're protected by _capture_lock
                 if self.cap is not None and self.cap.isOpened():
                     current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
                     total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
                     
+                    # End of video - loop
                     if total_frames > 0 and current_pos >= total_frames - 1:
                         logging.info(f"End of video, looping: {self.source}")
+                        
                         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        
+                        # Test read
                         ret, test_frame = self.cap.read()
                         
                         if ret and test_frame is not None:
@@ -536,29 +474,39 @@ class SharedVideoStream:
                             self.consecutive_failures = 0
                             self.reconnect_attempts = 0
                             return
+                        
             except Exception as e:
                 logging.warning(f"Error handling video loop: {e}")
         
-        # ✅ FIX #11: Less aggressive for RTSP
+        # RTSP reconnection
         elif self.is_rtsp_source:
-            # Don't increment reconnect_attempts here - let the main loop handle it
-            # Just log the failure
-            if self.consecutive_failures % 10 == 0:  # Log every 10 failures
-                logging.warning(
-                    f"RTSP read failures: {self.consecutive_failures} consecutive "
-                    f"(will keep trying for {self.read_timeout_seconds}s total)"
-                )
+            self.reconnect_attempts += 1
+            
+            if self.reconnect_attempts >= self.max_reconnect_attempts:
+                logging.error(f"Max RTSP reconnect attempts reached")
+                self.is_running = False
+                return
+            
+            delay = self.rtsp_reconnect_delay
+            logging.warning(
+                f"RTSP failure, retry in {delay}s "
+                f"(attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})"
+            )
+            
+            time.sleep(delay)
+            
+            # Force re-open - will be called from async context
+            self.cap = None
             return
         
-        # Generic handling for other sources
+        # Generic handling
         self.reconnect_attempts += 1
         
         if self.reconnect_attempts >= self.max_reconnect_attempts:
-            logging.error(f"Max reconnect attempts reached for {self.source}")
+            logging.error(f"Max reconnect attempts reached")
             self.is_running = False
             return
         
-        # Exponential backoff
         base_delay = 1.0 if self.is_file_source else 2.0
         max_delay = 5.0 if self.is_file_source else 30.0
         
@@ -567,20 +515,23 @@ class SharedVideoStream:
         total_delay = delay + jitter
         
         logging.warning(
-            f"Read failure, will retry in {total_delay:.1f}s "
+            f"Read failure, retry in {total_delay:.1f}s "
             f"(attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})"
         )
         
         time.sleep(total_delay)
+        
+        # Force re-open
         self.cap = None
     
     def _open_video_source(self) -> bool:
         """
-        Open video source with improved error handling.
+        Open video source with safe cleanup.
+        FIXED: Use safe release method, proper None checks.
         SYNCHRONOUS version for use in blocking context.
         """
         try:
-            # Clean up existing capture
+            # CRITICAL: Safe cleanup of existing capture
             if self.cap is not None:
                 try:
                     if self.cap.isOpened():
@@ -589,7 +540,7 @@ class SharedVideoStream:
                     pass
                 self.cap = None
             
-            # Small delay
+            # Small delay before reopening
             time.sleep(0.2)
             
             # Validate file source
@@ -597,18 +548,10 @@ class SharedVideoStream:
                 if not self._validate_file_source(self.source):
                     return False
             
-            # ✅ RTSP opening with enhanced settings
+            # RTSP opening
             if self.is_rtsp_source:
-                # ✅ FIX #12: Rate limit reconnection attempts
-                current_time = time.time()
-                if current_time - self.last_reconnect_time < self.min_reconnect_interval:
-                    wait_time = self.min_reconnect_interval - (current_time - self.last_reconnect_time)
-                    logging.info(f"Rate limiting: waiting {wait_time:.1f}s before reconnect")
-                    time.sleep(wait_time)
-                
-                self.last_reconnect_time = time.time()
-                
                 logging.info(f"Opening RTSP stream: {self.source}")
+                
                 self._configure_rtsp_environment()
                 
                 try:
@@ -632,25 +575,20 @@ class SharedVideoStream:
                 try:
                     self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.rtsp_timeout * 1000)
                     self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.rtsp_timeout * 1000)
-                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except Exception as e:
                     logging.warning(f"Could not set RTSP properties: {e}")
                 
-                # ✅ FIX #13: Multiple test reads to ensure stability
-                test_success = False
-                for attempt in range(3):
-                    try:
-                        ret, test_frame = self.cap.read()
-                        if ret and test_frame is not None and test_frame.size > 0:
-                            test_success = True
-                            break
-                        time.sleep(0.5)
-                    except Exception as e:
-                        logging.warning(f"Test read attempt {attempt + 1} failed: {e}")
-                        time.sleep(0.5)
+                # Test read
+                try:
+                    ret, test_frame = self.cap.read()
+                except Exception as e:
+                    logging.error(f"Test read failed: {e}")
+                    ret = False
+                    test_frame = None
                 
-                if not test_success:
-                    logging.error(f"RTSP opened but cannot read frames after 3 attempts")
+                if not ret or test_frame is None:
+                    logging.error(f"RTSP opened but cannot read frames")
                     try:
                         self.cap.release()
                     except:
@@ -663,10 +601,6 @@ class SharedVideoStream:
                 fps = self.cap.get(cv2.CAP_PROP_FPS)
                 
                 logging.info(f"✓ RTSP connected: {width}x{height} @ {fps}fps")
-                
-                # Reset connection tracking
-                self.connection_stable_time = time.time()
-                
                 return True
             
             # File opening
