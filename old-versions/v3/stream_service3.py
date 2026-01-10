@@ -628,6 +628,219 @@ class StreamManager:
 
     # ==================== Stream Lifecycle ====================
 
+    # async def start_stream_background(
+    #     self,
+    #     stream_id: UUID,
+    #     owner_id: UUID,
+    #     owner_username: str,
+    #     camera_name: str,
+    #     source: str,
+    #     workspace_id: UUID,
+    #     location_info: Optional[Dict[str, Any]] = None
+    # ):
+    #     """
+    #     🎬 Start stream with health verification.
+        
+    #     IMPORTANT: Assumes distributed manager has already:
+    #     1. Claimed the camera (locked_by_server set)
+    #     2. Verified is_streaming=TRUE
+    #     3. Verified no user stop
+    #     """
+    #     stream_id_str = str(stream_id)
+    #     workspace_id_str = str(workspace_id)
+
+    #     logger.info(f"🎬 START: stream={stream_id_str}, camera={camera_name}")
+        
+    #     # Validate workspace limits
+    #     try:
+    #         can_start, reason = await self.can_start_stream_in_workspace(workspace_id, owner_id)
+    #         if not can_start:
+    #             logger.warning(f"Cannot start {stream_id_str}: {reason}")
+    #             raise WorkspaceQuotaExceeded(reason)
+    #     except Exception as e:
+    #         logger.error(f"Validation error: {e}", exc_info=True)
+    #         raise
+        
+    #     async with self._safe_stream_operation(stream_id_str, "start"):
+    #         async with self._lock:
+    #             # Check if already healthy
+    #             if stream_id_str in self.active_streams:
+    #                 stream_info = self.active_streams[stream_id_str]
+    #                 task = stream_info.get('task')
+    #                 latest_frame = stream_info.get('latest_frame')
+    #                 last_frame_time = stream_info.get('last_frame_time')
+                    
+    #                 is_healthy = False
+    #                 if last_frame_time:
+    #                     age = (datetime.now(ZoneInfo("Africa/Cairo")) - last_frame_time).total_seconds()
+    #                     is_healthy = age < 30 and latest_frame is not None
+                    
+    #                 task_alive = task and not task.done()
+    #                 current_state = self.stream_states.get(stream_id_str)
+                    
+    #                 if current_state == StreamState.ACTIVE and is_healthy and task_alive:
+    #                     logger.info(f"✅ {stream_id_str} already healthy")
+    #                     return
+    #                 else:
+    #                     logger.warning(f"🔧 {stream_id_str} unhealthy, restarting")
+    #                     await self._stop_stream(stream_id_str, for_restart=True)
+    #                     await asyncio.sleep(1.0)
+                
+    #             # Transition to STARTING
+    #             await self._transition_stream_state(stream_id_str, StreamState.STARTING)
+                
+    #             # Register in workspace
+    #             self.workspace_streams[workspace_id_str].add(stream_id_str)
+    #             self.stream_workspaces[stream_id_str] = workspace_id_str
+                
+    #             # Initialize stream entry
+    #             self.active_streams[stream_id_str] = {
+    #                 'status': 'starting',
+    #                 'task': None,
+    #                 'start_time': datetime.now(ZoneInfo("Africa/Cairo")),
+    #                 'location_info': location_info or {},
+    #                 'workspace_id': workspace_id,
+    #                 'source': source,
+    #                 'camera_name': camera_name,
+    #                 'username': owner_username,
+    #                 'user_id': owner_id,
+    #                 'clients': set(),
+    #                 'latest_frame': None,
+    #                 'last_frame_time': None,
+    #                 'last_heartbeat': datetime.now(ZoneInfo("Africa/Cairo"))
+    #             }
+                
+    #             # Initialize fire detection
+    #             self.fire_detection_states[stream_id_str] = {
+    #                 'status': 'no detection',
+    #                 'last_detection_time': None,
+    #                 'last_notification_time': None
+    #             }
+    #             self.fire_detection_frame_counts[stream_id_str] = 0
+
+    #         try:
+    #             # Update database
+    #             server_id = config.server_id
+        
+    #             claim_query = """
+    #                 UPDATE video_stream
+    #                 SET 
+    #                     locked_by_server = $1,
+    #                     server_heartbeat = NOW(),
+    #                     is_streaming = TRUE,
+    #                     status = 'processing',
+    #                     stop_reason = NULL,
+    #                     stopped_at = NULL,
+    #                     stopped_by = NULL,
+    #                     retry_count = 0,
+    #                     last_retry_at = NULL,
+    #                     next_retry_at = NULL,
+    #                     auto_retry_enabled = TRUE,
+    #                     updated_at = NOW(),
+    #                     last_activity = NOW()
+    #                 WHERE stream_id = $2
+    #                 AND (locked_by_server IS NULL OR locked_by_server = $1)
+    #                 RETURNING locked_by_server
+    #             """
+                
+    #             result = await self.db_manager.execute_query(
+    #                 claim_query, 
+    #                 (server_id, stream_id),
+    #                 fetch_one=True
+    #             )
+                
+    #             if not result:
+    #                 logger.error(f"❌ Failed to claim lock for {stream_id_str}")
+    #                 raise RuntimeError("Another server owns this camera")
+                
+    #             logger.info(f"🔒 Claimed lock for {stream_id_str} (server: {server_id})")
+                
+    #             # Initialize stats
+    #             self.stream_processing_stats[stream_id_str] = {
+    #                 "frames_processed": 0,
+    #                 "detection_count": 0,
+    #                 "avg_processing_time": 0.0,
+    #                 "last_updated": datetime.now(ZoneInfo("Africa/Cairo")),
+    #                 "errors": 0
+    #             }
+
+    #             # Ensure Qdrant collection
+    #             if self.qdrant_service:
+    #                 await self.qdrant_service.ensure_workspace_collection(workspace_id)
+
+    #             # Create processing task
+    #             stop_event = asyncio.Event()
+                
+    #             task = asyncio.create_task(
+    #                 self.processing_service.process_stream_with_sharing(
+    #                     stream_id=stream_id,
+    #                     camera_name=camera_name,
+    #                     source=source,
+    #                     owner_username=owner_username,
+    #                     owner_id=owner_id,
+    #                     workspace_id=workspace_id,
+    #                     stop_event=stop_event,
+    #                     location_info=location_info
+    #                 )
+    #             )
+    #             task.set_name(f"process_stream_{stream_id_str}")
+    #             task.add_done_callback(
+    #                 lambda t: asyncio.create_task(
+    #                     self._handle_stream_task_completion(stream_id_str, t)
+    #                 )
+    #             )
+
+    #             # Update stream info
+    #             async with self._lock:
+    #                 self.active_streams[stream_id_str].update({
+    #                     'stop_event': stop_event,
+    #                     'task': task,
+    #                     'status': 'active_pending'
+    #                 })
+                
+    #             # Register with shared stream manager
+    #             self._shared_stream_registry[source].add(stream_id_str)
+                
+    #             # Transition to ACTIVE
+    #             await self._transition_stream_state(stream_id_str, StreamState.ACTIVE)
+
+    #             # Notify workspace
+    #             await self._notify_workspace_stream_started(workspace_id, camera_name, owner_username)
+                
+    #             # Update metrics
+    #             self.metrics['total_streams_started'] += 1
+                
+    #             logger.info(f"✅ {stream_id_str} started successfully")
+
+    #         except Exception as e:
+    #             logger.error(f"Failed to start {stream_id_str}: {e}", exc_info=True)
+                
+    #             # Cleanup on failure
+    #             async with self._lock:
+    #                 self.active_streams.pop(stream_id_str, None)
+    #                 self.workspace_streams[workspace_id_str].discard(stream_id_str)
+    #                 self.stream_workspaces.pop(stream_id_str, None)
+                
+    #             self.stream_processing_stats.pop(stream_id_str, None)
+    #             self._shared_stream_registry[source].discard(stream_id_str)
+                
+    #             await self._transition_stream_state(stream_id_str, StreamState.ERROR, force=True)
+                
+    #             # # Update database to error state (keep is_streaming=TRUE for retry)
+    #             # await self.video_stream_service.update_stream_status(
+    #             #     stream_id, 'error', is_streaming=True
+    #             # )
+                        
+    #             # Release lock on failure
+    #             release_query = """
+    #                 UPDATE video_stream
+    #                 SET locked_by_server = NULL, server_heartbeat = NULL
+    #                 WHERE stream_id = $1 AND locked_by_server = $2
+    #             """
+    #             await self.db_manager.execute_query(release_query, (stream_id, server_id))
+
+    #             raise
+
     async def start_stream_background(
         self,
         stream_id: UUID,

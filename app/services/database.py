@@ -64,12 +64,12 @@ async def init_db_pool(
         POSTGRES_PASSWORD = config.postgres_password
         
         # Optimized pool settings for remote database
-        min_size = min_connections or int(os.environ.get('DB_MIN_POOL_SIZE', '50'))
-        max_size = max_connections or int(os.environ.get('DB_MAX_POOL_SIZE', '200'))
+        min_size = config.db_min_pool_size
+        max_size = config.db_max_pool_size
         
         # Connection timeout settings
-        timeout = float(os.environ.get('DB_TIMEOUT', '10.0'))
-        command_timeout = float(os.environ.get('DB_COMMAND_TIMEOUT', '30.0'))
+        timeout = config.db_timeout
+        command_timeout = config.db_command_timeout
 
         logger.info(f"Attempting to connect to PostgreSQL at {DB_HOST}:{DB_PORT}/{POSTGRES_DB}")
         logger.info(f"Pool configuration: min={min_size}, max={max_size}, timeout={timeout}s")

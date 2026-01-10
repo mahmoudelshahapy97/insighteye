@@ -981,6 +981,391 @@ class StreamProcessingService:
         except Exception as e:
             logger.error(f"Error handling Fire/smoke detection alert: {e}", exc_info=True)
 
+    # async def process_stream_with_sharing(
+    #     self,
+    #     stream_id: UUID,
+    #     camera_name: str,
+    #     source: str,
+    #     owner_username: str,
+    #     owner_id: UUID,
+    #     workspace_id: UUID,
+    #     stop_event: asyncio.Event,
+    #     location_info: Optional[Dict[str, Any]] = None
+    # ):
+    #     """Main stream processing loop."""
+    #     frame_count = 0
+    #     frames_since_last_save = 0
+    #     last_db_update_activity = datetime.now(ZoneInfo("Africa/Cairo"))
+    #     last_heartbeat = datetime.now(ZoneInfo("Africa/Cairo"))
+    #     stream_id_str = str(stream_id)
+    #     loop = asyncio.get_event_loop()
+    #     shared_stream = None
+    #     first_frame_received = False
+    #     consecutive_failures = 0
+    #     max_consecutive_failures = 30
+        
+    #     # Initialize fire detection state
+    #     if self.stream_manager:
+    #         self.stream_manager.fire_detection_states[stream_id_str] = {
+    #             'status': 'no detection',
+    #             'last_detection_time': None,
+    #             'last_notification_time': None
+    #         }
+    #         self.stream_manager.fire_detection_frame_counts[stream_id_str] = 0
+            
+    #     logger.info(f"Starting stream processing for {stream_id_str} ({camera_name})")
+        
+    #     try:
+    #         # Get threshold settings
+    #         threshold_settings = await self._get_camera_threshold_settings(stream_id)
+            
+    #         # Validate source
+    #         if not source.startswith('rtsp://'):
+    #             if not await self._validate_stream_source(source):
+    #                 logger.error(f"Invalid or inaccessible video source: {source}")
+    #                 # DON'T update database here - let caller handle it
+    #                 raise RuntimeError(f"Invalid or inaccessible video source: {source}")
+    #         else:
+    #             logger.info(f"Skipping pre-validation for RTSP stream {stream_id_str}")
+
+    #         # Get stream parameters
+    #         from app.services.parameter_service import parameter_service
+    #         params = await parameter_service.get_workspace_params(workspace_id)
+    #         frame_skip = params.get("frame_skip", 300)
+    #         frame_delay_target = params.get("frame_delay", 0.033)
+    #         conf_threshold = params.get("conf", 0.5)
+            
+    #         logger.info(f"Stream {stream_id_str} parameters: frame_skip={frame_skip}, "
+    #                 f"frame_delay={frame_delay_target}, conf={conf_threshold}")
+            
+    #         # Get or create shared stream
+    #         shared_stream = await self.video_file_manager.get_shared_stream(source)
+            
+    #         # Add this stream as a subscriber
+    #         if not await shared_stream.add_subscriber(stream_id_str):
+    #             logger.error(f"Failed to add subscriber {stream_id_str} to shared stream")
+    #             # DON'T update database here - let caller handle it
+    #             raise RuntimeError(f"Failed to subscribe to shared stream for {source}")
+            
+    #         logger.info(f"Stream {stream_id_str} subscribed to shared stream for {source}")
+            
+    #         # Main processing loop
+    #         while not stop_event.is_set():
+    #             try:
+    #                 current_time = datetime.now(ZoneInfo("Africa/Cairo"))
+    #                 if (current_time - last_heartbeat).total_seconds() >= 10:
+    #                     if self.stream_manager:
+    #                         async with self.stream_manager._lock:
+    #                             if stream_id_str in self.stream_manager.active_streams:
+    #                                 self.stream_manager.active_streams[stream_id_str]['last_heartbeat'] = current_time
+    #                     last_heartbeat = current_time
+                    
+    #                 # Wait for frame
+    #                 if not await shared_stream.wait_for_frame(timeout=10.0):
+    #                     consecutive_failures += 1
+                        
+    #                     if consecutive_failures % 3 == 0:
+    #                         logger.debug(f"Stream {stream_id_str} waiting for frames... ({consecutive_failures} attempts)")
+                        
+    #                     if consecutive_failures > max_consecutive_failures:
+    #                         logger.error(f"Too many consecutive frame wait timeouts for {stream_id_str}")
+    #                         # DON'T set status='error' with is_streaming=False
+    #                         # Just break and let finally block handle cleanup
+    #                         break
+    #                     await asyncio.sleep(0.1)
+    #                     continue
+                    
+    #                 # Get frame
+    #                 frame = await shared_stream.get_latest_frame(stream_id_str)
+                    
+    #                 if frame is None or frame.size == 0:
+    #                     consecutive_failures += 1
+    #                     if consecutive_failures > max_consecutive_failures:
+    #                         logger.error(f"Too many consecutive empty frames for {stream_id_str}")
+    #                         # DON'T set status='error' with is_streaming=False
+    #                         break
+    #                     await asyncio.sleep(0.1)
+    #                     continue
+                    
+    #                 # Reset failure counter
+    #                 consecutive_failures = 0
+                    
+    #                 # Mark as active after first frame
+    #                 if not first_frame_received:
+    #                     first_frame_received = True
+    #                     await self.update_stream_to_active(stream_id_str)
+    #                     logger.info(f"First frame received for stream {stream_id_str}")
+                    
+    #                 frame_count += 1
+    #                 frames_since_last_save += 1
+
+    #                 # Process frame
+    #                 annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status = \
+    #                     await loop.run_in_executor(
+    #                         thread_pool,
+    #                         self.detect_objects_with_threshold,
+    #                         frame,
+    #                         conf_threshold,
+    #                         threshold_settings,
+    #                         stream_id_str
+    #                     )
+                    
+    #                 # Update stream manager
+    #                 if self.stream_manager:
+    #                     current_time_utc = datetime.now(ZoneInfo("Africa/Cairo"))
+    #                     async with self.stream_manager._lock:
+    #                         if stream_id_str in self.stream_manager.active_streams:
+    #                             self.stream_manager.active_streams[stream_id_str]['latest_frame'] = annotated_frame
+    #                             self.stream_manager.active_streams[stream_id_str]['last_frame_time'] = current_time_utc
+    #                             self.stream_manager.active_streams[stream_id_str]['last_heartbeat'] = current_time_utc
+    #                             self.stream_manager.active_streams[stream_id_str]['person_count'] = person_count
+    #                             self.stream_manager.active_streams[stream_id_str]['male_count'] = male_count
+    #                             self.stream_manager.active_streams[stream_id_str]['female_count'] = female_count
+    #                             self.stream_manager.active_streams[stream_id_str]['fire_status'] = fire_status
+
+    #                     if stream_id_str in self.stream_manager.fire_detection_states:
+    #                         fire_state = self.stream_manager.fire_detection_states[stream_id_str]
+    #                         fire_state['status'] = fire_status
+    #                         if fire_status != 'no detection':
+    #                             fire_state['last_detection_time'] = current_time_utc
+                    
+    #                 # Update stats
+    #                 if stream_id_str in self.stream_manager.stream_processing_stats:
+    #                     self.stream_manager.stream_processing_stats[stream_id_str]['frames_processed'] += 1
+    #                     self.stream_manager.stream_processing_stats[stream_id_str]['last_updated'] = datetime.now(ZoneInfo("Africa/Cairo"))
+                    
+    #                 # Save to Qdrant
+    #                 should_save_to_qdrant = False
+    #                 if frames_since_last_save >= frame_skip:
+    #                     should_save_to_qdrant = True
+    #                 elif person_count > 0 and frame_skip > 100 and frames_since_last_save >= 30:
+    #                     should_save_to_qdrant = True
+                    
+    #                 if should_save_to_qdrant:
+    #                     save_success = await self._save_detection(
+    #                         stream_id_str=stream_id_str,
+    #                         camera_name=camera_name,
+    #                         owner_username=owner_username,
+    #                         person_count=person_count,
+    #                         male_count=male_count,
+    #                         female_count=female_count,
+    #                         fire_status=fire_status,
+    #                         frame=annotated_frame,
+    #                         workspace_id=workspace_id,
+    #                         location_info=location_info
+    #                     )
+                        
+    #                     if save_success:
+    #                         frames_since_last_save = 0
+    #                         if self.stream_manager and stream_id_str in self.stream_manager.stream_processing_stats:
+    #                             self.stream_manager.stream_processing_stats[stream_id_str]['detection_count'] = \
+    #                                 self.stream_manager.stream_processing_stats[stream_id_str].get('detection_count', 0) + 1
+                    
+    #                 # ==================== CRITICAL: Check Alerts on EVERY Frame ====================
+    #                 # 1. People Count Alert - Check on EVERY frame if threshold is set
+    #                 if alert_triggered and threshold_settings.get("alert_enabled"):
+    #                     await self._handle_people_count_alert(
+    #                         stream_id, stream_id_str, person_count,
+    #                         threshold_settings, camera_name, workspace_id, owner_id
+    #                     )
+
+    #                 # 2. Fire Detection Alert
+    #                 if fire_status != "no detection":
+    #                     await self._handle_fire_detection_alert(
+    #                         stream_id, stream_id_str, fire_status,
+    #                         camera_name, workspace_id, owner_id
+    #                     )
+                    
+    #                 # Periodic database updates - CRITICAL: Keep is_streaming=True
+    #                 current_time = datetime.now(ZoneInfo("Africa/Cairo"))
+    #                 if (current_time - last_db_update_activity).total_seconds() >= 30:
+                        
+    #                     # # 🔥 CRITICAL FIX: Check if we're being stopped BEFORE updating database
+    #                     # if stop_event.is_set():
+    #                     #     logger.debug(f"Skipping periodic DB update for {stream_id_str} - stop signal received")
+    #                     #     break  # Exit the loop instead of updating
+                                                
+    #                     logger.debug(f"📊 Periodic update: {stream_id_str} -> status=active, is_streaming=TRUE")
+    #                     try:
+    #                         # await video_stream_service.update_stream_status(
+    #                         #     stream_id, "active", is_streaming=True, last_activity=current_time  
+    #                         # )
+    #                         if self.stream_manager:
+    #                             await self.stream_manager.status_batcher.queue_update(
+    #                                 stream_id, "active", True
+    #                             )
+
+    #                     except Exception as e:
+    #                         logger.error(f"Error in periodic DB update for {stream_id_str}: {e}")
+    #                         # DON'T break - continue processing even if DB update fails
+                    
+    #                 # Frame delay
+    #                 if frame_delay_target > 0:
+    #                     await asyncio.sleep(frame_delay_target)
+    #                 else:
+    #                     await asyncio.sleep(0.01)
+                        
+    #             except asyncio.CancelledError:
+    #                 logger.info(f"Stream processing cancelled for {stream_id_str}")
+    #                 break
+    #             except Exception as e:
+    #                 logger.error(f"Error in processing loop for {stream_id_str}: {e}", exc_info=True)
+    #                 consecutive_failures += 1
+    #                 if consecutive_failures > max_consecutive_failures:
+    #                     logger.error(f"Too many consecutive errors for {stream_id_str}")
+    #                     break
+    #                 await asyncio.sleep(1)
+            
+    #     except ConnectionError as e:
+    #         logger.error(f"Connection error for {stream_id_str}: {e}")
+    #         stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
+    #         current_retry_count = stream_info.get('retry_count', 0) if stream_info else 0
+    #         await self.retry_service.schedule_retry(
+    #             stream_id=stream_id,
+    #             stop_reason='connection_error',
+    #             current_retry_count=current_retry_count,
+    #             error_context=str(e)
+    #         )
+    #         raise
+            
+    #     except TimeoutError as e:
+    #         logger.error(f"Timeout error for {stream_id_str}: {e}")
+    #         stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
+    #         current_retry_count = stream_info.get('retry_count', 0) if stream_info else 0
+    #         await self.retry_service.schedule_retry(
+    #             stream_id=stream_id,
+    #             stop_reason='timeout',
+    #             current_retry_count=current_retry_count,
+    #             error_context=str(e)
+    #         )
+    #         raise
+            
+    #     except Exception as e:
+    #         logger.error(f"System error for {stream_id_str}: {e}", exc_info=True)
+    #         stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
+    #         current_retry_count = stream_info.get('retry_count', 0) if stream_info else 0
+    #         await self.retry_service.schedule_retry(
+    #             stream_id=stream_id,
+    #             stop_reason='system_error',
+    #             current_retry_count=current_retry_count,
+    #             error_context=str(e)
+    #         )
+    #         raise
+
+    #     finally:
+    #         # Cleanup
+    #         logger.info(f"Cleaning up stream {stream_id_str}. Total frames: {frame_count}")
+            
+    #         if shared_stream:
+    #             await shared_stream.remove_subscriber(stream_id_str)
+    #             logger.info(f"Removed subscriber {stream_id_str} from shared stream")
+            
+    #         # Clear cache
+    #         cache_key = f"cache_{stream_id_str}"
+    #         if cache_key in self._cached_results:
+    #             del self._cached_results[cache_key]
+
+    #         # Clean up orphaned cache entries
+    #         if self.stream_manager:
+    #             for cache_id in list(self._cached_results.keys()):
+    #                 if cache_id.startswith("cache_"):
+    #                     sid = cache_id.replace("cache_", "")
+    #                     if sid not in self.stream_manager.active_streams:
+    #                         del self._cached_results[cache_id]
+            
+    #         # Keep fire detection state briefly
+    #         if self.stream_manager and stream_id_str in self.stream_manager.fire_detection_states:
+    #             self.stream_manager.fire_detection_states[stream_id_str]['status'] = 'no detection'
+    #             self.stream_manager.fire_detection_states[stream_id_str]['last_detection_time'] = datetime.now(ZoneInfo("Africa/Cairo"))
+
+    #         # ✅ CRITICAL: Check database state before doing anything
+    #         try:
+    #             db_check = await video_stream_service.db_manager.execute_query(
+    #                 "SELECT stop_reason, is_streaming, status FROM video_stream WHERE stream_id = $1",
+    #                 (stream_id,),
+    #                 fetch_one=True
+    #             )
+                
+    #             if not db_check:
+    #                 logger.error(f"Stream {stream_id_str} not found in database during cleanup")
+    #                 return
+                
+    #             # ✅ CRITICAL FIX: If user stopped it, don't touch the database AT ALL!
+    #             if db_check['stop_reason'] == 'user_action':
+    #                 logger.info(
+    #                     f"✅ Stream {stream_id_str} was user-stopped "
+    #                     f"Skipping ALL database operations in finally block."
+    #                 )
+    #                 return
+                
+    #             # If database says is_streaming=FALSE and it's not user_action,
+    #             # still don't touch it (might be workspace disabled, etc)
+    #             if db_check['is_streaming'] == False:
+    #                 logger.info(
+    #                     f"✅ Stream {stream_id_str} already marked is_streaming=FALSE in database "
+    #                     f"Skipping database update."
+    #                 )
+    #                 return
+
+    #             # ✅ NEW: Check if exception was raised (system error)
+    #             exc_info = sys.exc_info()
+    #             had_exception = exc_info[0] is not None
+                
+    #             if had_exception:
+    #                 # Exception was raised - this is a system error
+    #                 exception_type = exc_info[0].__name__
+    #                 logger.warning(
+    #                     f"⚠️ Stream {stream_id_str} ended with exception: {exception_type}. "
+    #                     f"Database should already be updated by exception handler."
+    #                 )
+    #                 # Don't update database here - exception handler already did it
+    #                 return
+                
+    #             # ✅ No exception, check if stop was graceful
+    #             if stop_event.is_set():
+    #                 # Graceful stop via API
+    #                 current_db_state = await video_stream_service.db_manager.execute_query(
+    #                     "SELECT stop_reason, is_streaming FROM video_stream WHERE stream_id = $1",
+    #                     (stream_id,),
+    #                     fetch_one=True
+    #                 )
+                    
+    #                 if current_db_state and current_db_state['stop_reason'] == 'user_action':
+    #                     logger.info(
+    #                         f"✅ Stop event set AND database shows user_action. "
+    #                         f"API already handled database update. Skipping."
+    #                     )
+    #                     return
+    #                 else:
+    #                     # Stop event set but no user_action - unusual, treat as system error
+    #                     logger.warning(
+    #                         f"⚠️ Stop event set but stop_reason is not user_action. "
+    #                         f"Recording as system_error to allow retry."
+    #                     )
+    #                     await video_stream_service.record_camera_stop(
+    #                         stream_id=stream_id,
+    #                         stop_reason='system_error',
+    #                         stopped_by=None,
+    #                         additional_context="Stream stopped cleanly but not by user"
+    #                     )
+    #             else:
+    #                 # No exception, no stop event - unexpected termination
+    #                 logger.error(
+    #                     f"❌ Stream {stream_id_str} ended without exception or stop signal. "
+    #                     f"This is unexpected. Recording as system_error."
+    #                 )
+    #                 await video_stream_service.record_camera_stop(
+    #                     stream_id=stream_id,
+    #                     stop_reason='system_error',
+    #                     stopped_by=None,
+    #                     additional_context="Stream ended unexpectedly without signal"
+    #                 )
+                    
+    #         except Exception as e:
+    #             logger.error(f"Error in finally block for {stream_id_str}: {e}", exc_info=True)
+            
+    #         logger.info(f"Stream processing completed for {stream_id_str}")
+
     async def process_stream_with_sharing(
         self,
         stream_id: UUID,

@@ -9,7 +9,7 @@ import asyncio
 from uuid import UUID
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
-from typing import Dict, Optional, List
+from typing import Dict, Any, Optional, List
 import concurrent.futures
 import os
 import cv2
@@ -2296,4 +2296,517 @@ async def clear_stuck_cameras_endpoint(
         "success": True,
         "cameras_cleared": cleared_count,
         "message": f"Cleared {cleared_count} stuck cameras"
+    }
+
+@router.get("/stream/{stream_id}/lock-status")
+async def get_stream_lock_status(
+    stream_id: UUID,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+) -> Dict[str, Any]:
+    """
+    🔍 Diagnostic endpoint to check camera lock and heartbeat status.
+    
+    Returns detailed information about:
+    - Current lock holder (server_id)
+    - Heartbeat age
+    - Memory state
+    - Streaming state
+    """
+    from app.services.database import db_manager
+    from app.services.stream_service import stream_manager
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from app.config.settings import config
+    
+    stream_id_str = str(stream_id)
+    current_server = config.server_id
+    
+    # ==================== DATABASE STATE ====================
+    db_query = """
+        SELECT 
+            stream_id,
+            name,
+            locked_by_server,
+            server_heartbeat,
+            AGE(NOW(), server_heartbeat) as heartbeat_age,
+            is_streaming,
+            status,
+            stop_reason,
+            auto_retry_enabled,
+            retry_count,
+            last_activity,
+            AGE(NOW(), last_activity) as activity_age,
+            updated_at,
+            AGE(NOW(), updated_at) as update_age
+        FROM video_stream
+        WHERE stream_id = $1
+    """
+    
+    db_state = await db_manager.execute_query(
+        db_query, 
+        (stream_id,), 
+        fetch_one=True
+    )
+    
+    if not db_state:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    # ==================== MEMORY STATE ====================
+    memory_state = None
+    if stream_id_str in stream_manager.active_streams:
+        stream_info = stream_manager.active_streams[stream_id_str]
+        
+        task = stream_info.get('task')
+        task_status = None
+        if task:
+            if task.done():
+                try:
+                    exc = task.exception()
+                    task_status = f"failed: {exc}" if exc else "completed"
+                except:
+                    task_status = "cancelled"
+            else:
+                task_status = "running"
+        
+        last_frame_time = stream_info.get('last_frame_time')
+        frame_age = None
+        if last_frame_time:
+            frame_age = (datetime.now(ZoneInfo("Africa/Cairo")) - last_frame_time).total_seconds()
+        
+        memory_state = {
+            "exists": True,
+            "status": stream_info.get('status'),
+            "task_status": task_status,
+            "has_frame": stream_info.get('latest_frame') is not None,
+            "last_frame_age_seconds": frame_age,
+            "client_count": len(stream_info.get('clients', set())),
+            "start_time": stream_info.get('start_time').isoformat() if stream_info.get('start_time') else None
+        }
+    else:
+        memory_state = {
+            "exists": False,
+            "reason": "not_in_active_streams"
+        }
+    
+    # ==================== ANALYSIS ====================
+    issues = []
+    recommendations = []
+    
+    # Issue 1: Not locked
+    if db_state['locked_by_server'] is None:
+        issues.append({
+            "severity": "critical",
+            "issue": "NO_SERVER_LOCK",
+            "description": "Camera is not locked by any server"
+        })
+        recommendations.append("Stop and restart the camera to claim the lock")
+    
+    # Issue 2: Locked by wrong server
+    elif str(db_state['locked_by_server']) != str(current_server):
+        issues.append({
+            "severity": "warning",
+            "issue": "DIFFERENT_SERVER",
+            "description": f"Camera locked by different server: {db_state['locked_by_server']}"
+        })
+    
+    # Issue 3: Stale heartbeat
+    if db_state['server_heartbeat']:
+        heartbeat_seconds = (
+            datetime.now(timezone.utc) - 
+            db_state['server_heartbeat'].replace(tzinfo=timezone.utc)
+        ).total_seconds()
+        
+        if heartbeat_seconds > 120:  # 2 minutes
+            issues.append({
+                "severity": "critical",
+                "issue": "STALE_HEARTBEAT",
+                "description": f"Heartbeat is {heartbeat_seconds:.0f} seconds old"
+            })
+            recommendations.append("Server may have crashed - restart or release lock")
+    
+    # Issue 4: In memory but not locked
+    if memory_state["exists"] and db_state['locked_by_server'] is None:
+        issues.append({
+            "severity": "critical",
+            "issue": "MEMORY_DB_MISMATCH",
+            "description": "Camera in memory but not locked in database"
+        })
+        recommendations.append("This is a critical bug - stop camera immediately")
+    
+    # Issue 5: Locked but not in memory
+    if not memory_state["exists"] and db_state['locked_by_server'] == current_server:
+        issues.append({
+            "severity": "warning",
+            "issue": "LOCKED_NOT_IN_MEMORY",
+            "description": "Camera locked by this server but not in memory"
+        })
+        recommendations.append("Camera may have crashed - will auto-restart in 30s")
+    
+    # Issue 6: No frames
+    if memory_state["exists"] and memory_state["last_frame_age_seconds"]:
+        if memory_state["last_frame_age_seconds"] > 60:
+            issues.append({
+                "severity": "warning",
+                "issue": "NO_FRAMES",
+                "description": f"No frames for {memory_state['last_frame_age_seconds']:.0f} seconds"
+            })
+            recommendations.append("Camera may be frozen - check video source")
+    
+    # Health status
+    health_status = "healthy"
+    if any(i["severity"] == "critical" for i in issues):
+        health_status = "critical"
+    elif issues:
+        health_status = "degraded"
+    
+    return {
+        "stream_id": str(stream_id),
+        "camera_name": db_state['name'],
+        "current_server": str(current_server),
+        "health_status": health_status,
+        "database": {
+            "locked_by_server": str(db_state['locked_by_server']) if db_state['locked_by_server'] else None,
+            "server_heartbeat": db_state['server_heartbeat'].isoformat() if db_state['server_heartbeat'] else None,
+            "heartbeat_age": str(db_state['heartbeat_age']) if db_state['heartbeat_age'] else None,
+            "is_streaming": db_state['is_streaming'],
+            "status": db_state['status'],
+            "stop_reason": db_state['stop_reason'],
+            "auto_retry_enabled": db_state['auto_retry_enabled'],
+            "retry_count": db_state['retry_count'],
+            "last_activity": db_state['last_activity'].isoformat() if db_state['last_activity'] else None,
+            "activity_age": str(db_state['activity_age']) if db_state['activity_age'] else None
+        },
+        "memory": memory_state,
+        "issues": issues,
+        "recommendations": recommendations,
+        "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
+    }
+
+
+@router.post("/stream/{stream_id}/force-lock")
+async def force_lock_stream(
+    stream_id: UUID,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+) -> Dict[str, Any]:
+    """
+    🔒 Force lock a camera to this server (admin only).
+    
+    WARNING: Use with caution! This can cause conflicts if another server is actually running it.
+    """
+    from app.services.database import db_manager
+    from app.config.settings import config
+    
+    # Check if user is admin
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    server_id = config.server_id
+    
+    force_lock_query = """
+        UPDATE video_stream
+        SET 
+            locked_by_server = $1,
+            server_heartbeat = NOW(),
+            status = 'processing',
+            updated_at = NOW()
+        WHERE stream_id = $2
+        RETURNING 
+            stream_id, 
+            name, 
+            locked_by_server, 
+            server_heartbeat
+    """
+    
+    result = await db_manager.execute_query(
+        force_lock_query,
+        (server_id, stream_id),
+        fetch_one=True
+    )
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    return {
+        "success": True,
+        "message": f"Forcefully locked camera to server {server_id}",
+        "stream_id": str(result['stream_id']),
+        "camera_name": result['name'],
+        "locked_by_server": str(result['locked_by_server']),
+        "server_heartbeat": result['server_heartbeat'].isoformat()
+    }
+
+
+@router.post("/stream/{stream_id}/release-lock")
+async def release_lock_stream(
+    stream_id: UUID,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+) -> Dict[str, Any]:
+    """
+    🔓 Release server lock (admin only).
+    
+    Use this to clean up stale locks.
+    """
+    from app.services.database import db_manager
+    
+    # Check if user is admin
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    release_query = """
+        UPDATE video_stream
+        SET 
+            locked_by_server = NULL,
+            server_heartbeat = NULL,
+            updated_at = NOW()
+        WHERE stream_id = $1
+        RETURNING 
+            stream_id, 
+            name
+    """
+    
+    result = await db_manager.execute_query(
+        release_query,
+        (stream_id,),
+        fetch_one=True
+    )
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    return {
+        "success": True,
+        "message": f"Released lock for camera {result['name']}",
+        "stream_id": str(result['stream_id']),
+        "camera_name": result['name']
+    }
+
+
+@router.post("/admin/force-claim-cameras")
+async def force_claim_available_cameras(
+    max_cameras: int = 10,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+) -> Dict[str, Any]:
+    """
+    🔒 Force the distributed manager to claim available cameras immediately.
+    
+    This bypasses the 30-second management loop cycle and claims cameras NOW.
+    
+    Admin only.
+    """
+    from app.services.distributed_stream_manager import distributed_stream_manager
+    from app.config.settings import config
+    
+    # Check if user is admin
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    server_id = config.server_id
+    
+    # Get current capacity
+    async with distributed_stream_manager._lock:
+        current_active = len(distributed_stream_manager.active_streams)
+    
+    slots_available = distributed_stream_manager.max_local_capacity - current_active
+    
+    if slots_available <= 0:
+        return {
+            "success": False,
+            "message": f"No capacity available ({current_active}/{distributed_stream_manager.max_local_capacity})",
+            "server_id": str(server_id),
+            "cameras_claimed": 0
+        }
+    
+    # Limit to requested max
+    slots_to_use = min(slots_available, max_cameras)
+    
+    # Claim cameras
+    claimed_cameras = await distributed_stream_manager.claim_available_cameras(slots_to_use)
+    
+    if not claimed_cameras:
+        return {
+            "success": False,
+            "message": "No cameras available to claim (check logs for details)",
+            "server_id": str(server_id),
+            "slots_available": slots_available,
+            "cameras_claimed": 0
+        }
+    
+    # Start claimed cameras
+    start_results = []
+    for camera in claimed_cameras:
+        try:
+            await distributed_stream_manager.start_camera_locally(camera)
+            start_results.append({
+                "stream_id": str(camera['stream_id']),
+                "name": camera['name'],
+                "status": "started"
+            })
+        except Exception as e:
+            start_results.append({
+                "stream_id": str(camera['stream_id']),
+                "name": camera['name'],
+                "status": "failed",
+                "error": str(e)
+            })
+    
+    success_count = sum(1 for r in start_results if r['status'] == 'started')
+    
+    return {
+        "success": True,
+        "message": f"Claimed and started {success_count}/{len(claimed_cameras)} cameras",
+        "server_id": str(server_id),
+        "slots_available": slots_available,
+        "cameras_claimed": len(claimed_cameras),
+        "cameras_started": success_count,
+        "results": start_results
+    }
+
+
+@router.get("/admin/available-cameras")
+async def get_available_cameras(
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+) -> Dict[str, Any]:
+    """
+    📋 List all cameras that SHOULD be running but aren't locked.
+    
+    Admin only - for debugging.
+    """
+    from app.services.database import db_manager
+    from app.config.settings import config
+    
+    # Check if user is admin
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    query = """
+        SELECT 
+            vs.stream_id,
+            vs.name,
+            vs.is_streaming,
+            vs.status,
+            vs.locked_by_server,
+            vs.server_heartbeat,
+            AGE(NOW(), vs.server_heartbeat) as heartbeat_age,
+            vs.stop_reason,
+            vs.auto_retry_enabled,
+            vs.next_retry_at,
+            vs.last_activity,
+            AGE(NOW(), vs.last_activity) as activity_age,
+            u.username,
+            u.is_active as user_active,
+            u.is_subscribed,
+            w.name as workspace_name,
+            w.is_active as workspace_active
+        FROM video_stream vs
+        JOIN users u ON vs.user_id = u.user_id
+        JOIN workspaces w ON vs.workspace_id = w.workspace_id
+        WHERE vs.is_streaming = TRUE
+        ORDER BY 
+            vs.locked_by_server NULLS FIRST,
+            vs.last_activity DESC NULLS LAST
+    """
+    
+    cameras = await db_manager.execute_query(query, fetch_all=True)
+    
+    # Categorize cameras
+    available = []
+    locked = []
+    user_stopped = []
+    not_eligible = []
+    
+    for cam in cameras:
+        cam_info = {
+            "stream_id": str(cam['stream_id']),
+            "name": cam['name'],
+            "status": cam['status'],
+            "locked_by_server": str(cam['locked_by_server']) if cam['locked_by_server'] else None,
+            "heartbeat_age": str(cam['heartbeat_age']) if cam['heartbeat_age'] else None,
+            "stop_reason": cam['stop_reason'],
+            "auto_retry_enabled": cam['auto_retry_enabled'],
+            "workspace": cam['workspace_name'],
+            "owner": cam['username']
+        }
+        
+        # Categorize
+        if cam['stop_reason'] in ('user_action', 'user_stop', 'manual_stop', 'admin_stop'):
+            user_stopped.append(cam_info)
+        elif not cam['user_active'] or not cam['workspace_active'] or (not cam['is_subscribed'] and cam.get('role') != 'admin'):
+            not_eligible.append({
+                **cam_info,
+                "reason": "user/workspace inactive or subscription expired"
+            })
+        elif cam['locked_by_server'] is None:
+            available.append(cam_info)
+        else:
+            locked.append(cam_info)
+    
+    return {
+        "server_id": str(config.server_id),
+        "total_cameras": len(cameras),
+        "summary": {
+            "available": len(available),
+            "locked": len(locked),
+            "user_stopped": len(user_stopped),
+            "not_eligible": len(not_eligible)
+        },
+        "cameras": {
+            "available": available,
+            "locked": locked,
+            "user_stopped": user_stopped,
+            "not_eligible": not_eligible
+        }
+    }
+
+
+@router.post("/admin/release-all-locks")
+async def release_all_locks(
+    confirm: bool = False,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+) -> Dict[str, Any]:
+    """
+    🔓 Release ALL server locks (emergency use only).
+    
+    This will release locks from ALL servers, allowing the next management
+    loop cycle to reclaim cameras.
+    
+    Admin only - requires confirmation.
+    """
+    from app.services.database import db_manager
+    
+    # Check if user is admin
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Must set confirm=true to release all locks"
+        )
+    
+    release_query = """
+        UPDATE video_stream
+        SET 
+            locked_by_server = NULL,
+            server_heartbeat = NULL,
+            status = CASE 
+                WHEN is_streaming = TRUE THEN 'processing'
+                ELSE status
+            END,
+            updated_at = NOW()
+        WHERE locked_by_server IS NOT NULL
+        RETURNING stream_id, name, locked_by_server
+    """
+    
+    released = await db_manager.execute_query(release_query, fetch_all=True)
+    
+    return {
+        "success": True,
+        "message": f"Released {len(released)} locks",
+        "cameras": [
+            {
+                "stream_id": str(cam['stream_id']),
+                "name": cam['name']
+            }
+            for cam in released
+        ]
     }

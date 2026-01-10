@@ -51,6 +51,209 @@ class DistributedStreamManager:
 
     # ==================== Atomic Camera Claiming ====================
 
+    # async def claim_available_cameras(self, slots_available: int) -> List[Dict[str, Any]]:
+    #     """
+    #     🔒 ATOMIC camera claiming with comprehensive validation.
+        
+    #     CRITICAL GUARANTEES:
+    #     1. FOR UPDATE SKIP LOCKED ensures no double-claiming
+    #     2. Multiple verification layers prevent invalid claims
+    #     3. Post-claim health check catches any edge cases
+    #     4. Immediate release if verification fails
+    #     """
+    #     if slots_available <= 0:
+    #         return []
+        
+    #     claim_query = """
+    #         WITH available_cameras AS (
+    #             SELECT 
+    #                 vs.stream_id, vs.name, vs.path, vs.workspace_id, 
+    #                 vs.user_id, vs.location, vs.area, vs.building,
+    #                 vs.floor_level, vs.zone, vs.latitude, vs.longitude,
+    #                 u.username, u.role,
+    #                 vs.retry_count, vs.next_retry_at, vs.last_activity,
+    #                 vs.stop_reason, vs.auto_retry_enabled, vs.is_streaming,
+    #                 vs.locked_by_server, vs.server_heartbeat,
+    #                 CASE WHEN vs.path LIKE 'rtsp://%' THEN TRUE ELSE FALSE END as is_rtsp,
+    #                 -- Calculate time since last activity
+    #                 EXTRACT(EPOCH FROM (NOW() - vs.last_activity)) as seconds_since_activity
+    #             FROM video_stream vs
+    #             JOIN users u ON vs.user_id = u.user_id
+    #             JOIN workspaces w ON vs.workspace_id = w.workspace_id
+    #             WHERE 
+    #                 -- Camera should be streaming
+    #                 vs.is_streaming = TRUE
+    #                 AND u.is_active = TRUE
+    #                 AND w.is_active = TRUE
+    #                 AND (u.is_subscribed = TRUE OR u.role = 'admin')
+                    
+    #                 -- ✅ CRITICAL: Not user-stopped
+    #                 AND vs.stop_reason NOT IN ('user_action', 'user_stop', 'manual_stop', 'admin_stop')
+                    
+    #                 -- ✅ CRITICAL: Auto-retry must be enabled
+    #                 AND vs.auto_retry_enabled = TRUE
+                    
+    #                 -- ✅ CRITICAL: Respect retry timing
+    #                 AND (vs.next_retry_at IS NULL OR vs.next_retry_at <= NOW())
+                    
+    #                 -- ✅ CRITICAL: Enhanced locking logic with health checks
+    #                 AND (
+    #                     -- Case 1: Not locked (freshly enabled camera)
+    #                     vs.locked_by_server IS NULL
+                        
+    #                     OR
+                        
+    #                     -- Case 2: Dead server (no heartbeat)
+    #                     (
+    #                         CASE 
+    #                             WHEN vs.path LIKE 'rtsp://%' THEN
+    #                                 vs.server_heartbeat < NOW() - INTERVAL '6 minutes'
+    #                             ELSE
+    #                                 vs.server_heartbeat < NOW() - INTERVAL '2 minutes'
+    #                         END
+    #                     )
+                        
+    #                     OR
+                        
+    #                     -- Case 3: Server alive but stream unhealthy
+    #                     -- (heartbeat recent BUT no activity for extended period)
+    #                     (
+    #                         vs.server_heartbeat > NOW() - INTERVAL '2 minutes'
+    #                         AND
+    #                         CASE 
+    #                             WHEN vs.path LIKE 'rtsp://%' THEN
+    #                                 vs.last_activity < NOW() - INTERVAL '6 minutes'
+    #                             ELSE
+    #                                 vs.last_activity < NOW() - INTERVAL '3 minutes'
+    #                         END
+    #                     )
+    #                 )
+                    
+    #             ORDER BY 
+    #                 -- Prioritize cameras that have been down longest
+    #                 vs.last_activity ASC NULLS FIRST,
+    #                 vs.updated_at ASC
+                    
+    #             LIMIT $1
+    #             FOR UPDATE SKIP LOCKED
+    #         )
+    #         UPDATE video_stream
+    #         SET 
+    #             locked_by_server = $2,
+    #             server_heartbeat = NOW(),
+    #             status = 'processing',
+    #             updated_at = NOW()
+    #         FROM available_cameras
+    #         WHERE video_stream.stream_id = available_cameras.stream_id
+    #         -- ✅ CRITICAL: Re-verify is_streaming hasn't changed
+    #         AND video_stream.is_streaming = TRUE
+    #         AND video_stream.stop_reason NOT IN ('user_action', 'user_stop', 'manual_stop', 'admin_stop')
+    #         RETURNING 
+    #             video_stream.stream_id,
+    #             video_stream.name,
+    #             video_stream.path,
+    #             video_stream.workspace_id,
+    #             video_stream.user_id,
+    #             video_stream.location,
+    #             video_stream.area,
+    #             video_stream.building,
+    #             video_stream.floor_level,
+    #             video_stream.zone,
+    #             video_stream.latitude,
+    #             video_stream.longitude,
+    #             available_cameras.username,
+    #             available_cameras.role,
+    #             available_cameras.retry_count,
+    #             available_cameras.next_retry_at,
+    #             video_stream.stop_reason,
+    #             video_stream.auto_retry_enabled,
+    #             video_stream.is_streaming,
+    #             available_cameras.is_rtsp,
+    #             available_cameras.seconds_since_activity
+    #     """
+        
+    #     try:
+    #         claimed_cameras = await self.db_manager.execute_query(
+    #             claim_query,
+    #             (slots_available, self.server_id),
+    #             fetch_all=True
+    #         )
+            
+    #         if not claimed_cameras:
+    #             return []
+            
+    #         # ✅ POST-CLAIM VERIFICATION: Triple-check each claimed camera
+    #         verified_cameras = []
+            
+    #         for camera in claimed_cameras:
+    #             stream_id = str(camera['stream_id'])
+                
+    #             # Verification 1: is_streaming must be TRUE
+    #             if not camera.get('is_streaming', True):
+    #                 logger.error(
+    #                     f"❌ POST-CLAIM: {stream_id} has is_streaming=FALSE"
+    #                 )
+    #                 await self.release_camera_lock(
+    #                     stream_id, 
+    #                     reason="verification_failed",
+    #                     force_stop=True
+    #                 )
+    #                 continue
+                
+    #             # Verification 2: stop_reason must NOT indicate user stop
+    #             if camera.get('stop_reason') in ('user_action', 'user_stop', 'manual_stop', 'admin_stop'):
+    #                 logger.error(
+    #                     f"❌ POST-CLAIM: {stream_id} has stop_reason={camera.get('stop_reason')}"
+    #                 )
+    #                 await self.release_camera_lock(
+    #                     stream_id, 
+    #                     reason="user_stopped_after_claim",
+    #                     force_stop=True
+    #                 )
+    #                 continue
+                
+    #             # Verification 3: auto_retry_enabled must be TRUE
+    #             if not camera.get('auto_retry_enabled', True):
+    #                 logger.error(
+    #                     f"❌ POST-CLAIM: {stream_id} has auto_retry_enabled=FALSE"
+    #                 )
+    #                 await self.release_camera_lock(
+    #                     stream_id, 
+    #                     reason="retry_disabled_after_claim",
+    #                     force_stop=True
+    #                 )
+    #                 continue
+                
+    #             # ✅ Log claim with context
+    #             retry_count = camera.get('retry_count', 0)
+    #             is_rtsp = camera.get('is_rtsp', False)
+    #             stream_type = "RTSP" if is_rtsp else "FILE"
+    #             activity_age = camera.get('seconds_since_activity', 0)
+                
+    #             if retry_count > 0:
+    #                 logger.info(
+    #                     f"✅ Claimed {stream_type} camera '{camera['name']}' "
+    #                     f"(retry #{retry_count}, inactive for {activity_age:.0f}s)"
+    #                 )
+    #             else:
+    #                 logger.info(
+    #                     f"✅ Claimed {stream_type} camera '{camera['name']}' (first start)"
+    #                 )
+                
+    #             verified_cameras.append(camera)
+            
+    #         if len(verified_cameras) != len(claimed_cameras):
+    #             logger.warning(
+    #                 f"⚠️ Claimed {len(claimed_cameras)}, verified {len(verified_cameras)}, "
+    #                 f"rejected {len(claimed_cameras) - len(verified_cameras)}"
+    #             )
+            
+    #         return verified_cameras
+            
+    #     except Exception as e:
+    #         logger.error(f"Error claiming cameras: {e}", exc_info=True)
+    #         return []
+
     async def claim_available_cameras(self, slots_available: int) -> List[Dict[str, Any]]:
         """
         🔒 ATOMIC camera claiming with comprehensive validation.
@@ -621,6 +824,114 @@ class DistributedStreamManager:
 
     # ==================== Management Loop ====================
 
+    # async def manage_streams_with_deduplication(self):
+    #     """
+    #     🔄 Main management loop with intelligent claiming.
+    #     """
+    #     logger.info(f"🔄 Management loop started for server {self.server_id}")
+        
+    #     zombie_check_counter = 0
+    #     dead_server_cleanup_counter = 0
+        
+    #     while self.is_running:
+    #         try:
+    #             # Step 1: Update heartbeat for cameras we own
+    #             await self.update_heartbeat_for_owned_cameras()
+                
+    #             # Step 2: Check capacity
+    #             async with self._lock:
+    #                 current_active = len(self.active_streams)
+                
+    #             slots_available = self.max_local_capacity - current_active
+                
+    #             logger.debug(
+    #                 f"📊 Server {self.server_id}: "
+    #                 f"{current_active}/{self.max_local_capacity} cameras active, "
+    #                 f"{slots_available} slots available"
+    #             )
+                
+    #             # Step 3: Claim available cameras if we have capacity
+    #             if slots_available > 0:
+    #                 newly_claimed = await self.claim_available_cameras(slots_available)
+                    
+    #                 if newly_claimed:
+    #                     logger.info(
+    #                         f"🎯 Server {self.server_id} claimed {len(newly_claimed)} cameras"
+    #                     )
+                        
+    #                     # Step 4: Start claimed cameras in parallel
+    #                     start_tasks = [
+    #                         self.start_camera_locally(camera)
+    #                         for camera in newly_claimed
+    #                     ]
+                        
+    #                     results = await asyncio.gather(*start_tasks, return_exceptions=True)
+                        
+    #                     success_count = sum(
+    #                         1 for r in results if not isinstance(r, Exception)
+    #                     )
+    #                     logger.info(
+    #                         f"✅ Successfully started {success_count}/{len(newly_claimed)} cameras"
+    #                     )
+                
+    #             # Step 5: Periodic zombie cleanup (every 5 cycles = ~2.5 minutes)
+    #             zombie_check_counter += 1
+    #             if zombie_check_counter >= 5:
+    #                 await self.cleanup_zombies()
+    #                 zombie_check_counter = 0
+                
+    #             # Step 6: Cleanup dead server locks (every 3 cycles = ~1.5 minutes)
+    #             dead_server_cleanup_counter += 1
+    #             if dead_server_cleanup_counter >= 3:
+    #                 released = await self.cleanup_zombie_locks()
+    #                 if released > 0:
+    #                     logger.warning(f"🧹 Released {released} dead server locks")
+    #                 dead_server_cleanup_counter = 0
+                
+    #             # Step 7: Verify owned cameras should still be running
+    #             async with self._lock:
+    #                 local_stream_ids = list(self.active_streams.keys())
+                
+    #             if local_stream_ids:
+    #                 check_query = """
+    #                     SELECT stream_id, is_streaming, stop_reason, status
+    #                     FROM video_stream
+    #                     WHERE stream_id = ANY($1::uuid[])
+    #                 """
+                    
+    #                 db_states = await self.db_manager.execute_query(
+    #                     check_query,
+    #                     (local_stream_ids,),
+    #                     fetch_all=True
+    #                 )
+                    
+    #                 for db_state in db_states:
+    #                     stream_id_str = str(db_state['stream_id'])
+                        
+    #                     # Stop if database says shouldn't be running
+    #                     should_stop = (
+    #                         not db_state['is_streaming'] or
+    #                         db_state['stop_reason'] in ('user_action', 'user_stop', 'manual_stop', 'admin_stop')
+    #                     )
+                        
+    #                     if should_stop:
+    #                         logger.info(
+    #                             f"🛑 Stopping {stream_id_str}: "
+    #                             f"is_streaming={db_state['is_streaming']}, "
+    #                             f"stop_reason={db_state['stop_reason']}"
+    #                         )
+    #                         await self.stop_camera_locally(stream_id_str, reason="database_mismatch")
+                
+    #             # Sleep before next cycle
+    #             await asyncio.sleep(30)  # 30 second interval
+                
+    #         except asyncio.CancelledError:
+    #             logger.info("Management loop cancelled")
+    #             break
+    #         except Exception as e:
+    #             logger.error(f"Error in management loop: {e}", exc_info=True)
+    #             await asyncio.sleep(10)  # Back off on error
+
     async def manage_streams_with_deduplication(self):
         """
         🔄 Main management loop with intelligent claiming.
@@ -809,6 +1120,43 @@ class DistributedStreamManager:
             )
         
         logger.info(f"✅ Management loop stopped for server {self.server_id}")
+
+    # async def cleanup_zombie_locks(self):
+    #     """Clean up locks from dead servers."""
+    #     try:
+    #         # Use stored procedure if available
+    #         result = await self.db_manager.execute_query(
+    #             "SELECT * FROM cleanup_zombie_server_locks()",
+    #             fetch_one=True
+    #         )
+            
+    #         if result and result['released_count'] > 0:
+    #             logger.warning(
+    #                 f"🧹 Released {result['released_count']} zombie locks from dead servers"
+    #             )
+    #             return result['released_count']
+            
+    #         return 0
+            
+    #     except Exception as e:
+    #         # Fallback to manual cleanup if stored procedure doesn't exist
+    #         cleanup_query = """
+    #             UPDATE video_stream
+    #             SET 
+    #                 locked_by_server = NULL,
+    #                 server_heartbeat = NULL
+    #             WHERE locked_by_server IS NOT NULL
+    #               AND server_heartbeat < NOW() - INTERVAL '6 minutes'
+    #             RETURNING stream_id
+    #         """
+            
+    #         result = await self.db_manager.execute_query(cleanup_query, fetch_all=True)
+            
+    #         if result:
+    #             logger.warning(f"🧹 Cleaned up {len(result)} dead server locks (fallback)")
+    #             return len(result)
+            
+    #         return 0
 
     async def cleanup_zombie_locks(self):
         """

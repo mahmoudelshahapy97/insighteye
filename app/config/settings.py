@@ -38,7 +38,7 @@ class Settings(BaseSettings):
 
     # Balanced heartbeat
     management_loop_sleep: int = 20  # seconds
-    server_heartbeat_threshold: int = 120  # seconds
+    server_heartbeat_threshold_seconds: int = 360  # 6 minutes (matches RTSP grace period)
 
     # =============================================================================
     # PROJECT INFORMATION
@@ -134,8 +134,8 @@ class Settings(BaseSettings):
     db_host: str = "172.31.25.133"
     db_port: int = 6432
 
-    db_min_pool_size: int = 10
-    db_max_pool_size: int = 50
+    db_min_pool_size: int = 50
+    db_max_pool_size: int = 200
     db_timeout: float = 30.0
     db_command_timeout: float = 60.0
 
