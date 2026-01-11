@@ -333,5 +333,47 @@ class Settings(BaseSettings):
     enable_metrics: bool = True
     health_check_path: str = "/health"
 
+    # =============================================================================
+    # REDIS & CELERY
+    # =============================================================================
+    redis_host: str = "redis"  # Docker service name
+    redis_port: int = 6379
+    redis_db: int = 0
+    redis_password: Optional[str] = None
+    redis_max_connections: int = 50
+    redis_socket_timeout: int = 5
+    redis_socket_connect_timeout: int = 5
+    
+    # Celery configuration
+    celery_broker_url: Optional[str] = None  # Will default to Redis
+    celery_result_backend: Optional[str] = None  # Will default to Redis
+    celery_task_serializer: str = "json"
+    celery_result_serializer: str = "json"
+    celery_accept_content: List[str] = ["json"]
+    celery_timezone: str = "Africa/Cairo"
+    celery_enable_utc: bool = True
+    celery_worker_concurrency: int = 4
+    celery_worker_prefetch_multiplier: int = 1
+    celery_task_acks_late: bool = True
+    celery_task_reject_on_worker_lost: bool = True
+    celery_result_expires: int = 86400  # 24 hours
+    celery_task_time_limit: int =3600  # Max task duration (seconds)
+    
+    def get_celery_broker_url(self) -> str:
+        """Get Celery broker URL."""
+        if self.celery_broker_url:
+            return self.celery_broker_url
+        
+        auth = f":{self.redis_password}@" if self.redis_password else ""
+        return f"redis://{auth}{self.redis_host}:{self.redis_port}/{self.redis_db}"
+    
+    def get_celery_result_backend(self) -> str:
+        """Get Celery result backend URL."""
+        if self.celery_result_backend:
+            return self.celery_result_backend
+        
+        auth = f":{self.redis_password}@" if self.redis_password else ""
+        return f"redis://{auth}{self.redis_host}:{self.redis_port}/{self.redis_db}"
+
 # Singleton
 config = Settings()

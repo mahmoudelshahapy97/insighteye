@@ -41,3 +41,9 @@ pytest-cov
 pandas
 elasticsearch
 argon2-cffi
+
+celery[redis]==5.3.4
+redis==4.6.0
+celery[asyncio]==5.3.4
+kombu==5.3.4
+hiredis==2.2.3

@@ -1,4 +1,21 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: insighteye_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - insighteye_network
+
   app:
     build: .
     container_name: insighteye_app
@@ -6,12 +23,54 @@ services:
     env_file:
       - .env
     environment:
-     - OPENCV_FFMPEG_LOGLEVEL=-8
+      - OPENCV_FFMPEG_LOGLEVEL=-8
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     ports:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - .:/app
+    depends_on:
+      redis:
+        condition: service_healthy
     command: >
       uvicorn app.main:app
       --host 0.0.0.0
       --port 8000
+    networks:
+      - insighteye_network
+
+  celery_worker:
+    build: .
+    container_name: insighteye_celery_worker
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - OPENCV_FFMPEG_LOGLEVEL=-8
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - .:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      --max-tasks-per-child=100
+      --task-events
+      --without-gossip
+      --without-mingle
+      --without-heartbeat
+    networks:
+      - insighteye_network
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  insighteye_network:
+    driver: bridge
