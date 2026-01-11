@@ -145,6 +145,96 @@ async def get_unique_cameras(
         logger.error(f"Error fetching unique cameras: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/cameras/frame-counts")
+async def get_frame_counts_per_camera(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
+    limit: int = Query(5000, le=10000, description="Max datapoints per camera"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get total frame counts per camera with date and location filters"""
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
+        
+        params = [workspace_id_obj]
+        param_count = 1
+        date_filter = ""
+        
+        if start_date:
+            param_count += 1
+            params.append(start_date)
+            date_filter += f" AND date >= ${param_count}"
+        if end_date:
+            param_count += 1
+            params.append(end_date)
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+            
+        query = f"""
+            SELECT
+                camera_name,
+                camera_id,
+                location,
+                area,
+                building,
+                zone,
+                floor_level,
+                COUNT(*) AS total_frames,
+                MIN(timestamp) AS first_frame,
+                MAX(timestamp) AS last_frame
+            FROM stream_results
+            WHERE workspace_id = $1
+              AND camera_name IS NOT NULL
+              {date_filter}
+              {location_where}
+            GROUP BY camera_name, camera_id, location, area, building, zone, floor_level
+            ORDER BY total_frames DESC
+        """
+        
+        async with db_manager.get_connection() as conn:
+            results = await conn.fetch(query, *params)
+            
+        data = [dict(row) for row in results]
+        
+        return {
+            "success": True,
+            "count": len(data),
+            "limit_per_camera": limit,
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching frame counts: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/cameras/average-people")
 async def get_average_people_per_camera(
     request: Request,
