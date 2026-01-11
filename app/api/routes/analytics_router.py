@@ -2292,6 +2292,197 @@ async def get_fire_status_by_camera(
         logger.error(f"Error fetching threshold violations: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+# @router.get("/fire/threshold-violations-by-camera")
+# async def get_threshold_violations_by_camera(
+#     request: Request,
+#     start_date: Optional[date] = None,
+#     end_date: Optional[date] = None,
+#     locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+#     areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+#     buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+#     floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+#     zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
+#     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+# ):
+#     """Get person count threshold violations per camera with location filters"""
+#     user_id_obj = current_user_data["user_id"]
+#     username = current_user_data["username"]
+    
+#     try:
+#         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+#         if not workspace_id_obj:
+#             raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+#         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
+        
+#         params = [workspace_id_obj]
+#         param_count = 1
+#         date_filter = ""
+        
+#         if start_date:
+#             param_count += 1
+#             params.append(start_date)
+#             date_filter += f" AND sr.date >= ${param_count}"
+#         if end_date:
+#             param_count += 1
+#             params.append(end_date)
+#             date_filter += f" AND sr.date <= ${param_count}"
+        
+#         location_filters, param_count = build_location_filters(
+#             params, param_count, locations, areas, buildings, floor_levels, zones
+#         )
+        
+#         # Need to prefix location filters with "sr." for this query
+#         location_where = ""
+#         if location_filters:
+#             prefixed_filters = [f.replace("location", "sr.location")
+#                                   .replace("area", "sr.area")
+#                                   .replace("building", "sr.building")
+#                                   .replace("floor_level", "sr.floor_level")
+#                                   .replace("zone", "sr.zone") 
+#                                for f in location_filters]
+#             location_where = " AND " + " AND ".join(prefixed_filters)
+            
+#         query = f"""
+#             SELECT
+#                 sr.camera_name,
+#                 sr.camera_id,
+#                 sr.location,
+#                 sr.area,
+#                 sr.building,
+#                 sr.zone,
+#                 sr.floor_level,
+#                 vs.count_threshold_greater,
+#                 vs.count_threshold_less,
+#                 COUNT(CASE 
+#                     WHEN vs.count_threshold_greater IS NOT NULL 
+#                          AND sr.person_count > vs.count_threshold_greater 
+#                     THEN 1 
+#                 END) AS above_max_count,
+#                 COUNT(CASE 
+#                     WHEN vs.count_threshold_less IS NOT NULL 
+#                          AND sr.person_count < vs.count_threshold_less 
+#                     THEN 1 
+#                 END) AS below_min_count,
+#                 COUNT(*) AS total_checks,
+#                 AVG(sr.person_count) AS avg_person_count,
+#                 MAX(sr.person_count) AS max_person_count,
+#                 MIN(sr.person_count) AS min_person_count,
+#                 MAX(CASE 
+#                     WHEN vs.count_threshold_greater IS NOT NULL 
+#                          AND sr.person_count > vs.count_threshold_greater 
+#                     THEN sr.timestamp 
+#                 END) AS last_above_max_time,
+#                 MAX(CASE 
+#                     WHEN vs.count_threshold_less IS NOT NULL 
+#                          AND sr.person_count < vs.count_threshold_less 
+#                     THEN sr.timestamp 
+#                 END) AS last_below_min_time
+#             FROM stream_results sr
+#             JOIN video_stream vs ON sr.stream_id = vs.stream_id
+#             WHERE sr.workspace_id = $1
+#               AND sr.camera_name IS NOT NULL
+#               AND sr.person_count IS NOT NULL
+#               AND vs.alert_enabled = TRUE
+#               AND (vs.count_threshold_greater IS NOT NULL OR vs.count_threshold_less IS NOT NULL)
+#               {date_filter}
+#               {location_where}
+#             GROUP BY 
+#                 sr.camera_name, 
+#                 sr.camera_id, 
+#                 sr.location, 
+#                 sr.area, 
+#                 sr.building, 
+#                 sr.zone,
+#                 sr.floor_level,
+#                 vs.count_threshold_greater,
+#                 vs.count_threshold_less
+#             HAVING COUNT(CASE 
+#                     WHEN vs.count_threshold_greater IS NOT NULL 
+#                          AND sr.person_count > vs.count_threshold_greater 
+#                     THEN 1 
+#                 END) > 0
+#                 OR COUNT(CASE 
+#                     WHEN vs.count_threshold_less IS NOT NULL 
+#                          AND sr.person_count < vs.count_threshold_less 
+#                     THEN 1 
+#                 END) > 0
+#             ORDER BY (
+#                 COUNT(CASE 
+#                     WHEN vs.count_threshold_greater IS NOT NULL 
+#                          AND sr.person_count > vs.count_threshold_greater 
+#                     THEN 1 
+#                 END) + 
+#                 COUNT(CASE 
+#                     WHEN vs.count_threshold_less IS NOT NULL 
+#                          AND sr.person_count < vs.count_threshold_less 
+#                     THEN 1 
+#                 END)
+#             ) DESC, sr.camera_name
+#         """
+        
+#         async with db_manager.get_connection() as conn:
+#             results = await conn.fetch(query, *params)
+            
+#         data = [{
+#             'camera_name': row['camera_name'],
+#             'camera_id': row['camera_id'],
+#             'location': row['location'],
+#             'area': row['area'],
+#             'building': row['building'],
+#             'zone': row['zone'],
+#             'floor_level': row['floor_level'],
+#             'max_threshold': row['count_threshold_greater'],
+#             'min_threshold': row['count_threshold_less'],
+#             'above_max_count': row['above_max_count'],
+#             'below_min_count': row['below_min_count'],
+#             'total_violations': row['above_max_count'] + row['below_min_count'],
+#             'total_checks': row['total_checks'],
+#             'violation_rate': round(
+#                 ((row['above_max_count'] + row['below_min_count']) / row['total_checks'] * 100), 
+#                 2
+#             ) if row['total_checks'] > 0 else 0,
+#             'avg_person_count': round(float(row['avg_person_count'])) if row['avg_person_count'] else 0,
+#             'max_person_count': row['max_person_count'],
+#             'min_person_count': row['min_person_count'],
+#             'last_above_max_time': row['last_above_max_time'].isoformat() if row['last_above_max_time'] else None,
+#             'last_below_min_time': row['last_below_min_time'].isoformat() if row['last_below_min_time'] else None
+#         } for row in results]
+        
+#         total_above_max = sum(d['above_max_count'] for d in data)
+#         total_below_min = sum(d['below_min_count'] for d in data)
+#         cameras_with_violations = len(data)
+        
+#         return {
+#             "success": True,
+#             "summary": {
+#                 "cameras_with_violations": cameras_with_violations,
+#                 "total_above_max_violations": total_above_max,
+#                 "total_below_min_violations": total_below_min,
+#                 "total_violations": total_above_max + total_below_min,
+#                 "cameras_with_above_max": len([d for d in data if d['above_max_count'] > 0]),
+#                 "cameras_with_below_min": len([d for d in data if d['below_min_count'] > 0])
+#             },
+#             "filters_applied": {
+#                 "start_date": start_date.isoformat() if start_date else None,
+#                 "end_date": end_date.isoformat() if end_date else None,
+#                 "locations": parse_string_or_list(locations),
+#                 "areas": parse_string_or_list(areas),
+#                 "buildings": parse_string_or_list(buildings),
+#                 "floor_levels": parse_string_or_list(floor_levels),
+#                 "zones": parse_string_or_list(zones)
+#             },
+#             "count": len(data),
+#             "data": data
+#         }
+        
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error fetching threshold violations: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/fire/threshold-violations-by-camera")
 async def get_threshold_violations_by_camera(
     request: Request,
@@ -2302,9 +2493,17 @@ async def get_threshold_violations_by_camera(
     buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
     floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
     zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
+    include_zero_violations: bool = Query(False, description="Include cameras with zero violations"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
-    """Get person count threshold violations per camera with location filters"""
+    """Get person count threshold violations per camera with location filters
+    
+    FIXED ISSUES:
+    1. Added include_zero_violations parameter to optionally show all cameras
+    2. Made HAVING clause conditional
+    3. Added detailed logging for debugging
+    4. Added validation checks for configuration
+    """
     user_id_obj = current_user_data["user_id"]
     username = current_user_data["username"]
     
@@ -2315,6 +2514,59 @@ async def get_threshold_violations_by_camera(
 
         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
         
+        # Step 1: Validate configuration first
+        async with db_manager.get_connection() as conn:
+            config_check = await conn.fetchrow("""
+                SELECT 
+                    COUNT(*) as total_cameras,
+                    COUNT(CASE WHEN alert_enabled = TRUE THEN 1 END) as alerts_enabled_count,
+                    COUNT(CASE WHEN count_threshold_greater IS NOT NULL THEN 1 END) as has_max_threshold,
+                    COUNT(CASE WHEN count_threshold_less IS NOT NULL THEN 1 END) as has_min_threshold,
+                    COUNT(CASE WHEN alert_enabled = TRUE 
+                               AND (count_threshold_greater IS NOT NULL 
+                                    OR count_threshold_less IS NOT NULL) 
+                          THEN 1 END) as configured_cameras
+                FROM video_stream
+                WHERE workspace_id = $1
+            """, workspace_id_obj)
+            
+            logger.info(f"Configuration check for workspace {workspace_id_obj}: {dict(config_check)}")
+            
+            # Warn if no cameras are properly configured
+            if config_check['configured_cameras'] == 0:
+                logger.warning(f"No cameras configured with alerts and thresholds in workspace {workspace_id_obj}")
+                return {
+                    "success": True,
+                    "warning": "No cameras have both alerts enabled and thresholds configured",
+                    "configuration_status": {
+                        "total_cameras": config_check['total_cameras'],
+                        "alerts_enabled": config_check['alerts_enabled_count'],
+                        "has_max_threshold": config_check['has_max_threshold'],
+                        "has_min_threshold": config_check['has_min_threshold'],
+                        "properly_configured": config_check['configured_cameras']
+                    },
+                    "summary": {
+                        "cameras_with_violations": 0,
+                        "total_above_max_violations": 0,
+                        "total_below_min_violations": 0,
+                        "total_violations": 0,
+                        "cameras_with_above_max": 0,
+                        "cameras_with_below_min": 0
+                    },
+                    "filters_applied": {
+                        "start_date": start_date.isoformat() if start_date else None,
+                        "end_date": end_date.isoformat() if end_date else None,
+                        "locations": parse_string_or_list(locations),
+                        "areas": parse_string_or_list(areas),
+                        "buildings": parse_string_or_list(buildings),
+                        "floor_levels": parse_string_or_list(floor_levels),
+                        "zones": parse_string_or_list(zones)
+                    },
+                    "count": 0,
+                    "data": []
+                }
+        
+        # Step 2: Build query parameters
         params = [workspace_id_obj]
         param_count = 1
         date_filter = ""
@@ -2332,7 +2584,7 @@ async def get_threshold_violations_by_camera(
             params, param_count, locations, areas, buildings, floor_levels, zones
         )
         
-        # Need to prefix location filters with "sr." for this query
+        # Prefix location filters with "sr." for this query
         location_where = ""
         if location_filters:
             prefixed_filters = [f.replace("location", "sr.location")
@@ -2342,6 +2594,22 @@ async def get_threshold_violations_by_camera(
                                   .replace("zone", "sr.zone") 
                                for f in location_filters]
             location_where = " AND " + " AND ".join(prefixed_filters)
+        
+        # Step 3: Conditional HAVING clause based on include_zero_violations parameter
+        having_clause = ""
+        if not include_zero_violations:
+            having_clause = """
+            HAVING COUNT(CASE 
+                    WHEN vs.count_threshold_greater IS NOT NULL 
+                         AND sr.person_count > vs.count_threshold_greater 
+                    THEN 1 
+                END) > 0
+                OR COUNT(CASE 
+                    WHEN vs.count_threshold_less IS NOT NULL 
+                         AND sr.person_count < vs.count_threshold_less 
+                    THEN 1 
+                END) > 0
+            """
             
         query = f"""
             SELECT
@@ -2354,6 +2622,7 @@ async def get_threshold_violations_by_camera(
                 sr.floor_level,
                 vs.count_threshold_greater,
                 vs.count_threshold_less,
+                vs.alert_enabled,
                 COUNT(CASE 
                     WHEN vs.count_threshold_greater IS NOT NULL 
                          AND sr.person_count > vs.count_threshold_greater 
@@ -2396,17 +2665,9 @@ async def get_threshold_violations_by_camera(
                 sr.zone,
                 sr.floor_level,
                 vs.count_threshold_greater,
-                vs.count_threshold_less
-            HAVING COUNT(CASE 
-                    WHEN vs.count_threshold_greater IS NOT NULL 
-                         AND sr.person_count > vs.count_threshold_greater 
-                    THEN 1 
-                END) > 0
-                OR COUNT(CASE 
-                    WHEN vs.count_threshold_less IS NOT NULL 
-                         AND sr.person_count < vs.count_threshold_less 
-                    THEN 1 
-                END) > 0
+                vs.count_threshold_less,
+                vs.alert_enabled
+            {having_clause}
             ORDER BY (
                 COUNT(CASE 
                     WHEN vs.count_threshold_greater IS NOT NULL 
@@ -2421,9 +2682,15 @@ async def get_threshold_violations_by_camera(
             ) DESC, sr.camera_name
         """
         
+        logger.info(f"Executing threshold violations query with {len(params)} parameters")
+        logger.debug(f"Query parameters: {params}")
+        
         async with db_manager.get_connection() as conn:
             results = await conn.fetch(query, *params)
             
+        logger.info(f"Query returned {len(results)} results")
+        
+        # Step 4: Format results
         data = [{
             'camera_name': row['camera_name'],
             'camera_id': row['camera_id'],
@@ -2434,6 +2701,7 @@ async def get_threshold_violations_by_camera(
             'floor_level': row['floor_level'],
             'max_threshold': row['count_threshold_greater'],
             'min_threshold': row['count_threshold_less'],
+            'alert_enabled': row['alert_enabled'],
             'above_max_count': row['above_max_count'],
             'below_min_count': row['below_min_count'],
             'total_violations': row['above_max_count'] + row['below_min_count'],
@@ -2451,12 +2719,13 @@ async def get_threshold_violations_by_camera(
         
         total_above_max = sum(d['above_max_count'] for d in data)
         total_below_min = sum(d['below_min_count'] for d in data)
-        cameras_with_violations = len(data)
+        cameras_with_violations = len([d for d in data if d['total_violations'] > 0])
         
-        return {
+        response = {
             "success": True,
             "summary": {
                 "cameras_with_violations": cameras_with_violations,
+                "cameras_monitored": len(data),
                 "total_above_max_violations": total_above_max,
                 "total_below_min_violations": total_below_min,
                 "total_violations": total_above_max + total_below_min,
@@ -2470,14 +2739,211 @@ async def get_threshold_violations_by_camera(
                 "areas": parse_string_or_list(areas),
                 "buildings": parse_string_or_list(buildings),
                 "floor_levels": parse_string_or_list(floor_levels),
-                "zones": parse_string_or_list(zones)
+                "zones": parse_string_or_list(zones),
+                "include_zero_violations": include_zero_violations
             },
             "count": len(data),
             "data": data
         }
+        
+        logger.info(f"Returning {len(data)} cameras with summary: {response['summary']}")
+        return response
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching threshold violations: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/threshold-violations-config-check")
+async def check_threshold_violations_config(
+    request: Request,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Diagnostic endpoint to check threshold violation configuration
+    
+    Returns detailed information about:
+    - How many cameras exist
+    - How many have alerts enabled
+    - How many have thresholds configured
+    - Sample person count data
+    """
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace")
+
+        await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
+        
+        async with db_manager.get_connection() as conn:
+            # Camera configuration check
+            camera_config = await conn.fetch("""
+                SELECT 
+                    name,
+                    alert_enabled,
+                    count_threshold_greater,
+                    count_threshold_less,
+                    status,
+                    is_streaming,
+                    CASE 
+                        WHEN alert_enabled = TRUE 
+                             AND (count_threshold_greater IS NOT NULL OR count_threshold_less IS NOT NULL)
+                        THEN 'properly_configured'
+                        WHEN alert_enabled = FALSE THEN 'alerts_disabled'
+                        WHEN count_threshold_greater IS NULL AND count_threshold_less IS NULL THEN 'no_thresholds'
+                        ELSE 'partial_config'
+                    END as config_status
+                FROM video_stream
+                WHERE workspace_id = $1
+                ORDER BY name
+            """, workspace_id_obj)
+            
+            # Data availability check
+            data_check = await conn.fetchrow("""
+                SELECT 
+                    COUNT(DISTINCT sr.stream_id) as cameras_with_data,
+                    COUNT(*) as total_stream_results,
+                    MIN(sr.date) as earliest_date,
+                    MAX(sr.date) as latest_date,
+                    AVG(sr.person_count) as avg_person_count,
+                    MIN(sr.person_count) as min_person_count,
+                    MAX(sr.person_count) as max_person_count
+                FROM stream_results sr
+                WHERE sr.workspace_id = $1
+            """, workspace_id_obj)
+            
+            # Potential violations check
+            violations_check = await conn.fetch("""
+                SELECT 
+                    vs.name,
+                    vs.count_threshold_greater,
+                    vs.count_threshold_less,
+                    COUNT(*) as total_readings,
+                    MIN(sr.person_count) as min_count_recorded,
+                    MAX(sr.person_count) as max_count_recorded,
+                    AVG(sr.person_count) as avg_count_recorded,
+                    COUNT(CASE 
+                        WHEN vs.count_threshold_greater IS NOT NULL 
+                             AND sr.person_count > vs.count_threshold_greater 
+                        THEN 1 
+                    END) as would_trigger_above_max,
+                    COUNT(CASE 
+                        WHEN vs.count_threshold_less IS NOT NULL 
+                             AND sr.person_count < vs.count_threshold_less 
+                        THEN 1 
+                    END) as would_trigger_below_min
+                FROM video_stream vs
+                LEFT JOIN stream_results sr ON vs.stream_id = sr.stream_id
+                WHERE vs.workspace_id = $1
+                  AND vs.alert_enabled = TRUE
+                  AND (vs.count_threshold_greater IS NOT NULL OR vs.count_threshold_less IS NOT NULL)
+                GROUP BY vs.name, vs.count_threshold_greater, vs.count_threshold_less
+            """, workspace_id_obj)
+        
+        # Format camera configuration
+        cameras = [{
+            'name': row['name'],
+            'alert_enabled': row['alert_enabled'],
+            'max_threshold': row['count_threshold_greater'],
+            'min_threshold': row['count_threshold_less'],
+            'status': row['status'],
+            'is_streaming': row['is_streaming'],
+            'config_status': row['config_status']
+        } for row in camera_config]
+        
+        # Format violations check
+        violations_analysis = [{
+            'camera_name': row['name'],
+            'max_threshold': row['count_threshold_greater'],
+            'min_threshold': row['count_threshold_less'],
+            'total_readings': row['total_readings'],
+            'min_count_recorded': row['min_count_recorded'],
+            'max_count_recorded': row['max_count_recorded'],
+            'avg_count_recorded': round(float(row['avg_count_recorded']), 2) if row['avg_count_recorded'] else 0,
+            'would_trigger_above_max': row['would_trigger_above_max'],
+            'would_trigger_below_min': row['would_trigger_below_min'],
+            'has_violations': (row['would_trigger_above_max'] > 0 or row['would_trigger_below_min'] > 0)
+        } for row in violations_check]
+        
+        config_summary = {
+            'total_cameras': len(cameras),
+            'alerts_enabled': len([c for c in cameras if c['alert_enabled']]),
+            'has_max_threshold': len([c for c in cameras if c['max_threshold'] is not None]),
+            'has_min_threshold': len([c for c in cameras if c['min_threshold'] is not None]),
+            'properly_configured': len([c for c in cameras if c['config_status'] == 'properly_configured']),
+            'cameras_with_data': data_check['cameras_with_data'] if data_check else 0,
+            'total_stream_results': data_check['total_stream_results'] if data_check else 0
+        }
+        
+        return {
+            "success": True,
+            "configuration_summary": config_summary,
+            "data_availability": {
+                "earliest_date": data_check['earliest_date'].isoformat() if data_check and data_check['earliest_date'] else None,
+                "latest_date": data_check['latest_date'].isoformat() if data_check and data_check['latest_date'] else None,
+                "avg_person_count": round(float(data_check['avg_person_count']), 2) if data_check and data_check['avg_person_count'] else 0,
+                "min_person_count": data_check['min_person_count'] if data_check else None,
+                "max_person_count": data_check['max_person_count'] if data_check else None
+            },
+            "cameras": cameras,
+            "violations_analysis": violations_analysis,
+            "recommendations": generate_recommendations(config_summary, violations_analysis)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in config check: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def generate_recommendations(config_summary: dict, violations_analysis: list) -> list:
+    """Generate actionable recommendations based on configuration"""
+    recommendations = []
+    
+    if config_summary['properly_configured'] == 0:
+        recommendations.append({
+            "priority": "critical",
+            "issue": "No cameras are properly configured",
+            "action": "Enable alerts and set thresholds on your cameras",
+            "sql": "UPDATE video_stream SET alert_enabled = TRUE, count_threshold_greater = 10, count_threshold_less = 2 WHERE workspace_id = 'your-workspace-id';"
+        })
+    
+    if config_summary['alerts_enabled'] < config_summary['total_cameras']:
+        recommendations.append({
+            "priority": "high",
+            "issue": f"Only {config_summary['alerts_enabled']} of {config_summary['total_cameras']} cameras have alerts enabled",
+            "action": "Enable alerts on remaining cameras",
+            "sql": "UPDATE video_stream SET alert_enabled = TRUE WHERE workspace_id = 'your-workspace-id' AND alert_enabled = FALSE;"
+        })
+    
+    if config_summary['has_max_threshold'] == 0 and config_summary['has_min_threshold'] == 0:
+        recommendations.append({
+            "priority": "critical",
+            "issue": "No thresholds configured on any camera",
+            "action": "Set person count thresholds",
+            "sql": "UPDATE video_stream SET count_threshold_greater = 10, count_threshold_less = 2 WHERE workspace_id = 'your-workspace-id';"
+        })
+    
+    cameras_without_violations = [v for v in violations_analysis if not v['has_violations'] and v['total_readings'] > 0]
+    if cameras_without_violations:
+        recommendations.append({
+            "priority": "medium",
+            "issue": f"{len(cameras_without_violations)} cameras have data but no violations",
+            "action": "Review and adjust thresholds to match actual person count ranges",
+            "details": [f"{v['camera_name']}: counts range from {v['min_count_recorded']} to {v['max_count_recorded']}, but thresholds are {v['min_threshold']}-{v['max_threshold']}" 
+                       for v in cameras_without_violations[:3]]
+        })
+    
+    if config_summary['total_stream_results'] == 0:
+        recommendations.append({
+            "priority": "critical",
+            "issue": "No stream results data in database",
+            "action": "Ensure cameras are streaming and saving results to stream_results table"
+        })
+    
+    return recommendations
