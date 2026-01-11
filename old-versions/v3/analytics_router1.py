@@ -1155,6 +1155,194 @@ async def get_camera_timeseries(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/fire/detection-summary")
+async def get_fire_detection_summary(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get summary of fire detections across all cameras with filters"""
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
+        
+        params = [workspace_id_obj]
+        param_count = 1
+        date_filter = ""
+        
+        if start_date:
+            param_count += 1
+            params.append(start_date)
+            date_filter += f" AND date >= ${param_count}"
+        if end_date:
+            param_count += 1
+            params.append(end_date)
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+            
+        query = f"""
+            SELECT
+                fire_status,
+                COUNT(*) AS detection_count,
+                COUNT(DISTINCT stream_id) AS affected_cameras,
+                COUNT(DISTINCT date) AS days_with_detections,
+                MIN(timestamp) AS first_detection,
+                MAX(timestamp) AS last_detection
+            FROM stream_results
+            WHERE workspace_id = $1
+              {date_filter}
+              {location_where}
+            GROUP BY fire_status
+            ORDER BY detection_count DESC
+        """
+        
+        async with db_manager.get_connection() as conn:
+            results = await conn.fetch(query, *params)
+            
+        data = [dict(row) for row in results]
+        
+        total_detections = sum(row['detection_count'] for row in data)
+        fire_detections = sum(row['detection_count'] for row in data if row['fire_status'] != 'no detection')
+        
+        return {
+            "success": True,
+            "summary": {
+                "total_records": total_detections,
+                "fire_detections": fire_detections,
+                "no_detection_records": total_detections - fire_detections,
+                "fire_detection_percentage": round((fire_detections / total_detections * 100), 2) if total_detections > 0 else 0
+            },
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching fire detection summary: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# @router.get("/fire/detections-by-camera")
+# async def get_fire_detections_by_camera(
+#     request: Request,
+#     start_date: Optional[date] = None,
+#     end_date: Optional[date] = None,
+#     locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+#     areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+#     buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+#     floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+#     zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
+#     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+# ):
+#     """Get fire detection counts per camera with filters"""
+#     user_id_obj = current_user_data["user_id"]
+#     username = current_user_data["username"]
+    
+#     try:
+#         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+#         if not workspace_id_obj:
+#             raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+#         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
+        
+#         params = [workspace_id_obj]
+#         param_count = 1
+#         date_filter = ""
+        
+#         if start_date:
+#             param_count += 1
+#             params.append(start_date)
+#             date_filter += f" AND date >= ${param_count}"
+#         if end_date:
+#             param_count += 1
+#             params.append(end_date)
+#             date_filter += f" AND date <= ${param_count}"
+        
+#         location_filters, param_count = build_location_filters(
+#             params, param_count, locations, areas, buildings, floor_levels, zones
+#         )
+#         location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+            
+#         query = f"""
+#             SELECT
+#                 camera_name,
+#                 camera_id,
+#                 location,
+#                 area,
+#                 building,
+#                 zone,
+#                 floor_level,
+#                 COUNT(*) AS total_checks,
+#                 COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS fire_detections,
+#                 COUNT(DISTINCT CASE WHEN fire_status != 'no detection' THEN date END) AS days_with_fire,
+#                 MIN(CASE WHEN fire_status != 'no detection' THEN timestamp END) AS first_fire_detection,
+#                 MAX(CASE WHEN fire_status != 'no detection' THEN timestamp END) AS last_fire_detection,
+#                 ROUND((COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END)::NUMERIC / 
+#                        NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate
+#             FROM stream_results
+#             WHERE workspace_id = $1
+#               AND camera_name IS NOT NULL
+#               {date_filter}
+#               {location_where}
+#             GROUP BY camera_name, camera_id, location, area, building, zone, floor_level
+#             ORDER BY fire_detections DESC, camera_name
+#         """
+        
+#         async with db_manager.get_connection() as conn:
+#             results = await conn.fetch(query, *params)
+            
+#         data = [{
+#             **dict(row),
+#             'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0
+#         } for row in results]
+        
+#         return {
+#             "success": True,
+#             "count": len(data),
+#             "filters_applied": {
+#                 "start_date": start_date.isoformat() if start_date else None,
+#                 "end_date": end_date.isoformat() if end_date else None,
+#                 "locations": parse_string_or_list(locations),
+#                 "areas": parse_string_or_list(areas),
+#                 "buildings": parse_string_or_list(buildings),
+#                 "floor_levels": parse_string_or_list(floor_levels),
+#                 "zones": parse_string_or_list(zones)
+#             },
+#             "data": data
+#         }
+        
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error fetching fire detections by camera: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/fire/detections-by-camera")
 async def get_fire_detections_by_camera(
     request: Request,
@@ -1294,104 +1482,6 @@ async def get_fire_detections_by_camera(
         logger.error(f"Error fetching fire detections by camera: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/fire/detection-summary")
-async def get_fire_detection_summary(
-    request: Request,
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
-    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
-    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
-    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
-    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get summary of fire detections across all cameras with filters"""
-    user_id_obj = current_user_data["user_id"]
-    username = current_user_data["username"]
-    
-    try:
-        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-        if not workspace_id_obj:
-            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
-
-        await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
-        
-        params = [workspace_id_obj]
-        param_count = 1
-        date_filter = ""
-        
-        if start_date:
-            param_count += 1
-            params.append(start_date)
-            date_filter += f" AND date >= ${param_count}"
-        if end_date:
-            param_count += 1
-            params.append(end_date)
-            date_filter += f" AND date <= ${param_count}"
-        
-        location_filters, param_count = build_location_filters(
-            params, param_count, locations, areas, buildings, floor_levels, zones
-        )
-        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
-            
-        query = f"""
-            SELECT
-                fire_status,
-                COUNT(*) AS detection_count,
-                COUNT(DISTINCT stream_id) AS affected_cameras,
-                COUNT(DISTINCT date) AS days_with_detections,
-                MIN(timestamp) AS first_detection,
-                MAX(timestamp) AS last_detection
-            FROM stream_results
-            WHERE workspace_id = $1
-              {date_filter}
-              {location_where}
-            GROUP BY fire_status
-            ORDER BY detection_count DESC
-        """
-        
-        async with db_manager.get_connection() as conn:
-            results = await conn.fetch(query, *params)
-            
-        data = [dict(row) for row in results]
-        
-        total_detections = sum(row['detection_count'] for row in data)
-        fire_detections = sum(row['detection_count'] for row in data if row['fire_status'] == 'fire')
-        smoke_detections = sum(row['detection_count'] for row in data if row['fire_status'] == 'smoke')
-        no_detection = sum(row['detection_count'] for row in data if row['fire_status'] == 'no detection')
-        
-        return {
-            "success": True,
-            "summary": {
-                "total_records": total_detections,
-                "fire_detections": fire_detections,
-                "smoke_detections": smoke_detections,
-                "total_fire_and_smoke": fire_detections + smoke_detections,
-                "no_detection_records": no_detection,
-                "fire_detection_percentage": round((fire_detections / total_detections * 100), 2) if total_detections > 0 else 0,
-                "smoke_detection_percentage": round((smoke_detections / total_detections * 100), 2) if total_detections > 0 else 0,
-                "combined_detection_percentage": round(((fire_detections + smoke_detections) / total_detections * 100), 2) if total_detections > 0 else 0
-            },
-            "filters_applied": {
-                "start_date": start_date.isoformat() if start_date else None,
-                "end_date": end_date.isoformat() if end_date else None,
-                "locations": parse_string_or_list(locations),
-                "areas": parse_string_or_list(areas),
-                "buildings": parse_string_or_list(buildings),
-                "floor_levels": parse_string_or_list(floor_levels),
-                "zones": parse_string_or_list(zones)
-            },
-            "data": data
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching fire detection summary: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.get("/fire/detections-by-location")
 async def get_fire_detections_by_location(
     request: Request,
@@ -1438,29 +1528,19 @@ async def get_fire_detections_by_location(
             SELECT
                 COALESCE({group_by}, 'Unknown') AS group_name,
                 COUNT(*) AS total_checks,
-                COUNT(CASE WHEN fire_status = 'fire' THEN 1 END) AS fire_detections,
-                COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END) AS smoke_detections,
-                COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS total_detections,
+                COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS fire_detections,
                 COUNT(DISTINCT camera_id) AS cameras_in_group,
-                COUNT(DISTINCT CASE WHEN fire_status = 'fire' THEN date END) AS days_with_fire,
-                COUNT(DISTINCT CASE WHEN fire_status = 'smoke' THEN date END) AS days_with_smoke,
-                COUNT(DISTINCT CASE WHEN fire_status != 'no detection' THEN date END) AS days_with_any_detection,
-                MIN(CASE WHEN fire_status = 'fire' THEN timestamp END) AS first_fire_detection,
-                MAX(CASE WHEN fire_status = 'fire' THEN timestamp END) AS last_fire_detection,
-                MIN(CASE WHEN fire_status = 'smoke' THEN timestamp END) AS first_smoke_detection,
-                MAX(CASE WHEN fire_status = 'smoke' THEN timestamp END) AS last_smoke_detection,
-                ROUND((COUNT(CASE WHEN fire_status = 'fire' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate,
-                ROUND((COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS smoke_detection_rate,
+                COUNT(DISTINCT CASE WHEN fire_status != 'no detection' THEN date END) AS days_with_fire,
+                MIN(CASE WHEN fire_status != 'no detection' THEN timestamp END) AS first_fire_detection,
+                MAX(CASE WHEN fire_status != 'no detection' THEN timestamp END) AS last_fire_detection,
                 ROUND((COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS total_detection_rate
+                       NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate
             FROM stream_results
             WHERE workspace_id = $1
               {date_filter}
               {location_where}
             GROUP BY COALESCE({group_by}, 'Unknown')
-            ORDER BY total_detections DESC, fire_detections DESC, smoke_detections DESC
+            ORDER BY fire_detections DESC
         """
         
         async with db_manager.get_connection() as conn:
@@ -1469,9 +1549,7 @@ async def get_fire_detections_by_location(
         data = [{
             **dict(row),
             'group_type': group_by,
-            'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0,
-            'smoke_detection_rate': round(float(row['smoke_detection_rate'])) if row['smoke_detection_rate'] else 0,
-            'total_detection_rate': round(float(row['total_detection_rate'])) if row['total_detection_rate'] else 0
+            'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0
         } for row in results]
         
         return {
@@ -1550,19 +1628,11 @@ async def get_fire_detections_timeline(
             SELECT
                 {truncate_expr} AS time_period,
                 COUNT(*) AS total_checks,
-                COUNT(CASE WHEN fire_status = 'fire' THEN 1 END) AS fire_detections,
-                COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END) AS smoke_detections,
-                COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS total_detections,
+                COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS fire_detections,
                 COUNT(DISTINCT stream_id) AS cameras_checked,
-                COUNT(DISTINCT CASE WHEN fire_status = 'fire' THEN stream_id END) AS cameras_with_fire,
-                COUNT(DISTINCT CASE WHEN fire_status = 'smoke' THEN stream_id END) AS cameras_with_smoke,
-                COUNT(DISTINCT CASE WHEN fire_status != 'no detection' THEN stream_id END) AS cameras_with_any_detection,
-                ROUND((COUNT(CASE WHEN fire_status = 'fire' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate,
-                ROUND((COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS smoke_detection_rate,
+                COUNT(DISTINCT CASE WHEN fire_status != 'no detection' THEN stream_id END) AS cameras_with_fire,
                 ROUND((COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS total_detection_rate
+                       NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate
             FROM stream_results
             WHERE workspace_id = $1
               AND timestamp IS NOT NULL
@@ -1578,9 +1648,7 @@ async def get_fire_detections_timeline(
         data = [{
             **dict(row),
             'time_period': row['time_period'].isoformat(),
-            'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0,
-            'smoke_detection_rate': round(float(row['smoke_detection_rate'])) if row['smoke_detection_rate'] else 0,
-            'total_detection_rate': round(float(row['total_detection_rate'])) if row['total_detection_rate'] else 0
+            'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0
         } for row in results]
         
         return {
@@ -1652,16 +1720,10 @@ async def get_fire_detections_by_weekday(
                 TO_CHAR(date, 'Day') AS weekday_name,
                 EXTRACT(DOW FROM date) AS weekday_num,
                 COUNT(*) AS total_checks,
-                COUNT(CASE WHEN fire_status = 'fire' THEN 1 END) AS fire_detections,
-                COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END) AS smoke_detections,
-                COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS total_detections,
+                COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS fire_detections,
                 COUNT(DISTINCT date) AS days_sampled,
-                ROUND((COUNT(CASE WHEN fire_status = 'fire' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate,
-                ROUND((COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS smoke_detection_rate,
                 ROUND((COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS total_detection_rate
+                       NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate
             FROM stream_results
             WHERE workspace_id = $1
               AND date IS NOT NULL
@@ -1677,9 +1739,7 @@ async def get_fire_detections_by_weekday(
         data = [{
             **dict(row),
             'weekday_name': row['weekday_name'].strip(),
-            'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0,
-            'smoke_detection_rate': round(float(row['smoke_detection_rate'])) if row['smoke_detection_rate'] else 0,
-            'total_detection_rate': round(float(row['total_detection_rate'])) if row['total_detection_rate'] else 0
+            'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0
         } for row in results]
         
         return {
@@ -1749,20 +1809,10 @@ async def get_fire_detections_by_hour(
             SELECT
                 EXTRACT(HOUR FROM time) AS hour,
                 COUNT(*) AS total_checks,
-                COUNT(CASE WHEN fire_status = 'fire' THEN 1 END) AS fire_detections,
-                COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END) AS smoke_detections,
-                COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS total_detections,
+                COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS fire_detections,
                 COUNT(DISTINCT date) AS days_sampled,
-                ROUND((COUNT(CASE WHEN fire_status = 'fire' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate,
-                ROUND((COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS smoke_detection_rate,
                 ROUND((COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(*), 0) * 100), 2) AS total_detection_rate,
-                ROUND((COUNT(CASE WHEN fire_status = 'fire' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(DISTINCT date), 0)), 2) AS avg_fire_per_day,
-                ROUND((COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END)::NUMERIC / 
-                       NULLIF(COUNT(DISTINCT date), 0)), 2) AS avg_smoke_per_day,
+                       NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate,
                 ROUND((COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END)::NUMERIC / 
                        NULLIF(COUNT(DISTINCT date), 0)), 2) AS avg_detections_per_day
             FROM stream_results
@@ -1780,10 +1830,6 @@ async def get_fire_detections_by_hour(
         data = [{
             **dict(row),
             'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0,
-            'smoke_detection_rate': round(float(row['smoke_detection_rate'])) if row['smoke_detection_rate'] else 0,
-            'total_detection_rate': round(float(row['total_detection_rate'])) if row['total_detection_rate'] else 0,
-            'avg_fire_per_day': round(float(row['avg_fire_per_day'])) if row['avg_fire_per_day'] else 0,
-            'avg_smoke_per_day': round(float(row['avg_smoke_per_day'])) if row['avg_smoke_per_day'] else 0,
             'avg_detections_per_day': round(float(row['avg_detections_per_day'])) if row['avg_detections_per_day'] else 0
         } for row in results]
         
@@ -1808,170 +1854,6 @@ async def get_fire_detections_by_hour(
         logger.error(f"Error fetching fire detections by hour: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/fire/high-risk-cameras")
-async def get_high_risk_cameras(
-    request: Request,
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    threshold_percentage: float = Query(5.0, ge=0, le=100, description="Min fire detection rate to be considered high risk"),
-    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
-    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
-    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
-    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
-    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get cameras with high fire detection rates with filters"""
-    user_id_obj = current_user_data["user_id"]
-    username = current_user_data["username"]
-    
-    try:
-        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-        if not workspace_id_obj:
-            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
-
-        await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
-        
-        params = [workspace_id_obj]
-        param_count = 1
-        date_filter = ""
-        
-        if start_date:
-            param_count += 1
-            params.append(start_date)
-            date_filter += f" AND date >= ${param_count}"
-        if end_date:
-            param_count += 1
-            params.append(end_date)
-            date_filter += f" AND date <= ${param_count}"
-        
-        location_filters, param_count = build_location_filters(
-            params, param_count, locations, areas, buildings, floor_levels, zones
-        )
-        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
-            
-        query = f"""
-            WITH camera_stats AS (
-                SELECT
-                    camera_name,
-                    camera_id,
-                    stream_id,
-                    location,
-                    area,
-                    building,
-                    zone,
-                    floor_level,
-                    COUNT(*) AS total_checks,
-                    
-                    -- Separate fire and smoke counts
-                    COUNT(CASE WHEN fire_status = 'fire' THEN 1 END) AS fire_detections,
-                    COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END) AS smoke_detections,
-                    COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS total_detections,
-                    
-                    -- Detection rates
-                    ROUND((COUNT(CASE WHEN fire_status = 'fire' THEN 1 END)::NUMERIC / 
-                           NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate,
-                    ROUND((COUNT(CASE WHEN fire_status = 'smoke' THEN 1 END)::NUMERIC / 
-                           NULLIF(COUNT(*), 0) * 100), 2) AS smoke_detection_rate,
-                    ROUND((COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END)::NUMERIC / 
-                           NULLIF(COUNT(*), 0) * 100), 2) AS total_detection_rate,
-                    
-                    -- Fire-specific timestamps
-                    MIN(CASE WHEN fire_status = 'fire' THEN timestamp END) AS first_fire_detection,
-                    MAX(CASE WHEN fire_status = 'fire' THEN timestamp END) AS last_fire_detection,
-                    
-                    -- Smoke-specific timestamps
-                    MIN(CASE WHEN fire_status = 'smoke' THEN timestamp END) AS first_smoke_detection,
-                    MAX(CASE WHEN fire_status = 'smoke' THEN timestamp END) AS last_smoke_detection,
-                    
-                    -- Any detection timestamps
-                    MIN(CASE WHEN fire_status != 'no detection' THEN timestamp END) AS first_detection,
-                    MAX(CASE WHEN fire_status != 'no detection' THEN timestamp END) AS last_detection,
-                    
-                    -- Days with detections
-                    COUNT(DISTINCT CASE WHEN fire_status = 'fire' THEN date END) AS days_with_fire,
-                    COUNT(DISTINCT CASE WHEN fire_status = 'smoke' THEN date END) AS days_with_smoke,
-                    COUNT(DISTINCT CASE WHEN fire_status != 'no detection' THEN date END) AS days_with_any_detection
-                    
-                FROM stream_results
-                WHERE workspace_id = $1
-                  AND camera_name IS NOT NULL
-                  {date_filter}
-                  {location_where}
-                GROUP BY camera_name, camera_id, stream_id, location, area, building, zone, floor_level
-            )
-            SELECT *
-            FROM camera_stats
-            WHERE total_detection_rate >= ${param_count + 1}
-            ORDER BY total_detection_rate DESC, fire_detections DESC, smoke_detections DESC
-        """
-        
-        params.append(threshold_percentage)
-        
-        async with db_manager.get_connection() as conn:
-            results = await conn.fetch(query, *params)
-            
-        data = [{
-            'camera_name': row['camera_name'],
-            'camera_id': row['camera_id'],
-            'stream_id': str(row['stream_id']),
-            'location': row['location'],
-            'area': row['area'],
-            'building': row['building'],
-            'zone': row['zone'],
-            'floor_level': row['floor_level'],
-            'total_checks': row['total_checks'],
-            'fire_detections': row['fire_detections'],
-            'smoke_detections': row['smoke_detections'],
-            'total_detections': row['total_detections'],
-            'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0,
-            'smoke_detection_rate': round(float(row['smoke_detection_rate'])) if row['smoke_detection_rate'] else 0,
-            'total_detection_rate': round(float(row['total_detection_rate'])) if row['total_detection_rate'] else 0,
-            'first_fire_detection': row['first_fire_detection'].isoformat() if row['first_fire_detection'] else None,
-            'last_fire_detection': row['last_fire_detection'].isoformat() if row['last_fire_detection'] else None,
-            'first_smoke_detection': row['first_smoke_detection'].isoformat() if row['first_smoke_detection'] else None,
-            'last_smoke_detection': row['last_smoke_detection'].isoformat() if row['last_smoke_detection'] else None,
-            'first_detection': row['first_detection'].isoformat() if row['first_detection'] else None,
-            'last_detection': row['last_detection'].isoformat() if row['last_detection'] else None,
-            'days_with_fire': row['days_with_fire'],
-            'days_with_smoke': row['days_with_smoke'],
-            'days_with_any_detection': row['days_with_any_detection']
-        } for row in results]
-        
-        # Calculate summary statistics
-        summary = {
-            'high_risk_count': len(data),
-            'total_fire_detections': sum(d['fire_detections'] for d in data),
-            'total_smoke_detections': sum(d['smoke_detections'] for d in data),
-            'total_all_detections': sum(d['total_detections'] for d in data),
-            'cameras_with_fire': len([d for d in data if d['fire_detections'] > 0]),
-            'cameras_with_smoke': len([d for d in data if d['smoke_detections'] > 0]),
-            'avg_fire_detection_rate': round(sum(d['fire_detection_rate'] for d in data) / len(data), 2) if data else 0,
-            'avg_smoke_detection_rate': round(sum(d['smoke_detection_rate'] for d in data) / len(data), 2) if data else 0,
-            'avg_total_detection_rate': round(sum(d['total_detection_rate'] for d in data) / len(data), 2) if data else 0
-        }
-        
-        return {
-            "success": True,
-            "threshold_percentage": threshold_percentage,
-            "summary": summary,
-            "filters_applied": {
-                "start_date": start_date.isoformat() if start_date else None,
-                "end_date": end_date.isoformat() if end_date else None,
-                "locations": parse_string_or_list(locations),
-                "areas": parse_string_or_list(areas),
-                "buildings": parse_string_or_list(buildings),
-                "floor_levels": parse_string_or_list(floor_levels),
-                "zones": parse_string_or_list(zones)
-            },
-            "data": data
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching high risk cameras: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/fire/recent-detections")
 async def get_recent_fire_detections(
@@ -2064,6 +1946,113 @@ async def get_recent_fire_detections(
         raise
     except Exception as e:
         logger.error(f"Error fetching recent fire detections: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fire/high-risk-cameras")
+async def get_high_risk_cameras(
+    request: Request,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    threshold_percentage: float = Query(5.0, ge=0, le=100, description="Min fire detection rate to be considered high risk"),
+    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
+    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
+    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
+    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
+    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get cameras with high fire detection rates with filters"""
+    user_id_obj = current_user_data["user_id"]
+    username = current_user_data["username"]
+    
+    try:
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
+
+        await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
+        
+        params = [workspace_id_obj]
+        param_count = 1
+        date_filter = ""
+        
+        if start_date:
+            param_count += 1
+            params.append(start_date)
+            date_filter += f" AND date >= ${param_count}"
+        if end_date:
+            param_count += 1
+            params.append(end_date)
+            date_filter += f" AND date <= ${param_count}"
+        
+        location_filters, param_count = build_location_filters(
+            params, param_count, locations, areas, buildings, floor_levels, zones
+        )
+        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
+            
+        query = f"""
+            WITH camera_stats AS (
+                SELECT
+                    camera_name,
+                    camera_id,
+                    stream_id,
+                    location,
+                    area,
+                    building,
+                    zone,
+                    floor_level,
+                    COUNT(*) AS total_checks,
+                    COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END) AS fire_detections,
+                    ROUND((COUNT(CASE WHEN fire_status != 'no detection' THEN 1 END)::NUMERIC / 
+                           NULLIF(COUNT(*), 0) * 100), 2) AS fire_detection_rate,
+                    MIN(CASE WHEN fire_status != 'no detection' THEN timestamp END) AS first_fire_detection,
+                    MAX(CASE WHEN fire_status != 'no detection' THEN timestamp END) AS last_fire_detection,
+                    COUNT(DISTINCT CASE WHEN fire_status != 'no detection' THEN date END) AS days_with_fire
+                FROM stream_results
+                WHERE workspace_id = $1
+                  AND camera_name IS NOT NULL
+                  {date_filter}
+                  {location_where}
+                GROUP BY camera_name, camera_id, stream_id, location, area, building, zone, floor_level
+            )
+            SELECT *
+            FROM camera_stats
+            WHERE fire_detection_rate >= ${param_count + 1}
+            ORDER BY fire_detection_rate DESC, fire_detections DESC
+        """
+        
+        params.append(threshold_percentage)
+        
+        async with db_manager.get_connection() as conn:
+            results = await conn.fetch(query, *params)
+            
+        data = [{
+            **dict(row),
+            'stream_id': str(row['stream_id']),
+            'fire_detection_rate': round(float(row['fire_detection_rate'])) if row['fire_detection_rate'] else 0
+        } for row in results]
+        
+        return {
+            "success": True,
+            "threshold_percentage": threshold_percentage,
+            "high_risk_count": len(data),
+            "filters_applied": {
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+                "locations": parse_string_or_list(locations),
+                "areas": parse_string_or_list(areas),
+                "buildings": parse_string_or_list(buildings),
+                "floor_levels": parse_string_or_list(floor_levels),
+                "zones": parse_string_or_list(zones)
+            },
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching high risk cameras: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
