@@ -981,6 +981,211 @@ class StreamProcessingService:
         except Exception as e:
             logger.error(f"Error handling Fire/smoke detection alert: {e}", exc_info=True)
 
+    # async def process_stream_with_sharing(
+    #     self,
+    #     stream_id: UUID,
+    #     camera_name: str,
+    #     source: str,
+    #     owner_username: str,
+    #     owner_id: UUID,
+    #     workspace_id: UUID,
+    #     stop_event: asyncio.Event,
+    #     location_info: Optional[Dict[str, Any]] = None
+    # ):
+    #     """Main stream processing loop with frame-skipped detection."""
+
+    #     frame_count = 0
+    #     frames_since_last_save = 0
+
+    #     last_db_update_activity = datetime.now(ZoneInfo("Africa/Cairo"))
+    #     last_heartbeat = datetime.now(ZoneInfo("Africa/Cairo"))
+
+    #     stream_id_str = str(stream_id)
+    #     loop = asyncio.get_event_loop()
+    #     shared_stream = None
+    #     first_frame_received = False
+
+    #     consecutive_failures = 0
+    #     max_consecutive_failures = 30
+
+    #     detection_interval = 10  # 🔥 RUN detection every N frames
+
+    #     logger.info(f"Starting stream processing for {stream_id_str} ({camera_name})")
+
+    #     try:
+    #         # -------------------- SETTINGS --------------------
+    #         threshold_settings = await self._get_camera_threshold_settings(stream_id)
+
+    #         from app.services.parameter_service import parameter_service
+    #         params = await parameter_service.get_workspace_params(workspace_id)
+
+    #         frame_skip = params.get("frame_skip", 300)
+    #         frame_delay_target = params.get("frame_delay", 0.033)
+    #         conf_threshold = params.get("conf", 0.5)
+
+    #         # -------------------- SOURCE --------------------
+    #         if not source.startswith("rtsp://"):
+    #             if not await self._validate_stream_source(source):
+    #                 raise RuntimeError(f"Invalid video source: {source}")
+
+    #         shared_stream = await self.video_file_manager.get_shared_stream(source)
+
+    #         if not await shared_stream.add_subscriber(stream_id_str):
+    #             raise RuntimeError("Failed to subscribe to shared stream")
+
+    #         # -------------------- MAIN LOOP --------------------
+    #         while not stop_event.is_set():
+    #             try:
+    #                 # ---------- WAIT FOR FRAME ----------
+    #                 if not await shared_stream.wait_for_frame(timeout=10):
+    #                     consecutive_failures += 1
+    #                     if consecutive_failures > max_consecutive_failures:
+    #                         break
+    #                     await asyncio.sleep(0.1)
+    #                     continue
+
+    #                 frame = await shared_stream.get_latest_frame(stream_id_str)
+    #                 if frame is None or frame.size == 0:
+    #                     consecutive_failures += 1
+    #                     if consecutive_failures > max_consecutive_failures:
+    #                         break
+    #                     await asyncio.sleep(0.1)
+    #                     continue
+
+    #                 consecutive_failures = 0
+    #                 frame_count += 1
+    #                 frames_since_last_save += 1
+
+    #                 current_time = datetime.now(ZoneInfo("Africa/Cairo"))
+
+    #                 # ---------- FIRST FRAME ----------
+    #                 if not first_frame_received:
+    #                     first_frame_received = True
+    #                     await self.update_stream_to_active(stream_id_str)
+
+    #                 # ================= FAST PATH (EVERY FRAME) =================
+    #                 if self.stream_manager:
+    #                     async with self.stream_manager._lock:
+    #                         if stream_id_str in self.stream_manager.active_streams:
+    #                             self.stream_manager.active_streams[stream_id_str].update({
+    #                                 "latest_frame": frame,
+    #                                 "last_frame_time": current_time,
+    #                                 "last_heartbeat": current_time,
+    #                             })
+
+    #                 # Heartbeat
+    #                 if (current_time - last_heartbeat).total_seconds() >= 10:
+    #                     last_heartbeat = current_time
+
+    #                 # DB status heartbeat (independent of detection)
+    #                 if (current_time - last_db_update_activity).total_seconds() >= 30:
+    #                     last_db_update_activity = current_time
+    #                     if self.stream_manager:
+    #                         await self.stream_manager.status_batcher.queue_update(
+    #                             stream_id, "active", True
+    #                         )
+
+    #                 # ================= DETECTION GATE =================
+    #                 run_detection = (frame_count % frame_skip == 0)
+    #                 if not run_detection:
+    #                     await asyncio.sleep(frame_delay_target)
+    #                     continue
+
+    #                 # ================= SLOW PATH (DETECTION ONLY) =================
+    #                 (
+    #                     annotated_frame,
+    #                     person_count,
+    #                     alert_triggered,
+    #                     male_count,
+    #                     female_count,
+    #                     fire_status,
+    #                 ) = await loop.run_in_executor(
+    #                     thread_pool,
+    #                     self.detect_objects_with_threshold,
+    #                     frame,
+    #                     conf_threshold,
+    #                     threshold_settings,
+    #                     stream_id_str,
+    #                 )
+
+    #                 # ---------- UPDATE STREAM MANAGER (DETECTION RESULT) ----------
+    #                 if self.stream_manager:
+    #                     async with self.stream_manager._lock:
+    #                         if stream_id_str in self.stream_manager.active_streams:
+    #                             self.stream_manager.active_streams[stream_id_str].update({
+    #                                 "latest_frame": annotated_frame,
+    #                                 "person_count": person_count,
+    #                                 "male_count": male_count,
+    #                                 "female_count": female_count,
+    #                                 "fire_status": fire_status,
+    #                             })
+
+    #                 # ---------- SAVE ----------
+    #                 should_save = (
+    #                     frames_since_last_save >= frame_skip or
+    #                     (person_count > 0 and frame_skip > 100 and frames_since_last_save >= 30)
+    #                 )
+
+    #                 if should_save:
+    #                     saved = await self._save_detection(
+    #                         stream_id_str=stream_id_str,
+    #                         camera_name=camera_name,
+    #                         owner_username=owner_username,
+    #                         person_count=person_count,
+    #                         male_count=male_count,
+    #                         female_count=female_count,
+    #                         fire_status=fire_status,
+    #                         frame=annotated_frame,
+    #                         workspace_id=workspace_id,
+    #                         location_info=location_info,
+    #                     )
+    #                     if saved:
+    #                         frames_since_last_save = 0
+
+    #                 # ---------- ALERTS ----------
+    #                 if alert_triggered and threshold_settings.get("alert_enabled"):
+    #                     await self._handle_people_count_alert(
+    #                         stream_id,
+    #                         stream_id_str,
+    #                         person_count,
+    #                         threshold_settings,
+    #                         camera_name,
+    #                         workspace_id,
+    #                         owner_id,
+    #                     )
+
+    #                 if fire_status != "no detection":
+    #                     await self._handle_fire_detection_alert(
+    #                         stream_id,
+    #                         stream_id_str,
+    #                         fire_status,
+    #                         camera_name,
+    #                         workspace_id,
+    #                         owner_id,
+    #                     )
+
+    #                 await asyncio.sleep(frame_delay_target)
+
+    #             except asyncio.CancelledError:
+    #                 break
+    #             except Exception as e:
+    #                 logger.error(f"Stream loop error {stream_id_str}: {e}", exc_info=True)
+    #                 consecutive_failures += 1
+    #                 if consecutive_failures > max_consecutive_failures:
+    #                     break
+    #                 await asyncio.sleep(1)
+
+    #     finally:
+    #         logger.info(f"Cleaning up stream {stream_id_str}")
+
+    #         if shared_stream:
+    #             await shared_stream.remove_subscriber(stream_id_str)
+
+    #         if self.stream_manager:
+    #             self.stream_manager.active_streams.pop(stream_id_str, None)
+
+    #         logger.info(f"Stream processing completed for {stream_id_str}")
+
     async def process_stream_with_sharing(
         self,
         stream_id: UUID,
@@ -1063,16 +1268,7 @@ class StreamProcessingService:
                         first_frame_received = True
                         await self.update_stream_to_active(stream_id_str)
 
-                    # ================= FAST PATH (EVERY FRAME) =================
-                    if self.stream_manager:
-                        async with self.stream_manager._lock:
-                            if stream_id_str in self.stream_manager.active_streams:
-                                self.stream_manager.active_streams[stream_id_str].update({
-                                    "latest_frame": frame,
-                                    "last_frame_time": current_time,
-                                    "last_heartbeat": current_time,
-                                })
-
+                    # ================= HEARTBEAT & STATUS UPDATES (EVERY FRAME) =================
                     # Heartbeat
                     if (current_time - last_heartbeat).total_seconds() >= 10:
                         last_heartbeat = current_time
@@ -1087,11 +1283,15 @@ class StreamProcessingService:
 
                     # ================= DETECTION GATE =================
                     run_detection = (frame_count % frame_skip == 0)
+                    
+                    # 🔥 FIX: Skip frame entirely if not running detection
+                    # Don't update stream manager with raw frames - only send processed frames
                     if not run_detection:
                         await asyncio.sleep(frame_delay_target)
-                        continue
+                        continue  # ← Skip to next frame WITHOUT updating frontend
 
                     # ================= SLOW PATH (DETECTION ONLY) =================
+                    # Only reach here when detection should run
                     (
                         annotated_frame,
                         person_count,
@@ -1108,12 +1308,15 @@ class StreamProcessingService:
                         stream_id_str,
                     )
 
-                    # ---------- UPDATE STREAM MANAGER (DETECTION RESULT) ----------
+                    # ---------- UPDATE STREAM MANAGER (DETECTION RESULT ONLY) ----------
+                    # Now we ONLY update when we have a processed/annotated frame
                     if self.stream_manager:
                         async with self.stream_manager._lock:
                             if stream_id_str in self.stream_manager.active_streams:
                                 self.stream_manager.active_streams[stream_id_str].update({
-                                    "latest_frame": annotated_frame,
+                                    "latest_frame": annotated_frame,  # ← Annotated frame only
+                                    "last_frame_time": current_time,
+                                    "last_heartbeat": current_time,
                                     "person_count": person_count,
                                     "male_count": male_count,
                                     "female_count": female_count,
