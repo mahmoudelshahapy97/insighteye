@@ -41,8 +41,8 @@ class DistributedStreamManager:
         self.is_running = False
         
         # Grace periods (longer for RTSP to handle buffering delays)
-        self.rtsp_grace_period_seconds = config.rtsp_grace_period_seconds  # 6 minutes for RTSP
-        self.file_grace_period_seconds = config.file_grace_period_seconds  # 2 minutes for files
+        self.rtsp_grace_period_seconds = config.rtsp_grace_period_seconds  
+        self.file_grace_period_seconds = config.file_grace_period_seconds  
         
         logger.info(
             f"🚀 DistributedStreamManager initialized: "
@@ -110,7 +110,7 @@ class DistributedStreamManager:
                                 OR
                                 CASE 
                                     WHEN vs.path LIKE 'rtsp://%' THEN
-                                        vs.server_heartbeat < NOW() - INTERVAL '6 minutes'
+                                        vs.server_heartbeat < NOW() - INTERVAL '5 minutes'
                                     ELSE
                                         vs.server_heartbeat < NOW() - INTERVAL '2 minutes'
                                 END
@@ -122,13 +122,13 @@ class DistributedStreamManager:
                         -- Case 3: Server alive but stream unhealthy
                         (
                             vs.locked_by_server IS NOT NULL
-                            AND vs.server_heartbeat > NOW() - INTERVAL '2 minutes'
+                            AND vs.server_heartbeat > NOW() - INTERVAL '5 minutes'
                             AND
                             CASE 
                                 WHEN vs.path LIKE 'rtsp://%' THEN
-                                    vs.last_activity < NOW() - INTERVAL '6 minutes'
+                                    vs.last_activity < NOW() - INTERVAL '5 minutes'
                                 ELSE
-                                    vs.last_activity < NOW() - INTERVAL '3 minutes'
+                                    vs.last_activity < NOW() - INTERVAL '2 minutes'
                             END
                         )
                     )
@@ -832,7 +832,7 @@ class DistributedStreamManager:
                     WHERE locked_by_server IS NOT NULL
                     AND (
                         server_heartbeat IS NULL 
-                        OR server_heartbeat < NOW() - INTERVAL '6 minutes'
+                        OR server_heartbeat < NOW() - INTERVAL '5 minutes'
                     )
                     AND is_streaming = TRUE
                     AND stop_reason NOT IN ('user_action', 'user_stop', 'manual_stop', 'admin_stop')
@@ -974,7 +974,7 @@ class DistributedStreamManager:
                 WHERE locked_by_server IS NOT NULL
                 AND (
                     server_heartbeat IS NULL 
-                    OR server_heartbeat < NOW() - INTERVAL '6 minutes'
+                    OR server_heartbeat < NOW() - INTERVAL '5 minutes'
                 )
                 AND is_streaming = TRUE
                 RETURNING stream_id, name

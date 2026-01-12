@@ -418,22 +418,6 @@ async def get_stream_thresholds(
         logger.error(f"Error getting stream thresholds: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# @router.get("stream-by-id/{stream_id}")
-# async def get_stream_by_id(
-#     stream_id: str,
-#     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-# ):
-#     """Get details for a specific stream."""
-#     try:
-#         user_id_str = str(current_user_data["user_id"])
-#         result = await camera_service.get_stream_by_id(stream_id, user_id_str)
-#         return JSONResponse(content={"status": "success", "data": result})
-#     except HTTPException as e:
-#         return JSONResponse(status_code=e.status_code, content={"status": "error", "message": e.detail})
-#     except Exception as e:
-#         logger.error(f"Error getting stream {stream_id}: {e}", exc_info=True)
-#         return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error."})
-
 @router.get("/streams")
 async def get_all_workspace_streams_endpoint(
     workspace_id: Optional[str] = Query(None, description="Specific workspace ID (optional)"),

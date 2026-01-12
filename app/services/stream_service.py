@@ -781,7 +781,7 @@ class StreamManager:
                     AND (
                         locked_by_server IS NULL 
                         OR locked_by_server = $1
-                        OR server_heartbeat < NOW() - INTERVAL '6 minutes'
+                        OR server_heartbeat < NOW() - INTERVAL '5 minutes'
                     )
                     RETURNING 
                         locked_by_server, 
@@ -1845,7 +1845,7 @@ class StreamManager:
                 # 2. Identify "Orphaned" or "Available" cameras
                 # A camera is available if:
                 # - is_streaming is TRUE AND
-                # - (locked_by_server is NULL OR server_heartbeat is older than 2 minutes)
+                # - (locked_by_server is NULL OR server_heartbeat is older than 5 minutes)
                 # - AND stop_reason is NOT user_action
                 
                 # Find how many slots I have left
@@ -1858,7 +1858,7 @@ class StreamManager:
                             SELECT stream_id FROM video_stream
                             WHERE is_streaming = TRUE
                             AND (locked_by_server IS NULL 
-                                OR server_heartbeat < NOW() - INTERVAL '6 minutes')
+                                OR server_heartbeat < NOW() - INTERVAL '5 minutes')
                             AND stop_reason NOT IN ('user_action', 'user_stop')
                             AND auto_retry_enabled = TRUE
                             LIMIT $1
@@ -1876,7 +1876,7 @@ class StreamManager:
                     #         SELECT stream_id 
                     #         FROM video_stream 
                     #         WHERE is_streaming = TRUE 
-                    #         AND (locked_by_server IS NULL OR server_heartbeat < NOW() - INTERVAL '6 minutes')
+                    #         AND (locked_by_server IS NULL OR server_heartbeat < NOW() - INTERVAL '5 minutes')
                     #         AND (stop_reason IS NULL OR stop_reason != 'user_action')
                     #         LIMIT $1
                     #         FOR UPDATE SKIP LOCKED
@@ -2476,7 +2476,7 @@ class StreamManager:
                         
                         # ✅ FIX: Different grace periods for RTSP vs files
                         # RTSP: 5 minutes before and after retry time
-                        # Files: 2 minutes before and after retry time
+                        # Files: 5 minutes before and after retry time
                         grace_before = 300 if is_rtsp else 120  # Before retry time
                         grace_after = 300 if is_rtsp else 120   # After retry time
                         
