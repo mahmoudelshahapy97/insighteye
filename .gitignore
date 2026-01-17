@@ -20,7 +20,6 @@ postgres_data/
 postgres_data/*
 insighteye/
 
-scripts/
 users_for_testing.txt
 
 # Ignore system files
