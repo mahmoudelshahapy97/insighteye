@@ -156,12 +156,12 @@ def main():
 
 def convert_all_models():
     """Convert all models in yolo_models directory"""
-    models_dir = Path("yolo_models")
+    models_dir = Path("models")
     
     models = [
-        "car_detection.pt",
-        "plate_detection.pt",
-        "character_detection.pt"
+        "fire.pt",
+        "gender.pt",
+        "people.pt"
     ]
     
     for model_name in models:
@@ -193,7 +193,7 @@ def convert_all_models():
 
 if __name__ == "__main__":
     # Uncomment to convert all models at once
-    # convert_all_models()
+    convert_all_models()
     
     # Or use command line arguments
-    main()
+    # main()
