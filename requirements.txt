@@ -7,7 +7,7 @@ opencv-python-headless==4.8.1.78
 #opencv-python==4.10.0.84
 numpy
 chromadb
-ultralytics
+ultralytics==8.4.7
 Pillow
 datetime
 uvicorn

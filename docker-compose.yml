@@ -18,6 +18,7 @@ services:
 
   app:
     build: .
+    image: insighteye_app:latest
     container_name: insighteye_app
     restart: always
     env_file:
@@ -41,7 +42,7 @@ services:
       - insighteye_network
 
   celery_worker:
-    build: .
+    image: insighteye_app:latest
     container_name: insighteye_celery_worker
     restart: always
     env_file:
@@ -55,6 +56,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      app:
+        condition: service_started
     command: >
       celery -A app.celery_app worker
       --loglevel=info
