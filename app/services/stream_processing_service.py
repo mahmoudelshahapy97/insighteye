@@ -981,211 +981,6 @@ class StreamProcessingService:
         except Exception as e:
             logger.error(f"Error handling Fire/smoke detection alert: {e}", exc_info=True)
 
-    # async def process_stream_with_sharing(
-    #     self,
-    #     stream_id: UUID,
-    #     camera_name: str,
-    #     source: str,
-    #     owner_username: str,
-    #     owner_id: UUID,
-    #     workspace_id: UUID,
-    #     stop_event: asyncio.Event,
-    #     location_info: Optional[Dict[str, Any]] = None
-    # ):
-    #     """Main stream processing loop with frame-skipped detection."""
-
-    #     frame_count = 0
-    #     frames_since_last_save = 0
-
-    #     last_db_update_activity = datetime.now(ZoneInfo("Africa/Cairo"))
-    #     last_heartbeat = datetime.now(ZoneInfo("Africa/Cairo"))
-
-    #     stream_id_str = str(stream_id)
-    #     loop = asyncio.get_event_loop()
-    #     shared_stream = None
-    #     first_frame_received = False
-
-    #     consecutive_failures = 0
-    #     max_consecutive_failures = 30
-
-    #     detection_interval = 10  # 🔥 RUN detection every N frames
-
-    #     logger.info(f"Starting stream processing for {stream_id_str} ({camera_name})")
-
-    #     try:
-    #         # -------------------- SETTINGS --------------------
-    #         threshold_settings = await self._get_camera_threshold_settings(stream_id)
-
-    #         from app.services.parameter_service import parameter_service
-    #         params = await parameter_service.get_workspace_params(workspace_id)
-
-    #         frame_skip = params.get("frame_skip", 300)
-    #         frame_delay_target = params.get("frame_delay", 0.033)
-    #         conf_threshold = params.get("conf", 0.5)
-
-    #         # -------------------- SOURCE --------------------
-    #         if not source.startswith("rtsp://"):
-    #             if not await self._validate_stream_source(source):
-    #                 raise RuntimeError(f"Invalid video source: {source}")
-
-    #         shared_stream = await self.video_file_manager.get_shared_stream(source)
-
-    #         if not await shared_stream.add_subscriber(stream_id_str):
-    #             raise RuntimeError("Failed to subscribe to shared stream")
-
-    #         # -------------------- MAIN LOOP --------------------
-    #         while not stop_event.is_set():
-    #             try:
-    #                 # ---------- WAIT FOR FRAME ----------
-    #                 if not await shared_stream.wait_for_frame(timeout=10):
-    #                     consecutive_failures += 1
-    #                     if consecutive_failures > max_consecutive_failures:
-    #                         break
-    #                     await asyncio.sleep(0.1)
-    #                     continue
-
-    #                 frame = await shared_stream.get_latest_frame(stream_id_str)
-    #                 if frame is None or frame.size == 0:
-    #                     consecutive_failures += 1
-    #                     if consecutive_failures > max_consecutive_failures:
-    #                         break
-    #                     await asyncio.sleep(0.1)
-    #                     continue
-
-    #                 consecutive_failures = 0
-    #                 frame_count += 1
-    #                 frames_since_last_save += 1
-
-    #                 current_time = datetime.now(ZoneInfo("Africa/Cairo"))
-
-    #                 # ---------- FIRST FRAME ----------
-    #                 if not first_frame_received:
-    #                     first_frame_received = True
-    #                     await self.update_stream_to_active(stream_id_str)
-
-    #                 # ================= FAST PATH (EVERY FRAME) =================
-    #                 if self.stream_manager:
-    #                     async with self.stream_manager._lock:
-    #                         if stream_id_str in self.stream_manager.active_streams:
-    #                             self.stream_manager.active_streams[stream_id_str].update({
-    #                                 "latest_frame": frame,
-    #                                 "last_frame_time": current_time,
-    #                                 "last_heartbeat": current_time,
-    #                             })
-
-    #                 # Heartbeat
-    #                 if (current_time - last_heartbeat).total_seconds() >= 10:
-    #                     last_heartbeat = current_time
-
-    #                 # DB status heartbeat (independent of detection)
-    #                 if (current_time - last_db_update_activity).total_seconds() >= 30:
-    #                     last_db_update_activity = current_time
-    #                     if self.stream_manager:
-    #                         await self.stream_manager.status_batcher.queue_update(
-    #                             stream_id, "active", True
-    #                         )
-
-    #                 # ================= DETECTION GATE =================
-    #                 run_detection = (frame_count % frame_skip == 0)
-    #                 if not run_detection:
-    #                     await asyncio.sleep(frame_delay_target)
-    #                     continue
-
-    #                 # ================= SLOW PATH (DETECTION ONLY) =================
-    #                 (
-    #                     annotated_frame,
-    #                     person_count,
-    #                     alert_triggered,
-    #                     male_count,
-    #                     female_count,
-    #                     fire_status,
-    #                 ) = await loop.run_in_executor(
-    #                     thread_pool,
-    #                     self.detect_objects_with_threshold,
-    #                     frame,
-    #                     conf_threshold,
-    #                     threshold_settings,
-    #                     stream_id_str,
-    #                 )
-
-    #                 # ---------- UPDATE STREAM MANAGER (DETECTION RESULT) ----------
-    #                 if self.stream_manager:
-    #                     async with self.stream_manager._lock:
-    #                         if stream_id_str in self.stream_manager.active_streams:
-    #                             self.stream_manager.active_streams[stream_id_str].update({
-    #                                 "latest_frame": annotated_frame,
-    #                                 "person_count": person_count,
-    #                                 "male_count": male_count,
-    #                                 "female_count": female_count,
-    #                                 "fire_status": fire_status,
-    #                             })
-
-    #                 # ---------- SAVE ----------
-    #                 should_save = (
-    #                     frames_since_last_save >= frame_skip or
-    #                     (person_count > 0 and frame_skip > 100 and frames_since_last_save >= 30)
-    #                 )
-
-    #                 if should_save:
-    #                     saved = await self._save_detection(
-    #                         stream_id_str=stream_id_str,
-    #                         camera_name=camera_name,
-    #                         owner_username=owner_username,
-    #                         person_count=person_count,
-    #                         male_count=male_count,
-    #                         female_count=female_count,
-    #                         fire_status=fire_status,
-    #                         frame=annotated_frame,
-    #                         workspace_id=workspace_id,
-    #                         location_info=location_info,
-    #                     )
-    #                     if saved:
-    #                         frames_since_last_save = 0
-
-    #                 # ---------- ALERTS ----------
-    #                 if alert_triggered and threshold_settings.get("alert_enabled"):
-    #                     await self._handle_people_count_alert(
-    #                         stream_id,
-    #                         stream_id_str,
-    #                         person_count,
-    #                         threshold_settings,
-    #                         camera_name,
-    #                         workspace_id,
-    #                         owner_id,
-    #                     )
-
-    #                 if fire_status != "no detection":
-    #                     await self._handle_fire_detection_alert(
-    #                         stream_id,
-    #                         stream_id_str,
-    #                         fire_status,
-    #                         camera_name,
-    #                         workspace_id,
-    #                         owner_id,
-    #                     )
-
-    #                 await asyncio.sleep(frame_delay_target)
-
-    #             except asyncio.CancelledError:
-    #                 break
-    #             except Exception as e:
-    #                 logger.error(f"Stream loop error {stream_id_str}: {e}", exc_info=True)
-    #                 consecutive_failures += 1
-    #                 if consecutive_failures > max_consecutive_failures:
-    #                     break
-    #                 await asyncio.sleep(1)
-
-    #     finally:
-    #         logger.info(f"Cleaning up stream {stream_id_str}")
-
-    #         if shared_stream:
-    #             await shared_stream.remove_subscriber(stream_id_str)
-
-    #         if self.stream_manager:
-    #             self.stream_manager.active_streams.pop(stream_id_str, None)
-
-    #         logger.info(f"Stream processing completed for {stream_id_str}")
-
     async def process_stream_with_sharing(
         self,
         stream_id: UUID,
@@ -1197,7 +992,14 @@ class StreamProcessingService:
         stop_event: asyncio.Event,
         location_info: Optional[Dict[str, Any]] = None
     ):
-        """Main stream processing loop with frame-skipped detection."""
+        """
+        Main stream processing loop with CRASH PROTECTION.
+        
+        CRITICAL FIXES:
+        1. Catch ALL exceptions to prevent cascade failures
+        2. Graceful degradation instead of crashing
+        3. Automatic recovery on transient errors
+        """
 
         frame_count = 0
         frames_since_last_save = 0
@@ -1210,13 +1012,22 @@ class StreamProcessingService:
         shared_stream = None
         first_frame_received = False
 
-        consecutive_failures = 0
-        max_consecutive_failures = 30
+        max_consecutive_failures = 1000  
+        # ✅ NEW: Adaptive failure thresholds
+        is_rtsp = source.startswith('rtsp://')
+        if is_rtsp:
+            max_consecutive_failures = 1000  # More lenient for RTSP
+            failure_reset_threshold = 5     # Reset counter after 5 good frames
+        else:
+            max_consecutive_failures = 30   # Strict for files
+            failure_reset_threshold = 1
 
-        detection_interval = 10  # 🔥 RUN detection every N frames
+        consecutive_failures = 0
+        consecutive_successes = 0  # ✅ NEW: Track good frames
 
         logger.info(f"Starting stream processing for {stream_id_str} ({camera_name})")
 
+        # ✅ CRITICAL: Wrap EVERYTHING in try-except to prevent crashes
         try:
             # -------------------- SETTINGS --------------------
             threshold_settings = await self._get_camera_threshold_settings(stream_id)
@@ -1241,10 +1052,18 @@ class StreamProcessingService:
             # -------------------- MAIN LOOP --------------------
             while not stop_event.is_set():
                 try:
+                    # ✅ CRITICAL: Check stop event frequently
+                    if stop_event.is_set():
+                        logger.info(f"Stop event detected for {stream_id_str}")
+                        break
+                    
                     # ---------- WAIT FOR FRAME ----------
                     if not await shared_stream.wait_for_frame(timeout=10):
                         consecutive_failures += 1
                         if consecutive_failures > max_consecutive_failures:
+                            logger.error(
+                                f"❌ {stream_id_str} exceeded max failures ({max_consecutive_failures})"
+                            )
                             break
                         await asyncio.sleep(0.1)
                         continue
@@ -1252,12 +1071,26 @@ class StreamProcessingService:
                     frame = await shared_stream.get_latest_frame(stream_id_str)
                     if frame is None or frame.size == 0:
                         consecutive_failures += 1
+                        consecutive_successes = 0  # ✅ Reset success counter
                         if consecutive_failures > max_consecutive_failures:
+                            logger.error(
+                                f"❌ {stream_id_str} exceeded max frame failures"
+                            )
                             break
                         await asyncio.sleep(0.1)
                         continue
 
                     consecutive_failures = 0
+                    consecutive_successes += 1
+
+                    # ✅ NEW: Gradually forgive old failures
+                    if consecutive_successes >= failure_reset_threshold:
+                        if consecutive_failures > 0:
+                            consecutive_failures = max(0, consecutive_failures - 1)
+                            logger.debug(
+                                f"✅ Reducing failure count for {stream_id_str}: {consecutive_failures}"
+                            )
+                            
                     frame_count += 1
                     frames_since_last_save += 1
 
@@ -1268,7 +1101,7 @@ class StreamProcessingService:
                         first_frame_received = True
                         await self.update_stream_to_active(stream_id_str)
 
-                    # ================= HEARTBEAT & STATUS UPDATES (EVERY FRAME) =================
+                    # ===== HEARTBEAT & STATUS UPDATES (EVERY FRAME) =====
                     # Heartbeat
                     if (current_time - last_heartbeat).total_seconds() >= 10:
                         last_heartbeat = current_time
@@ -1277,115 +1110,154 @@ class StreamProcessingService:
                     if (current_time - last_db_update_activity).total_seconds() >= 30:
                         last_db_update_activity = current_time
                         if self.stream_manager:
-                            await self.stream_manager.status_batcher.queue_update(
-                                stream_id, "active", True
-                            )
+                            try:
+                                await self.stream_manager.status_batcher.queue_update(
+                                    stream_id, "active", True
+                                )
+                            except Exception as batch_err:
+                                logger.error(f"Error queuing status update: {batch_err}")
 
-                    # ================= DETECTION GATE =================
+                    # ===== DETECTION GATE =====
                     run_detection = (frame_count % frame_skip == 0)
                     
-                    # 🔥 FIX: Skip frame entirely if not running detection
-                    # Don't update stream manager with raw frames - only send processed frames
+                    # Skip frame if not running detection
                     if not run_detection:
                         await asyncio.sleep(frame_delay_target)
-                        continue  # ← Skip to next frame WITHOUT updating frontend
+                        continue
 
-                    # ================= SLOW PATH (DETECTION ONLY) =================
-                    # Only reach here when detection should run
-                    (
-                        annotated_frame,
-                        person_count,
-                        alert_triggered,
-                        male_count,
-                        female_count,
-                        fire_status,
-                    ) = await loop.run_in_executor(
-                        thread_pool,
-                        self.detect_objects_with_threshold,
-                        frame,
-                        conf_threshold,
-                        threshold_settings,
-                        stream_id_str,
-                    )
+                    # ===== DETECTION (with error isolation) =====
+                    try:
+                        (
+                            annotated_frame,
+                            person_count,
+                            alert_triggered,
+                            male_count,
+                            female_count,
+                            fire_status,
+                        ) = await loop.run_in_executor(
+                            thread_pool,
+                            self.detect_objects_with_threshold,
+                            frame,
+                            conf_threshold,
+                            threshold_settings,
+                            stream_id_str,
+                        )
+                    except Exception as detection_err:
+                        logger.error(
+                            f"❌ Detection error for {stream_id_str}: {detection_err}",
+                            exc_info=True
+                        )
+                        # ✅ CRITICAL: Continue processing, don't crash
+                        await asyncio.sleep(frame_delay_target)
+                        continue
 
-                    # ---------- UPDATE STREAM MANAGER (DETECTION RESULT ONLY) ----------
-                    # Now we ONLY update when we have a processed/annotated frame
+                    # ---------- UPDATE STREAM MANAGER ----------
                     if self.stream_manager:
-                        async with self.stream_manager._lock:
-                            if stream_id_str in self.stream_manager.active_streams:
-                                self.stream_manager.active_streams[stream_id_str].update({
-                                    "latest_frame": annotated_frame,  # ← Annotated frame only
-                                    "last_frame_time": current_time,
-                                    "last_heartbeat": current_time,
-                                    "person_count": person_count,
-                                    "male_count": male_count,
-                                    "female_count": female_count,
-                                    "fire_status": fire_status,
-                                })
+                        try:
+                            async with self.stream_manager._lock:
+                                if stream_id_str in self.stream_manager.active_streams:
+                                    self.stream_manager.active_streams[stream_id_str].update({
+                                        "latest_frame": annotated_frame,
+                                        "last_frame_time": current_time,
+                                        "last_heartbeat": current_time,
+                                        "person_count": person_count,
+                                        "male_count": male_count,
+                                        "female_count": female_count,
+                                        "fire_status": fire_status,
+                                    })
+                        except Exception as update_err:
+                            logger.error(f"Error updating stream manager: {update_err}")
 
-                    # ---------- SAVE ----------
+                    # ---------- SAVE (with error isolation) ----------
                     should_save = (
                         frames_since_last_save >= frame_skip or
                         (person_count > 0 and frame_skip > 100 and frames_since_last_save >= 30)
                     )
 
                     if should_save:
-                        saved = await self._save_detection(
-                            stream_id_str=stream_id_str,
-                            camera_name=camera_name,
-                            owner_username=owner_username,
-                            person_count=person_count,
-                            male_count=male_count,
-                            female_count=female_count,
-                            fire_status=fire_status,
-                            frame=annotated_frame,
-                            workspace_id=workspace_id,
-                            location_info=location_info,
-                        )
-                        if saved:
-                            frames_since_last_save = 0
+                        try:
+                            saved = await self._save_detection(
+                                stream_id_str=stream_id_str,
+                                camera_name=camera_name,
+                                owner_username=owner_username,
+                                person_count=person_count,
+                                male_count=male_count,
+                                female_count=female_count,
+                                fire_status=fire_status,
+                                frame=annotated_frame,
+                                workspace_id=workspace_id,
+                                location_info=location_info,
+                            )
+                            if saved:
+                                frames_since_last_save = 0
+                        except Exception as save_err:
+                            logger.error(f"Error saving detection: {save_err}")
+                            # ✅ Don't crash, just log and continue
 
-                    # ---------- ALERTS ----------
-                    if alert_triggered and threshold_settings.get("alert_enabled"):
-                        await self._handle_people_count_alert(
-                            stream_id,
-                            stream_id_str,
-                            person_count,
-                            threshold_settings,
-                            camera_name,
-                            workspace_id,
-                            owner_id,
-                        )
+                    # ---------- ALERTS (with error isolation) ----------
+                    try:
+                        if alert_triggered and threshold_settings.get("alert_enabled"):
+                            await self._handle_people_count_alert(
+                                stream_id,
+                                stream_id_str,
+                                person_count,
+                                threshold_settings,
+                                camera_name,
+                                workspace_id,
+                                owner_id,
+                            )
 
-                    if fire_status != "no detection":
-                        await self._handle_fire_detection_alert(
-                            stream_id,
-                            stream_id_str,
-                            fire_status,
-                            camera_name,
-                            workspace_id,
-                            owner_id,
-                        )
+                        if fire_status != "no detection":
+                            await self._handle_fire_detection_alert(
+                                stream_id,
+                                stream_id_str,
+                                fire_status,
+                                camera_name,
+                                workspace_id,
+                                owner_id,
+                            )
+                    except Exception as alert_err:
+                        logger.error(f"Error handling alerts: {alert_err}")
+                        # ✅ Don't crash, just log and continue
 
                     await asyncio.sleep(frame_delay_target)
 
                 except asyncio.CancelledError:
+                    logger.info(f"Stream {stream_id_str} task cancelled")
                     break
-                except Exception as e:
-                    logger.error(f"Stream loop error {stream_id_str}: {e}", exc_info=True)
+                except Exception as loop_err:
+                    logger.error(
+                        f"❌ LOOP ERROR for {stream_id_str}: {loop_err}",
+                        exc_info=True
+                    )
                     consecutive_failures += 1
                     if consecutive_failures > max_consecutive_failures:
+                        logger.error(f"❌ Too many failures, stopping {stream_id_str}")
                         break
                     await asyncio.sleep(1)
 
+        except Exception as fatal_err:
+            # ✅ CRITICAL: Catch fatal errors to prevent cascade
+            logger.error(
+                f"❌ FATAL ERROR in process_stream for {stream_id_str}: {fatal_err}",
+                exc_info=True
+            )
+        
         finally:
+            # ✅ CRITICAL: ALWAYS cleanup, even on crash
             logger.info(f"Cleaning up stream {stream_id_str}")
 
-            if shared_stream:
-                await shared_stream.remove_subscriber(stream_id_str)
+            try:
+                if shared_stream:
+                    await shared_stream.remove_subscriber(stream_id_str)
+            except Exception as cleanup_err:
+                logger.error(f"Error removing subscriber: {cleanup_err}")
 
-            if self.stream_manager:
-                self.stream_manager.active_streams.pop(stream_id_str, None)
+            try:
+                if self.stream_manager:
+                    self.stream_manager.active_streams.pop(stream_id_str, None)
+            except Exception as cleanup_err:
+                logger.error(f"Error cleaning stream manager: {cleanup_err}")
 
             logger.info(f"Stream processing completed for {stream_id_str}")
 

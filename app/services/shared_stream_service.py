@@ -1,584 +1,1016 @@
 # app/services/shared_stream_service.py
-# 🔧 FIXED VERSION - Solves RTSP disconnection issues
+# 🎯 PRODUCTION-HARDENED VERSION - Fixes for 100+ camera scale
 import time
 import logging
 import asyncio
-import random
+import os
+from typing import Dict, Optional, Any, Union
+from dataclasses import dataclass, field
+from enum import Enum
+import concurrent.futures
+from datetime import datetime, timedelta
+from uuid import UUID
 import cv2
 import numpy as np
-import os
-from typing import Dict, Optional, Any
+from app.config.settings import config
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CRITICAL FIX #1: Per-stream thread pools to prevent saturation
+# ============================================================================
+class StreamThreadPool:
+    """Manages isolated thread pool per stream to prevent global saturation"""
+    _pools: Dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+    _lock = asyncio.Lock()
+    
+    @classmethod
+    async def get_pool(cls, stream_id: str) -> concurrent.futures.ThreadPoolExecutor:
+        """Get or create dedicated pool for stream (1 thread per stream)"""
+        async with cls._lock:
+            if stream_id not in cls._pools:
+                cls._pools[stream_id] = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"Stream_{stream_id[:8]}"
+                )
+            return cls._pools[stream_id]
+    
+    @classmethod
+    async def cleanup_pool(cls, stream_id: str):
+        """Clean up pool when stream stops"""
+        async with cls._lock:
+            if stream_id in cls._pools:
+                pool = cls._pools.pop(stream_id)
+                pool.shutdown(wait=False)
+
+
+class StreamState(Enum):
+    """Stream lifecycle states"""
+    IDLE = "idle"
+    CONNECTING = "connecting"
+    RUNNING = "running"
+    RECONNECTING = "reconnecting"
+    STOPPED = "stopped"
+    FAILED = "failed"
+    ZOMBIE = "zombie"  # NEW: Detected as unresponsive
+
+@dataclass
+class StreamMetrics:
+    """Stream health and performance metrics"""
+    total_frames: int = 0
+    connection_attempts: int = 0
+    consecutive_errors: int = 0
+    last_success_time: Optional[float] = None
+    last_error_time: Optional[float] = None
+    last_error: Optional[str] = None
+    state: StreamState = StreamState.IDLE
+    uptime_start: Optional[float] = None
+    
+    # NEW: Health tracking
+    last_heartbeat: Optional[float] = None
+    zombie_detected_at: Optional[float] = None
+    recovery_attempts: int = 0
+
+
+@dataclass
+class Subscriber:
+    """Subscriber information"""
+    stream_id: str
+    added_at: float = field(default_factory=time.time)
+    frames_received: int = 0
+    last_frame_time: Optional[float] = None
+    callback_info: Dict[str, Any] = field(default_factory=dict)
 
 
 class SharedVideoStream:
     """
-    FIXED: Async-based shared video stream with improved RTSP stability.
+    Production-hardened shared video stream for 100+ camera deployment.
     
-    KEY FIXES:
-    1. Increased timeouts and buffer sizes
-    2. Better frame buffer management
-    3. Smarter reconnection with exponential backoff
-    4. Connection recovery instead of full restart
-    5. Reduced aggressive error handling
+    Key improvements:
+    - Per-stream thread isolation
+    - Aggressive timeout detection
+    - Zombie state detection
+    - TCP-first RTSP strategy
+    - Enhanced health monitoring
     """
     
-    def __init__(self, source: str, max_subscribers: int = 10):
+    def __init__(
+        self,
+        source: str,
+        stream_id: str,  # Must be string
+        max_subscribers: int = 10,
+    ):
         self.source = source
-        self.subscribers: Dict[str, Dict[str, Any]] = {}
+        
+        # ✅ CRITICAL FIX: Ensure stream_id is always a string
+        if isinstance(stream_id, UUID):
+            self.stream_id = str(stream_id)
+        elif isinstance(stream_id, int):
+            # Convert integer IDs to string
+            import hashlib
+            self.stream_id = hashlib.md5(f"{source}_{stream_id}".encode()).hexdigest()
+            logger.warning(
+                f"⚠️ Received integer stream_id={stream_id}, "
+                f"converted to hash: {self.stream_id[:8]}"
+            )
+        else:
+            self.stream_id = str(stream_id)
+    
+        self.max_subscribers = max_subscribers
+        self.config = config 
+        
+        # State management
+        self.state = StreamState.IDLE
+        self.metrics = StreamMetrics()
+        
+        # Subscribers
+        self.subscribers: Dict[str, Subscriber] = {}
+        
+        # Video capture
         self.cap: Optional[cv2.VideoCapture] = None
         self.latest_frame: Optional[np.ndarray] = None
-        self.is_running = False
         
-        # Use asyncio primitives
+        # Async primitives
         self.lock = asyncio.Lock()
+        self.capture_lock = asyncio.Lock()
         self.frame_available = asyncio.Event()
-        self.max_subscribers = max_subscribers
+        self.stop_event = asyncio.Event()
+        
+        # Tasks
         self.capture_task: Optional[asyncio.Task] = None
-        self.stop_capture = asyncio.Event()
-        
-        self.last_frame_time = time.time()
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 10  # ✅ Increased from 5 to 10
-        
-        # Error tracking
-        self.frame_count = 0
-        self.last_error = None
-        self.error_count = 0
-        self.consecutive_failures = 0
-        self.last_successful_read = time.time()
+        self.health_monitor_task: Optional[asyncio.Task] = None
         
         # Source type detection
-        self.is_file_source = self._is_file_source(source)
-        self.is_rtsp_source = self._is_rtsp_source(source)
-        self.file_exists = self._validate_file_source(source) if self.is_file_source else True
-
-        # ✅ FIX #1: More lenient RTSP error handling
-        self.consecutive_decode_errors = 0
-        self.max_decode_errors = 50  # ✅ Increased from 10 to 50
-        self.last_good_frame_time = None
-
-        # ✅ FIX #2: Increased timeouts
-        self.rtsp_timeout = 60  # ✅ Increased from 15 to 60 seconds
-        self.rtsp_reconnect_delay = 5  # ✅ Increased from 2 to 5 seconds
-        self.read_timeout_seconds = 180  # ✅ New: 3 minutes before giving up
+        self.is_file = self._is_file_source(source)
+        self.is_rtsp = self._is_rtsp_source(source)
         
-        # CRITICAL: Capture lock to ensure only one read() at a time
-        self._capture_lock = asyncio.Lock()
+        # Recovery tracking
+        self._last_recovery_attempt: float = 0
+        self._last_reconnect_time: float = 0
         
-        # ✅ FIX #3: Connection recovery tracking
-        self.connection_stable_time = None
-        self.min_stable_duration = 60  # Consider connection stable after 60 seconds
-        self.last_reconnect_time = 0
-        self.min_reconnect_interval = 10  # Wait at least 10 seconds between reconnects
+        # NEW: Dedicated thread pool
+        self._thread_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
         
-        logging.info(f"Created SharedVideoStream for source: {source} "
-                    f"(file: {self.is_file_source}, rtsp: {self.is_rtsp_source})")
+        logger.info(
+            f"📹 Created SharedVideoStream: id={self.stream_id[:8]}, source={source}, "
+            f"type={'file' if self.is_file else 'rtsp' if self.is_rtsp else 'other'}"
+        )
     
-    async def add_subscriber(self, stream_id: str, callback_info: Dict[str, Any] = None) -> bool:
-        """Add a subscriber to this shared stream"""
+    # ==================== Subscriber Management ====================
+    
+    async def add_subscriber(
+        self,
+        subscriber_id: str,
+        callback_info: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Add a subscriber and start capture if needed"""
         async with self.lock:
             if len(self.subscribers) >= self.max_subscribers:
-                logging.warning(f"Max subscribers ({self.max_subscribers}) reached for {self.source}")
+                logger.warning(f"Max subscribers ({self.max_subscribers}) reached")
                 return False
-                
-            self.subscribers[stream_id] = {
-                'added_at': time.time(),
-                'frames_received': 0,
-                'last_frame_time': None,
-                'callback_info': callback_info or {}
-            }
             
-            logging.info(f"Added subscriber {stream_id} to {self.source}. Total: {len(self.subscribers)}")
+            self.subscribers[subscriber_id] = Subscriber(
+                stream_id=subscriber_id,
+                callback_info=callback_info or {}
+            )
             
-            # Start capture if first subscriber
-            if len(self.subscribers) == 1 and not self.is_running:
+            logger.info(
+                f"➕ Added subscriber {subscriber_id[:8]} to stream {self.stream_id[:8]}. "
+                f"Total: {len(self.subscribers)}"
+            )
+            
+            # Start capture if this is the first subscriber
+            if len(self.subscribers) == 1:
                 await self._start_capture()
             
             return True
     
-    async def remove_subscriber(self, stream_id: str):
-        """Remove a subscriber from this shared stream"""
+    async def remove_subscriber(self, subscriber_id: str) -> None:
+        """Remove a subscriber and stop capture if needed"""
         async with self.lock:
-            if stream_id in self.subscribers:
-                subscriber_info = self.subscribers.pop(stream_id)
-                logging.info(f"Removed subscriber {stream_id} from {self.source}. "
-                           f"Frames: {subscriber_info.get('frames_received', 0)}")
+            if subscriber_id not in self.subscribers:
+                return
             
-            # Stop capture if no subscribers
-            if not self.subscribers and self.is_running:
+            subscriber = self.subscribers.pop(subscriber_id)
+            logger.info(
+                f"➖ Removed subscriber {subscriber_id[:8]} from stream {self.stream_id[:8]}. "
+                f"Frames received: {subscriber.frames_received}"
+            )
+            
+            # Stop capture if no subscribers remain
+            if not self.subscribers:
                 await self._stop_capture()
     
-    async def get_latest_frame(self, stream_id: str) -> Optional[np.ndarray]:
-        """Get the latest frame for a specific subscriber"""
+    async def get_latest_frame(self, subscriber_id: str) -> Optional[np.ndarray]:
+        """Get the latest frame for a subscriber"""
         async with self.lock:
-            if stream_id not in self.subscribers:
+            if subscriber_id not in self.subscribers:
                 return None
-                
+            
             if self.latest_frame is not None:
-                self.subscribers[stream_id]['frames_received'] += 1
-                self.subscribers[stream_id]['last_frame_time'] = time.time()
+                subscriber = self.subscribers[subscriber_id]
+                subscriber.frames_received += 1
+                subscriber.last_frame_time = time.time()
                 return self.latest_frame.copy()
             
             return None
     
     async def wait_for_frame(self, timeout: float = 10.0) -> bool:
-        """Wait for a new frame to be available"""
+        """Wait for a new frame to become available"""
         try:
             await asyncio.wait_for(self.frame_available.wait(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
             return False
-
-    def _is_file_source(self, source: str) -> bool:
-        """Check if source is a file path"""
-        return (not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and 
-                not source.isdigit())
     
-    def _is_rtsp_source(self, source: str) -> bool:
-        """Check if source is an RTSP stream"""
-        return source.startswith('rtsp://')
+    # ==================== Capture Management ====================
     
-    def _validate_file_source(self, source: str) -> bool:
-        """Validate that file source exists"""
-        try:
-            if not os.path.exists(source):
-                logging.error(f"Video file does not exist: {source}")
-                return False
-            
-            if not os.access(source, os.R_OK):
-                logging.error(f"Video file is not readable: {source}")
-                return False
-            
-            file_size = os.path.getsize(source)
-            if file_size == 0:
-                logging.error(f"Video file is empty: {source}")
-                return False
-            
-            logging.info(f"Video file validated: {source} ({file_size} bytes)")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error validating video file {source}: {e}")
-            return False
-        
-    def _configure_rtsp_environment(self):
-        """
-        ✅ FIX #4: Enhanced RTSP configuration for stability.
-        
-        KEY IMPROVEMENTS:
-        1. Larger buffers to prevent overflow
-        2. Longer timeouts for network recovery
-        3. TCP transport for reliability
-        4. Error tolerance flags
-        """
-        if not self.is_rtsp_source:
+    async def _start_capture(self) -> None:
+        """Start the capture loop"""
+        if self.state in (StreamState.RUNNING, StreamState.CONNECTING):
             return
         
-        # Suppress FFmpeg error spam
-        os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'
+        self.state = StreamState.CONNECTING
+        self.stop_event.clear()
+        self.metrics.uptime_start = time.time()
         
-        # ✅ CRITICAL: Optimized RTSP settings for stability
-        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
-            f'rtsp_transport;tcp|'  # TCP is more reliable
-            f'timeout;{self.rtsp_timeout * 1000000}|'  # 60 seconds
-            f'stimeout;{self.rtsp_timeout * 1000000}|'
-            f'max_delay;5000000|'  # ✅ Increased to 5 seconds
-            f'buffer_size;2048000|'  # ✅ 2MB buffer (was implicit)
-            f'reorder_queue_size;0|'
-            f'fflags;+genpts+igndts+discardcorrupt|'  # ✅ Added discardcorrupt
-            f'flags;+low_delay|'
-            f'analyzeduration;5000000|'  # ✅ Increased to 5 seconds
-            f'probesize;5000000|'  # ✅ 5MB probe
-            f'err_detect;ignore_err'  # ✅ NEW: Ignore minor errors
-        )
+        # Get dedicated thread pool
+        self._thread_pool = await StreamThreadPool.get_pool(self.stream_id)
         
-        # Single-threaded FFmpeg
-        os.environ['OPENCV_FFMPEG_THREAD_COUNT'] = '1'
+        self.capture_task = asyncio.create_task(self._capture_loop())
+        self.capture_task.set_name(f"capture_{self.stream_id[:8]}")
         
-        logger.info(f"✅ Enhanced RTSP config: timeout={self.rtsp_timeout}s, buffer=2MB")
+        # NEW: Start health monitor
+        self.health_monitor_task = asyncio.create_task(self._health_monitor_loop())
+        self.health_monitor_task.set_name(f"health_{self.stream_id[:8]}")
+        
+        logger.info(f"▶️ Started capture task for {self.stream_id[:8]}")
     
-    async def get_stats(self) -> Dict[str, Any]:
-        """Get statistics"""
-        async with self.lock:
-            return {
-                'source': self.source,
-                'subscriber_count': len(self.subscribers),
-                'is_running': self.is_running,
-                'frame_count': self.frame_count,
-                'last_frame_time': self.last_frame_time,
-                'reconnect_attempts': self.reconnect_attempts,
-                'last_error': self.last_error,
-                'error_count': self.error_count,
-                'connection_stable': self.connection_stable_time is not None,
-                'subscribers': {
-                    stream_id: {
-                        'frames_received': info['frames_received'],
-                        'last_frame_time': info['last_frame_time']
-                    }
-                    for stream_id, info in self.subscribers.items()
-                }
-            }
-
-    async def _safe_release_capture(self):
-        """Safely release VideoCapture with proper error handling."""
-        if self.cap is None:
+    async def _stop_capture(self) -> None:
+        """Stop the capture loop gracefully"""
+        if self.state == StreamState.STOPPED:
             return
         
-        try:
-            async with self._capture_lock:
-                if self.cap is not None:
-                    try:
-                        if self.cap.isOpened():
-                            loop = asyncio.get_event_loop()
-                            await loop.run_in_executor(None, self.cap.release)
-                            logging.debug(f"✓ Released VideoCapture for {self.source}")
-                        else:
-                            logging.debug(f"VideoCapture already closed for {self.source}")
-                    except Exception as e:
-                        logging.warning(f"Error during cap.release() for {self.source}: {e}")
-                    finally:
-                        self.cap = None
-        except Exception as e:
-            logging.error(f"Error in _safe_release_capture for {self.source}: {e}")
-            self.cap = None
-    
-    async def _stop_capture(self):
-        """Stop the video capture task with safe cleanup."""
-        if not self.is_running:
-            return
+        logger.info(f"⏹️ Stopping capture for {self.stream_id[:8]}")
         
-        logging.info(f"Stopping capture for {self.source}")
-        self.is_running = False
-        self.stop_capture.set()
+        self.state = StreamState.STOPPED
+        self.stop_event.set()
+        
+        # Stop health monitor
+        if self.health_monitor_task and not self.health_monitor_task.done():
+            self.health_monitor_task.cancel()
+            try:
+                await asyncio.wait_for(self.health_monitor_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
         
         # Release capture to unblock read()
         await self._safe_release_capture()
         
-        # Wait for task with timeout
+        # Wait for task to complete
         if self.capture_task and not self.capture_task.done():
-            timeout = 10.0 if self.is_rtsp_source else 5.0
-            
-            logging.debug(f"Waiting for capture task (timeout: {timeout}s)")
             self.capture_task.cancel()
-            
             try:
+                timeout = 10.0 if self.is_rtsp else 5.0
                 await asyncio.wait_for(self.capture_task, timeout=timeout)
-            except asyncio.TimeoutError:
-                logging.warning(f"⚠️ Capture task for {self.source} did not stop within {timeout}s.")
-            except asyncio.CancelledError:
+            except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
         
         self.capture_task = None
-        logging.info(f"✓ Stopped capture for {self.source}")
+        
+        # Cleanup thread pool
+        await StreamThreadPool.cleanup_pool(self.stream_id)
+        self._thread_pool = None
+        
+        logger.info(f"✅ Capture stopped for {self.stream_id[:8]}")
     
-    async def _capture_loop(self):
+    # ==================== NEW: Health Monitoring ====================
+
+    async def _health_monitor_loop(self) -> None:
         """
-        ✅ FIX #5: Improved capture loop with better error recovery.
+        Monitor stream health and detect zombie states.
         
-        FIXES:
-        1. Connection recovery before full restart
-        2. Longer timeouts before giving up
-        3. Exponential backoff for reconnections
-        4. Buffer flush on errors
+        ✅ FIXED: 
+        - 10-minute timeout for RTSP cameras (not 20 seconds)
+        - 5-minute startup grace period for RTSP
+        - Prevents premature zombie detection during buffering
         """
-        logging.info(f"Capture loop started for {self.source}")
+        logger.info(f"🏥 Health monitor started for {self.stream_id[:8]}")
         
-        # Configure RTSP if needed
-        if self.is_rtsp_source:
-            self._configure_rtsp_environment()
+        # ✅ Determine timeout based on stream type
+        is_rtsp = self.is_rtsp
         
-        loop = asyncio.get_event_loop()
+        # CRITICAL: Different timeouts for startup vs running
+        startup_grace_period = 300.0 if is_rtsp else 60.0  # 5 min for RTSP startup
+        running_zombie_timeout = 600.0 if is_rtsp else 120.0  # 10 min RTSP, 2 min files
         
-        # Get video info
-        video_fps = None
-        if self.is_file_source:
-            try:
-                test_cap = cv2.VideoCapture(self.source)
-                if test_cap.isOpened():
-                    video_fps = test_cap.get(cv2.CAP_PROP_FPS)
-                    total_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    logging.info(f"Video: {total_frames} frames, {video_fps:.1f} FPS")
-                test_cap.release()
-            except Exception as e:
-                logging.warning(f"Could not get video info: {e}")
+        logger.info(
+            f"🏥 Health monitor: {'RTSP' if is_rtsp else 'FILE'} stream, "
+            f"startup_grace={startup_grace_period}s, "
+            f"running_timeout={running_zombie_timeout}s"
+        )
         
-        last_successful_read = time.time()
+        startup_time = time.time()
+        first_frame_received = False
         
         try:
-            while not self.stop_capture.is_set() and self.is_running:
-                try:
-                    # Check stop signal
-                    if self.stop_capture.is_set() or not self.is_running:
-                        logging.info(f"Stop signal received for {self.source}")
-                        break
+            while not self.stop_event.is_set():
+                await asyncio.sleep(30.0)  # Check every 30 seconds
+                
+                if self.state not in (StreamState.RUNNING, StreamState.CONNECTING):
+                    continue
+                
+                now = time.time()
+                
+                # Check if we've received ANY frames
+                if self.metrics.last_success_time:
+                    if not first_frame_received:
+                        first_frame_received = True
+                        logger.info(
+                            f"✅ {self.stream_id[:8]} received first frame "
+                            f"after {now - startup_time:.1f}s"
+                        )
                     
-                    # Open video source if needed
-                    if self.cap is None or not self.cap.isOpened():
-                        if not await self._open_video_source_async():
-                            # ✅ FIX #6: Exponential backoff for reconnection
-                            base_delay = self.rtsp_reconnect_delay if self.is_rtsp_source else 2.0
-                            backoff_delay = min(30.0, base_delay * (1.5 ** (self.reconnect_attempts - 1)))
-                            
-                            logging.warning(
-                                f"Failed to open {self.source}, retry in {backoff_delay:.1f}s "
-                                f"(attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})"
-                            )
-                            
-                            try:
-                                await asyncio.wait_for(
-                                    self.stop_capture.wait(), 
-                                    timeout=backoff_delay
-                                )
-                                break
-                            except asyncio.TimeoutError:
-                                pass
-                            
-                            self.reconnect_attempts += 1
-                            
-                            # ✅ FIX #7: Give up after max attempts
-                            if self.reconnect_attempts >= self.max_reconnect_attempts:
-                                logging.error(f"Max reconnect attempts reached for {self.source}")
-                                break
-                            
-                            continue
+                    time_since_frame = now - self.metrics.last_success_time
                     
-                    # ✅ FIX #8: Try connection recovery before full restart
-                    if self.is_rtsp_source and self.consecutive_failures > 5:
-                        if await self._try_connection_recovery():
-                            logging.info(f"✅ Connection recovered for {self.source}")
-                            self.consecutive_failures = 0
-                            last_successful_read = time.time()
-                            continue
-                    
-                    # Thread-safe read
-                    frame_read_successful = False
-                    ret = False
-                    frame = None
-                    
-                    async with self._capture_lock:
-                        if (not self.stop_capture.is_set() and 
-                            self.is_running and 
-                            self.cap is not None and
-                            self.cap.isOpened()):
-                            
-                            try:
-                                ret, frame = await loop.run_in_executor(None, self.cap.read)
-                                frame_read_successful = True
-                            except Exception as read_error:
-                                logging.error(f"Exception during cap.read(): {read_error}")
-                                ret = False
-                                frame = None
-                    
-                    if self.stop_capture.is_set() or not self.is_running:
-                        break
-                    
-                    if not frame_read_successful or not ret or frame is None:
-                        self._handle_read_failure()
+                    # ✅ Use running timeout (since we've received frames before)
+                    if time_since_frame > running_zombie_timeout:
+                        logger.error(
+                            f"☠️ ZOMBIE DETECTED for {self.stream_id[:8]}: "
+                            f"No frames for {time_since_frame:.0f}s "
+                            f"(timeout: {running_zombie_timeout}s, type: {'RTSP' if is_rtsp else 'FILE'})"
+                        )
+                        self.state = StreamState.ZOMBIE
+                        self.metrics.zombie_detected_at = now
                         
-                        # ✅ FIX #9: Increased timeout from 30s to 180s
-                        if self.is_rtsp_source:
-                            time_since_success = time.time() - last_successful_read
-                            if time_since_success > self.read_timeout_seconds:
-                                logging.error(
-                                    f"No frames for {time_since_success:.1f}s "
-                                    f"(timeout: {self.read_timeout_seconds}s)"
-                                )
-                                break
+                        # Trigger emergency stop and cleanup
+                        await self._emergency_cleanup()
+                        break
                         
-                        continue
-                    
-                    # Validate frame
-                    if frame.size == 0 or len(frame.shape) != 3:
-                        logging.warning(f"Invalid frame from {self.source}")
-                        self._handle_read_failure()
-                        continue
-                    
-                    # ✅ Successfully read frame
-                    last_successful_read = time.time()
-                    self.reconnect_attempts = 0
-                    self.consecutive_failures = 0
-                    self.frame_count += 1
-                    self.last_frame_time = time.time()
-                    self.last_successful_read = time.time()
-                    
-                    # Track connection stability
-                    if self.connection_stable_time is None:
-                        self.connection_stable_time = time.time()
-                    
-                    # Update latest frame
-                    async with self.lock:
-                        self.latest_frame = frame
-                        self.frame_available.set()
-                        self.frame_available.clear()
-                    
-                    # Frame rate control
-                    if self.is_rtsp_source:
-                        sleep_time = 0.01
-                    elif self.is_file_source and video_fps and video_fps > 0:
-                        target_fps = min(video_fps, 30.0)
-                        sleep_time = 1.0 / target_fps
-                    else:
-                        sleep_time = 0.033
-                    
-                    if sleep_time > 0:
+                    elif time_since_frame > running_zombie_timeout * 0.5:
+                        # ✅ PROACTIVE: Trigger reconnection at 50% threshold
+                        logger.warning(
+                            f"⚠️ Stream {self.stream_id[:8]} stagnant for {time_since_frame:.0f}s "
+                            f"({running_zombie_timeout * 0.5:.0f}s threshold) - triggering proactive recovery"
+                        )
+                        # Try full reconnection to prevent zombie state
                         try:
-                            await asyncio.wait_for(
-                                self.stop_capture.wait(),
-                                timeout=sleep_time
-                            )
-                            break
-                        except asyncio.TimeoutError:
-                            pass
+                            if await self._force_full_reconnection():
+                                logger.info(f"✅ Proactive recovery successful for {self.stream_id[:8]}")
+                            else:
+                                logger.warning(f"⚠️ Proactive recovery failed for {self.stream_id[:8]}")
+                        except Exception as e:
+                            logger.error(f"💥 Proactive recovery error for {self.stream_id[:8]}: {e}")
+                else:
+                    # ✅ NO FRAMES YET - Check startup grace period
+                    time_since_startup = now - startup_time
                     
-                except asyncio.CancelledError:
-                    logging.info(f"Capture task cancelled for {self.source}")
-                    break
-                except Exception as e:
-                    self.last_error = str(e)
-                    self.error_count += 1
-                    self.consecutive_failures += 1
-                    logging.error(f"Error in capture loop: {e}")
-                    
-                    max_failures = 20 if self.is_rtsp_source else 20  # Same for all
-                    if self.consecutive_failures > max_failures:
-                        logging.error(f"Too many failures ({self.consecutive_failures}), stopping")
+                    if time_since_startup > startup_grace_period:
+                        logger.error(
+                            f"☠️ STARTUP TIMEOUT for {self.stream_id[:8]}: "
+                            f"No frames after {time_since_startup:.0f}s "
+                            f"(grace period: {startup_grace_period}s)"
+                        )
+                        self.state = StreamState.ZOMBIE
+                        self.metrics.zombie_detected_at = now
+                        
+                        await self._emergency_cleanup()
                         break
+                        
+                    elif time_since_startup > startup_grace_period * 0.7:
+                        # Warn at 70% of grace period
+                        logger.warning(
+                            f"⏳ Stream {self.stream_id[:8]} still buffering: "
+                            f"{time_since_startup:.0f}s / {startup_grace_period}s grace period"
+                        )
+                
+                # Update heartbeat
+                self.metrics.last_heartbeat = now
+        
+        except asyncio.CancelledError:
+            logger.info(f"🏥 Health monitor cancelled for {self.stream_id[:8]}")
+        except Exception as e:
+            logger.error(f"💥 Health monitor error for {self.stream_id[:8]}: {e}")
+
+
+    async def _emergency_cleanup(self) -> None:
+        """Emergency cleanup when zombie state detected"""
+        logger.warning(f"🚨 Emergency cleanup for {self.stream_id[:8]}")
+        
+        try:
+            # Force release capture
+            await self._safe_release_capture()
+            
+            # Cancel capture task
+            if self.capture_task and not self.capture_task.done():
+                self.capture_task.cancel()
+            
+            self.state = StreamState.FAILED
+            self.metrics.last_error = "Zombie state - no frames received"
+        
+        except Exception as e:
+            logger.error(f"💥 Emergency cleanup error: {e}")
+    
+    # ==================== Capture Loop ====================
+    
+    async def _capture_loop(self) -> None:
+        """Main capture loop with robust error handling"""
+        logger.info(f"🎬 Capture loop started for {self.stream_id[:8]}")
+        
+        loop = asyncio.get_event_loop()
+        frame_interval = 1.0 / self.config.target_fps
+        last_frame_time = 0.0
+        last_success_time = time.time()
+        
+        try:
+            while not self.stop_event.is_set():
+                # FPS throttling
+                now = time.time()
+                if now - last_frame_time < frame_interval:
+                    await asyncio.sleep(0.01)
+                    continue
+                last_frame_time = now
+                
+                # Ensure video source is open
+                if not await self._ensure_video_source():
+                    delay = self._calculate_backoff_delay()
+                    logger.warning(
+                        f"⏳ Stream {self.stream_id[:8]}: Waiting {delay:.1f}s before retry "
+                        f"(attempt {self.metrics.connection_attempts})"
+                    )
                     
                     try:
-                        await asyncio.wait_for(self.stop_capture.wait(), timeout=1.0)
+                        await asyncio.wait_for(
+                            self.stop_event.wait(),
+                            timeout=delay
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+                    
+                    continue
+                
+                # Check timeout for RTSP
+                if self.is_rtsp:
+                    elapsed = time.time() - last_success_time
+                    if elapsed > self.config.max_read_timeout:
+                        logger.error(
+                            f"❌ Stream {self.stream_id[:8]}: Read timeout "
+                            f"({elapsed:.0f}s > {self.config.max_read_timeout:.0f}s)"
+                        )
+                        
+                        # Try recovery before giving up
+                        if self.metrics.recovery_attempts < 3:
+                            if await self._try_connection_recovery():
+                                last_success_time = time.time()
+                                continue
+                        
+                        # FORCE RECONNECTION instead of breaking
+                        # This prevents the stream from entering zombie state
+                        logger.warning(
+                            f"♻️ Stream {self.stream_id[:8]}: Forcing reconnection after read timeout"
+                        )
+                        await self._safe_release_capture()
+                        continue
+                
+                # Read frame
+                ret, frame = await self._read_frame_safe()
+                
+                if self.stop_event.is_set():
+                    break
+                
+                # Handle read failure
+                if not ret or frame is None or frame.size == 0:
+                    await self._handle_read_failure()
+                    continue
+                
+                # Validate frame
+                if not self._validate_frame(frame):
+                    await self._handle_read_failure()
+                    continue
+                
+                # Successfully read frame
+                await self._process_successful_frame(frame)
+                last_success_time = time.time()
+                
+                # Adaptive sleep
+                sleep_time = self._calculate_sleep_time()
+                if sleep_time > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self.stop_event.wait(),
+                            timeout=sleep_time
+                        )
                         break
                     except asyncio.TimeoutError:
                         pass
         
+        except asyncio.CancelledError:
+            logger.info(f"🛑 Capture task cancelled for {self.stream_id[:8]}")
         except Exception as e:
-            logging.error(f"Fatal error in capture loop: {e}", exc_info=True)
-        
+            logger.error(
+                f"💥 Fatal error in capture loop for {self.stream_id[:8]}: {e}",
+                exc_info=True
+            )
+            self.state = StreamState.FAILED
+            self.metrics.last_error = str(e)
         finally:
-            logging.info(f"Capture loop cleanup starting for {self.source}")
             await self._safe_release_capture()
-            self.is_running = False
-            self.connection_stable_time = None
-            logging.info(f"✓ Capture loop ended for {self.source}")
+            logger.info(
+                f"📊 Capture ended for {self.stream_id[:8]}: "
+                f"frames={self.metrics.total_frames}, "
+                f"attempts={self.metrics.connection_attempts}"
+            )
     
-    async def _try_connection_recovery(self) -> bool:
-        """
-        ✅ FIX #10: Try to recover connection without full restart.
-        
-        This is faster than creating a new connection and avoids
-        hitting NVR connection limits.
-        """
-        try:
-            if self.cap is None or not self.cap.isOpened():
-                return False
-            
-            logging.info(f"🔧 Attempting connection recovery for {self.source}")
-            
-            # Get event loop
-            loop = asyncio.get_event_loop()
-            
-            # Step 1: Flush buffer
-            async with self._capture_lock:
-                if self.cap is not None and self.cap.isOpened():
-                    # Clear buffer by setting buffer size to 1
-                    try:
-                        await loop.run_in_executor(
-                            None,
-                            self.cap.set,
-                            cv2.CAP_PROP_BUFFERSIZE,
-                            1
-                        )
-                    except:
-                        pass
-                    
-                    # Read and discard buffered frames
-                    for _ in range(10):
-                        try:
-                            await loop.run_in_executor(None, self.cap.read)
-                        except:
-                            break
-                    
-                    # Test read
-                    try:
-                        ret, test_frame = await loop.run_in_executor(None, self.cap.read)
-                        if ret and test_frame is not None and test_frame.size > 0:
-                            logging.info(f"✅ Connection recovery successful for {self.source}")
-                            return True
-                    except:
-                        pass
-            
-            return False
-            
-        except Exception as e:
-            logging.error(f"Error during connection recovery: {e}")
-            return False
+    # ==================== Frame Reading ====================
     
-    def _handle_read_failure(self):
-        """Handle read failures with improved logic."""
-        self.consecutive_failures += 1
-        
-        # Video looping for files
-        if self.is_file_source and self.cap is not None:
+    async def _read_frame_safe(self) -> tuple[bool, Optional[np.ndarray]]:
+        """Thread-safe frame reading with dedicated pool"""
+        async with self.capture_lock:
+            if (self.stop_event.is_set() or
+                self.cap is None or
+                not self.cap.isOpened() or
+                self._thread_pool is None):
+                return False, None
+            
             try:
-                if self.cap is not None and self.cap.isOpened():
-                    current_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-                    total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    
-                    if total_frames > 0 and current_pos >= total_frames - 1:
-                        logging.info(f"End of video, looping: {self.source}")
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, test_frame = self.cap.read()
+                loop = asyncio.get_event_loop()
+                # Use dedicated thread pool instead of global
+                ret, frame = await loop.run_in_executor(
+                    self._thread_pool,
+                    self.cap.read
+                )
+                return ret, frame
+            except Exception as e:
+                logger.error(f"Exception during read for {self.stream_id[:8]}: {e}")
+                return False, None
+    
+    def _validate_frame(self, frame: np.ndarray) -> bool:
+        """Validate frame integrity"""
+        if frame is None or frame.size == 0:
+            return False
+        if len(frame.shape) != 3:
+            return False
+        if frame.shape[0] < 10 or frame.shape[1] < 10:  # Minimum size check
+            return False
+        return True
+    
+    async def _process_successful_frame(self, frame: np.ndarray) -> None:
+        """Process a successfully read frame"""
+        # Reset error counters
+        self.metrics.consecutive_errors = 0
+        self.metrics.total_frames += 1
+        self.metrics.last_success_time = time.time()
+        self.state = StreamState.RUNNING
+        
+        # Resize if needed
+        if frame.shape[1] > self.config.max_frame_width:
+            h, w = frame.shape[:2]
+            new_w = self.config.max_frame_width
+            new_h = int(h * (new_w / w))
+            frame = cv2.resize(frame, (new_w, new_h))
+        
+        # Update latest frame
+        async with self.lock:
+            self.latest_frame = frame
+            self.frame_available.set()
+            self.frame_available.clear()
+        
+        # Log progress periodically
+        if self.metrics.total_frames % 100 == 0:
+            logger.debug(
+                f"📊 Stream {self.stream_id[:8]}: {self.metrics.total_frames} frames"
+            )
+    
+    async def _handle_read_failure(self) -> None:
+        """Handle frame read failure with 3-tier recovery strategy"""
+        self.metrics.consecutive_errors += 1
+        self.metrics.last_error_time = time.time()
+        
+        # ✅ TIER 3: EMERGENCY - Hit max errors, force stop and restart
+        if self.metrics.consecutive_errors >= self.config.max_consecutive_errors:
+            logger.error(
+                f"❌ Stream {self.stream_id[:8]}: Max consecutive errors reached "
+                f"({self.metrics.consecutive_errors}). FORCING EMERGENCY RESTART."
+            )
+            self.state = StreamState.FAILED
+            self.metrics.last_error = f"Max consecutive errors ({self.metrics.consecutive_errors})"
+            
+            # Force full reconnection
+            await self._safe_release_capture()
+            
+            # Reset error counter to allow restart
+            self.metrics.consecutive_errors = 0
+            self.metrics.recovery_attempts = 0
+            
+            # Wait before retry
+            await asyncio.sleep(5.0)
+            return
+        
+        # File looping
+        if self.is_file and self.cap is not None:
+            try:
+                async with self.capture_lock:
+                    if self.cap and self.cap.isOpened():
+                        current = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
                         
-                        if ret and test_frame is not None:
-                            logging.info(f"Successfully looped video")
-                            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            self.consecutive_failures = 0
-                            self.reconnect_attempts = 0
+                        if total > 0 and current >= total - 1:
+                            logger.info(f"🔁 Looping video {self.stream_id[:8]}")
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(
+                                self._thread_pool,
+                                self.cap.set,
+                                cv2.CAP_PROP_POS_FRAMES,
+                                0
+                            )
+                            self.metrics.consecutive_errors = 0
                             return
             except Exception as e:
-                logging.warning(f"Error handling video loop: {e}")
+                logger.warning(f"Error during loop for {self.stream_id[:8]}: {e}")
         
-        # ✅ FIX #11: Less aggressive for RTSP
-        elif self.is_rtsp_source:
-            # Don't increment reconnect_attempts here - let the main loop handle it
-            # Just log the failure
-            if self.consecutive_failures % 10 == 0:  # Log every 10 failures
-                logging.warning(
-                    f"RTSP read failures: {self.consecutive_failures} consecutive "
-                    f"(will keep trying for {self.read_timeout_seconds}s total)"
+        # RTSP 3-tier recovery strategy
+        if self.is_rtsp:
+            # Log every 10 errors
+            if self.metrics.consecutive_errors % 10 == 0:
+                logger.warning(
+                    f"⚠️ Stream {self.stream_id[:8]}: "
+                    f"{self.metrics.consecutive_errors} consecutive errors"
                 )
-            return
+            
+            # ✅ TIER 1: LIGHT RECOVERY (10-30 errors) - Buffer flush only
+            if (self.metrics.consecutive_errors % 10 == 0 and
+                self.metrics.consecutive_errors < 30):
+                if await self._try_connection_recovery():
+                    logger.info(f"✅ Tier 1 recovery successful for {self.stream_id[:8]}")
+                    self.metrics.consecutive_errors = 0
+                    return
+            
+            # ✅ TIER 2: MEDIUM RECOVERY (30-70 errors) - Full reconnection
+            elif (self.metrics.consecutive_errors >= 30 and 
+                  self.metrics.consecutive_errors < 70 and
+                  self.metrics.consecutive_errors % 10 == 0):
+                logger.warning(
+                    f"🔄 Stream {self.stream_id[:8]}: Tier 2 - Forcing full reconnection "
+                    f"({self.metrics.consecutive_errors} errors)"
+                )
+                if await self._force_full_reconnection():
+                    logger.info(f"✅ Tier 2 reconnection successful for {self.stream_id[:8]}")
+                    self.metrics.consecutive_errors = 0
+                    return
+            
+            # ✅ TIER 3: HEAVY RECOVERY (70+ errors) - Emergency restart with backoff
+            elif self.metrics.consecutive_errors >= 70:
+                if self.metrics.consecutive_errors % 20 == 0:
+                    logger.error(
+                        f"🚨 Stream {self.stream_id[:8]}: Tier 3 - Emergency restart "
+                        f"({self.metrics.consecutive_errors} errors)"
+                    )
+                    await self._safe_release_capture()
+                    # Longer backoff for severe failures
+                    await asyncio.sleep(10.0)
+                    return
+            
+            # Progressive delay
+            delay = min(1.0, 0.05 * (1.3 ** (self.metrics.consecutive_errors // 5)))
+            await asyncio.sleep(delay)
+        else:
+            await asyncio.sleep(0.1)
+    
+    # ==================== Connection Management ====================
+    
+    def _open_rtsp_source(self) -> bool:
+        """Open RTSP source with TCP-first strategy"""
+        self.metrics.connection_attempts += 1
         
-        # Generic handling for other sources
-        self.reconnect_attempts += 1
+        # Rate limiting
+        current_time = time.time()
+        if self._last_reconnect_time > 0:
+            elapsed = current_time - self._last_reconnect_time
+            if elapsed < self.config.min_reconnect_interval:
+                wait = self.config.min_reconnect_interval - elapsed
+                logger.info(
+                    f"⏰ Rate limiting stream {self.stream_id[:8]}: waiting {wait:.1f}s"
+                )
+                time.sleep(wait)
         
-        if self.reconnect_attempts >= self.max_reconnect_attempts:
-            logging.error(f"Max reconnect attempts reached for {self.source}")
-            self.is_running = False
-            return
+        self._last_reconnect_time = time.time()
         
-        # Exponential backoff
-        base_delay = 1.0 if self.is_file_source else 2.0
-        max_delay = 5.0 if self.is_file_source else 30.0
-        
-        delay = min(max_delay, base_delay * (1.5 ** (self.reconnect_attempts - 1)))
-        jitter = random.uniform(0.1, 0.5)
-        total_delay = delay + jitter
-        
-        logging.warning(
-            f"Read failure, will retry in {total_delay:.1f}s "
-            f"(attempt {self.reconnect_attempts}/{self.max_reconnect_attempts})"
+        logger.info(
+            f"🔌 Opening RTSP for {self.stream_id[:8]} "
+            f"(attempt #{self.metrics.connection_attempts})"
         )
         
-        time.sleep(total_delay)
+        # ============================================================================
+        # CRITICAL FIX #2: Use transport from config (TCP by default)
+        # ============================================================================
+        transport = "tcp" if self.config.prefer_tcp else "udp"
+        
+        try:
+            # Build RTSP options string
+            rtsp_options = (
+                f"rtsp_transport;{transport}|"
+                f"timeout;{self.config.rtsp_timeout * 1000000}|"
+                f"stimeout;{self.config.rtsp_timeout * 1000000}|"
+                f"max_delay;500000|"
+                f"buffer_size;1048576|"
+                f"reorder_queue_size;0|"
+                f"fflags;+nobuffer+discardcorrupt|"
+                f"flags;+low_delay|"
+                f"analyzeduration;1000000|"
+                f"probesize;500000"
+            )
+            
+            # Set environment for THIS capture only
+            # (Note: This is still global but we set it right before opening)
+            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = rtsp_options
+            
+            self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        except Exception as e:
+            logger.error(f"Failed to create VideoCapture for {self.stream_id[:8]}: {e}")
+            return False
+        
+        if not self.cap or not self.cap.isOpened():
+            logger.error(f"Failed to open RTSP stream {self.stream_id[:8]}")
+            if self.cap:
+                try:
+                    self.cap.release()
+                except:
+                    pass
+                self.cap = None
+            return False
+        
+        # Set properties
+        try:
+            timeout_ms = self.config.rtsp_timeout * 1000
+            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
+            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config.buffer_size)
+        except Exception as e:
+            logger.warning(f"Could not set properties for {self.stream_id[:8]}: {e}")
+        
+        # Test reads - REDUCED to 3 attempts for faster failure
+        for attempt in range(3):
+            try:
+                ret, frame = self.cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    logger.info(
+                        f"✅ RTSP connected for {self.stream_id[:8]}: "
+                        f"{frame.shape[1]}x{frame.shape[0]} via {transport.upper()}"
+                    )
+                    return True
+                logger.warning(
+                    f"Test read {attempt + 1} failed for {self.stream_id[:8]}"
+                )
+                time.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"Test read exception for {self.stream_id[:8]}: {e}")
+                time.sleep(0.5)
+        
+        logger.error(
+            f"❌ RTSP opened but cannot read frames for {self.stream_id[:8]}"
+        )
+        try:
+            self.cap.release()
+        except:
+            pass
         self.cap = None
+        return False
     
-    def _open_video_source(self) -> bool:
+    async def _try_connection_recovery(self) -> bool:
+        """Try to recover connection without full restart"""
+        current_time = time.time()
+        
+        # Rate limit recovery attempts
+        if current_time - self._last_recovery_attempt < self.config.recovery_interval:
+            return False
+        
+        self._last_recovery_attempt = current_time
+        self.metrics.recovery_attempts += 1
+        
+        logger.info(f"🔧 Attempting connection recovery for {self.stream_id[:8]}")
+        
+        loop = asyncio.get_event_loop()
+        
+        try:
+            async with self.capture_lock:
+                if not self.cap or not self.cap.isOpened():
+                    return False
+                
+                # Flush buffer
+                try:
+                    await loop.run_in_executor(
+                        self._thread_pool,
+                        self.cap.set,
+                        cv2.CAP_PROP_BUFFERSIZE,
+                        1
+                    )
+                except:
+                    pass
+                
+                # Discard buffered frames
+                for _ in range(5):
+                    try:
+                        await loop.run_in_executor(self._thread_pool, self.cap.read)
+                    except:
+                        break
+                
+                # Test read
+                ret, frame = await loop.run_in_executor(
+                    self._thread_pool,
+                    self.cap.read
+                )
+                if ret and frame is not None and frame.size > 0:
+                    logger.info(f"✅ Recovery successful for {self.stream_id[:8]}")
+                    self.metrics.consecutive_errors = 0
+                    self.metrics.last_success_time = time.time()
+                    return True
+            
+            return False
+        
+        except Exception as e:
+            logger.error(f"Recovery error for {self.stream_id[:8]}: {e}")
+            return False
+    
+    async def _force_full_reconnection(self) -> bool:
         """
-        Open video source with improved error handling.
-        SYNCHRONOUS version for use in blocking context.
+        Force full reconnection by releasing and reopening the RTSP stream.
+        This is stronger than buffer flushing and used for Tier 2 recovery.
         """
+        logger.info(f"🔄 Forcing full reconnection for {self.stream_id[:8]}")
+        
+        try:
+            # Release current connection
+            await self._safe_release_capture()
+            
+            # Wait a moment for cleanup
+            await asyncio.sleep(2.0)
+            
+            # Try to reopen
+            loop = asyncio.get_event_loop()
+            success = await loop.run_in_executor(
+                self._thread_pool,
+                self._open_video_source_sync
+            )
+            
+            if success:
+                logger.info(f"✅ Full reconnection successful for {self.stream_id[:8]}")
+                self.metrics.consecutive_errors = 0
+                self.metrics.last_success_time = time.time()
+                self.metrics.recovery_attempts = 0
+                return True
+            else:
+                logger.warning(f"⚠️ Full reconnection failed for {self.stream_id[:8]}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"💥 Full reconnection error for {self.stream_id[:8]}: {e}")
+            return False
+    
+    async def _safe_release_capture(self) -> None:
+        """Safely release video capture"""
+        if self.cap is None:
+            return
+        
+        try:
+            async with self.capture_lock:
+                if self.cap is not None:
+                    try:
+                        if self.cap.isOpened():
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(
+                                self._thread_pool,
+                                self.cap.release
+                            )
+                            logger.debug(f"✓ Released capture for {self.stream_id[:8]}")
+                    except Exception as e:
+                        logger.warning(
+                            f"Error releasing capture for {self.stream_id[:8]}: {e}"
+                        )
+                    finally:
+                        self.cap = None
+        except Exception as e:
+            logger.error(f"Error in safe release for {self.stream_id[:8]}: {e}")
+            self.cap = None
+    
+    # ==================== Utility Methods ====================
+    
+    def _calculate_backoff_delay(self) -> float:
+        """Calculate exponential backoff delay"""
+        return min(
+            self.config.max_backoff_delay,
+            self.config.min_backoff_delay * (
+                self.config.backoff_multiplier ** (self.metrics.connection_attempts - 1)
+            )
+        )
+    
+    def _calculate_sleep_time(self) -> float:
+        """Calculate adaptive sleep time based on source type"""
+        if self.is_rtsp:
+            return 0.01
+        
+        if self.is_file and self.cap:
+            try:
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                if fps > 0:
+                    return 1.0 / min(fps, 30.0)
+            except:
+                pass
+        
+        return 0.033  # ~30 FPS default
+    
+    def _is_file_source(self, source: str) -> bool:
+        """Check if source is a file"""
+        return (not source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')) and
+                not source.isdigit())
+    
+    def _is_rtsp_source(self, source: str) -> bool:
+        """Check if source is RTSP"""
+        return source.startswith('rtsp://')
+    
+    def _validate_file(self) -> bool:
+        """Validate file source"""
+        if not os.path.exists(self.source):
+            logger.error(f"File does not exist: {self.source}")
+            return False
+        
+        if not os.access(self.source, os.R_OK):
+            logger.error(f"File not readable: {self.source}")
+            return False
+        
+        if os.path.getsize(self.source) == 0:
+            logger.error(f"File is empty: {self.source}")
+            return False
+        
+        return True
+    
+    def _configure_rtsp_environment(self) -> None:
+        """Configure RTSP environment variables"""
+        os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'
+        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
+            f'rtsp_transport;udp|'
+            f'timeout;{self.config.rtsp_timeout * 1000000}|'
+            f'stimeout;{self.config.rtsp_timeout * 1000000}|'
+            f'max_delay;1000000|'
+            f'buffer_size;2097152|'
+            f'reorder_queue_size;0|'
+            f'fflags;+genpts+igndts+discardcorrupt+nobuffer|'
+            f'flags;+low_delay|'
+            f'analyzeduration;1000000|'
+            f'probesize;1000000|'
+            f'err_detect;ignore_err'
+        )
+        os.environ['OPENCV_FFMPEG_THREAD_COUNT'] = '1'
+    
+    async def get_stats(self) -> Dict[str, Any]:
+        """Get comprehensive statistics"""
+        async with self.lock:
+            return {
+                'source': self.source,
+                'state': self.state.value,
+                'subscriber_count': len(self.subscribers),
+                'metrics': {
+                    'total_frames': self.metrics.total_frames,
+                    'connection_attempts': self.metrics.connection_attempts,
+                    'consecutive_errors': self.metrics.consecutive_errors,
+                    'last_success': self.metrics.last_success_time,
+                    'last_error': self.metrics.last_error,
+                    'uptime': time.time() - self.metrics.uptime_start if self.metrics.uptime_start else 0
+                },
+                'subscribers': {
+                    sub.stream_id: {
+                        'frames_received': sub.frames_received,
+                        'last_frame_time': sub.last_frame_time
+                    }
+                    for sub in self.subscribers.values()
+                }
+            }
+
+    async def _ensure_video_source(self) -> bool:
+        """
+        Ensure video source is open and ready.
+        
+        ✅ CRITICAL: This method must be defined BEFORE _capture_loop() calls it
+        """
+        if self.cap is not None and self.cap.isOpened():
+            return True
+        
+        return await self._open_video_source_async()
+
+    async def _open_video_source_async(self) -> bool:
+        """Open video source asynchronously"""
+        loop = asyncio.get_event_loop()
+        try:
+            return await loop.run_in_executor(
+                self._thread_pool,
+                self._open_video_source_sync
+            )
+        except Exception as e:
+            logger.error(f"Error opening source for {self.stream_id[:8]}: {e}")
+            return False
+
+    def _open_video_source_sync(self) -> bool:
+        """Synchronous video source opening (runs in executor)"""
         try:
             # Clean up existing capture
             if self.cap is not None:
@@ -589,269 +1021,179 @@ class SharedVideoStream:
                     pass
                 self.cap = None
             
-            # Small delay
             time.sleep(0.2)
             
-            # Validate file source
-            if self.is_file_source:
-                if not self._validate_file_source(self.source):
-                    return False
+            # File validation
+            if self.is_file and not self._validate_file():
+                return False
             
-            # ✅ RTSP opening with enhanced settings
-            if self.is_rtsp_source:
-                # ✅ FIX #12: Rate limit reconnection attempts
-                current_time = time.time()
-                if current_time - self.last_reconnect_time < self.min_reconnect_interval:
-                    wait_time = self.min_reconnect_interval - (current_time - self.last_reconnect_time)
-                    logging.info(f"Rate limiting: waiting {wait_time:.1f}s before reconnect")
-                    time.sleep(wait_time)
-                
-                self.last_reconnect_time = time.time()
-                
-                logging.info(f"Opening RTSP stream: {self.source}")
-                self._configure_rtsp_environment()
-                
-                try:
-                    self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
-                except Exception as e:
-                    logging.error(f"Failed to create VideoCapture: {e}")
-                    self.cap = None
-                    return False
-                
-                if self.cap is None or not self.cap.isOpened():
-                    logging.error(f"Failed to open RTSP: {self.source}")
-                    if self.cap is not None:
-                        try:
-                            self.cap.release()
-                        except:
-                            pass
-                    self.cap = None
-                    return False
-                
-                # Set properties
-                try:
-                    self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.rtsp_timeout * 1000)
-                    self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.rtsp_timeout * 1000)
-                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer
-                except Exception as e:
-                    logging.warning(f"Could not set RTSP properties: {e}")
-                
-                # ✅ FIX #13: Multiple test reads to ensure stability
-                test_success = False
-                for attempt in range(3):
-                    try:
-                        ret, test_frame = self.cap.read()
-                        if ret and test_frame is not None and test_frame.size > 0:
-                            test_success = True
-                            break
-                        time.sleep(0.5)
-                    except Exception as e:
-                        logging.warning(f"Test read attempt {attempt + 1} failed: {e}")
-                        time.sleep(0.5)
-                
-                if not test_success:
-                    logging.error(f"RTSP opened but cannot read frames after 3 attempts")
-                    try:
-                        self.cap.release()
-                    except:
-                        pass
-                    self.cap = None
-                    return False
-                
-                width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                fps = self.cap.get(cv2.CAP_PROP_FPS)
-                
-                logging.info(f"✓ RTSP connected: {width}x{height} @ {fps}fps")
-                
-                # Reset connection tracking
-                self.connection_stable_time = time.time()
-                
-                return True
+            # RTSP opening
+            if self.is_rtsp:
+                return self._open_rtsp_source()
             
             # File opening
-            backends = [cv2.CAP_FFMPEG, cv2.CAP_ANY]
-            
-            for backend in backends:
+            return self._open_file_source()
+        
+        except Exception as e:
+            logger.error(
+                f"Critical error opening source for {self.stream_id[:8]}: {e}",
+                exc_info=True
+            )
+            if self.cap is not None:
                 try:
-                    logging.info(f"Trying backend {backend} for {self.source}")
-                    
-                    try:
-                        self.cap = cv2.VideoCapture(self.source, backend)
-                    except Exception as e:
-                        logging.warning(f"Failed to create VideoCapture with backend {backend}: {e}")
-                        self.cap = None
-                        continue
-                    
-                    if self.cap is None or not self.cap.isOpened():
-                        if self.cap is not None:
-                            try:
-                                self.cap.release()
-                            except:
-                                pass
-                        self.cap = None
-                        continue
-                    
-                    try:
-                        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    except Exception as e:
-                        logging.warning(f"Could not set buffer size: {e}")
-                    
-                    # Test read
-                    try:
-                        ret, test_frame = self.cap.read()
-                    except Exception as e:
-                        logging.warning(f"Test read failed with backend {backend}: {e}")
-                        ret = False
-                        test_frame = None
-                    
-                    if not ret or test_frame is None:
-                        logging.warning(f"Backend {backend} cannot read")
-                        try:
-                            self.cap.release()
-                        except:
-                            pass
-                        self.cap = None
-                        continue
-                    
-                    # Reset for files
-                    if self.is_file_source:
-                        try:
-                            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        except Exception as e:
-                            logging.warning(f"Could not reset frame position: {e}")
-                    
-                    logging.info(f"Successfully opened with backend {backend}")
-                    return True
-                    
-                except Exception as e:
-                    logging.warning(f"Backend {backend} failed: {e}")
-                    if self.cap is not None:
+                    self.cap.release()
+                except:
+                    pass
+                self.cap = None
+            return False
+
+    def _open_file_source(self) -> bool:
+        """Open file source with backend fallback"""
+        backends = [cv2.CAP_FFMPEG, cv2.CAP_ANY]
+        
+        for backend in backends:
+            try:
+                self.cap = cv2.VideoCapture(self.source, backend)
+                
+                if not self.cap or not self.cap.isOpened():
+                    if self.cap:
                         try:
                             self.cap.release()
                         except:
                             pass
                     self.cap = None
                     continue
+                
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config.buffer_size)
+                
+                # Test read
+                ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                    self.cap = None
+                    continue
+                
+                # Reset to start
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                
+                logger.info(
+                    f"✅ Opened file {self.stream_id[:8]} with backend {backend}"
+                )
+                return True
             
-            logging.error(f"All backends failed for {self.source}")
-            return False
-            
-        except Exception as e:
-            logging.error(f"Critical error opening {self.source}: {e}", exc_info=True)
-            if self.cap is not None:
-                try:
-                    self.cap.release()
-                except:
-                    pass
-            self.cap = None
-            return False
-    
-    async def _open_video_source_async(self) -> bool:
-        """
-        Open video source asynchronously without blocking event loop.
-        CRITICAL: Runs in thread pool to prevent blocking other cameras.
-        """
-        loop = asyncio.get_event_loop()
+            except Exception as e:
+                logger.warning(
+                    f"Backend {backend} failed for {self.stream_id[:8]}: {e}"
+                )
+                if self.cap:
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                    self.cap = None
         
-        # Run blocking _open_video_source in executor
-        try:
-            return await loop.run_in_executor(None, self._open_video_source)
-        except Exception as e:
-            logging.error(f"Error in async open: {e}")
-            return False
-
-    async def _start_capture(self):
-        """Start the video capture task"""
-        if self.is_running:
-            return
-            
-        self.is_running = True
-        self.stop_capture.clear()
-        self.capture_task = asyncio.create_task(self._capture_loop())
-        self.capture_task.set_name(f"capture_{self.source}")
-        logging.info(f"Started capture task for {self.source}")
-
-    def __del__(self):
-        """
-        Destructor to ensure cleanup on object deletion.
-        FIXED: Safe cleanup when object is garbage collected.
-        """
-        try:
-            if hasattr(self, 'is_running') and self.is_running:
-                # Can't await in __del__, so we just set flags
-                self.is_running = False
-                if hasattr(self, 'stop_capture'):
-                    self.stop_capture.set()
-        except Exception as e:
-            logging.debug(f"Error in __del__ for {self.source}: {e}")
-
+        return False
+        
 
 class VideoFileManager:
-    """Manages shared video streams to prevent file conflicts"""
+    """Manages shared video streams"""
     
     def __init__(self):
         self.shared_streams: Dict[str, SharedVideoStream] = {}
         self.lock = asyncio.Lock()
     
-    async def get_shared_stream(self, source: str, max_subscribers: int = 10) -> SharedVideoStream:
-        """Get or create a shared stream for a source"""
+    async def get_shared_stream(
+        self,
+        source: str,
+        stream_id: Optional[Union[str, UUID, int]] = None,  # ✅ Accept multiple types
+        max_subscribers: int = 10,
+    ) -> SharedVideoStream:
+        """
+        Get or create a shared stream.
+        
+        ✅ CRITICAL FIX: Properly handle stream_id of any type
+        """
         async with self.lock:
             if source not in self.shared_streams:
-                self.shared_streams[source] = SharedVideoStream(source, max_subscribers)
+                # Generate or normalize stream_id
+                if stream_id is None:
+                    import hashlib
+                    stream_id_str = hashlib.md5(source.encode()).hexdigest()
+                elif isinstance(stream_id, UUID):
+                    stream_id_str = str(stream_id)
+                elif isinstance(stream_id, int):
+                    # ✅ FIX: Convert integer to string hash
+                    import hashlib
+                    stream_id_str = hashlib.md5(f"{source}_{stream_id}".encode()).hexdigest()
+                else:
+                    stream_id_str = str(stream_id)
+                
+                logger.info(
+                    f"🔨 Creating shared stream: source={source}, "
+                    f"stream_id={stream_id_str[:8]} (from {type(stream_id).__name__})"
+                )
+                
+                self.shared_streams[source] = SharedVideoStream(
+                    source=source,
+                    stream_id=stream_id_str,  # ✅ Always pass string
+                    max_subscribers=max_subscribers
+                )
             return self.shared_streams[source]
     
-    async def remove_shared_stream(self, source: str):
+    async def remove_shared_stream(self, source: str) -> None:
         """Remove a shared stream"""
         async with self.lock:
             if source in self.shared_streams:
-                shared_stream = self.shared_streams[source]
-                if shared_stream.is_running:
-                    await shared_stream._stop_capture()
+                stream = self.shared_streams[source]
+                if stream.state in (StreamState.RUNNING, StreamState.CONNECTING):
+                    await stream._stop_capture()
                 del self.shared_streams[source]
-                logging.info(f"Removed shared stream for {source}")
+                logger.info(f"Removed shared stream: {source}")
     
-    async def cleanup_empty_streams(self):
+    async def cleanup_empty_streams(self) -> None:
         """Clean up streams with no subscribers"""
         async with self.lock:
-            empty_sources = []
-            for source, stream in self.shared_streams.items():
-                if not stream.subscribers:
-                    empty_sources.append(source)
+            empty = [
+                source for source, stream in self.shared_streams.items()
+                if not stream.subscribers
+            ]
             
-            for source in empty_sources:
+            for source in empty:
                 await self.remove_shared_stream(source)
     
     async def get_all_stats(self) -> Dict[str, Any]:
-        """Get statistics for all shared streams"""
+        """Get statistics for all streams"""
         async with self.lock:
-            stats = {}
-            for source, stream in self.shared_streams.items():
-                stats[source] = await stream.get_stats()
-            return stats
-
-    async def force_restart_shared_stream(self, source_path: str) -> bool:
-        """Force restart a shared stream"""
+            return {
+                source: await stream.get_stats()
+                for source, stream in self.shared_streams.items()
+            }
+    
+    async def force_restart_stream(self, source: str) -> bool:
+        """Force restart a stream"""
         try:
             async with self.lock:
-                if source_path in self.shared_streams:
-                    shared_stream = self.shared_streams[source_path]
-                    
-                    affected_stream_ids = list(shared_stream.subscribers.keys())
-                    
-                    await shared_stream._stop_capture()
-                    
-                    await asyncio.sleep(5.0)
-                    
-                    logging.info(
-                        f"Force restarted shared stream for {source_path}. "
-                        f"Affected streams: {affected_stream_ids}"
-                    )
-                    return True
-            
-            return False
+                if source not in self.shared_streams:
+                    return False
+                
+                stream = self.shared_streams[source]
+                affected_ids = list(stream.subscribers.keys())
+                
+                await stream._stop_capture()
+                await asyncio.sleep(2.0)
+                
+                # Subscribers will trigger restart when they request frames
+                logger.info(
+                    f"🔄 Restarted stream: {source}, "
+                    f"affected subscribers: {affected_ids}"
+                )
+                return True
+        
         except Exception as e:
-            logging.error(f"Error force restarting shared stream {source_path}: {e}", exc_info=True)
+            logger.error(f"Error restarting stream: {e}", exc_info=True)
             return False
 
 

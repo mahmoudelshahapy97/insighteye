@@ -4,10 +4,31 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from dotenv import load_dotenv
 import uuid
-from typing import ClassVar
+import platform
+import socket
 from uuid import UUID
+from hashlib import sha256
 
 load_dotenv()
+
+def generate_deterministic_server_id() -> UUID:
+    """
+    Generate a deterministic server ID based on system information.
+    This ensures the same ID is used across container restarts.
+    """
+    # Gather system information
+    hostname = socket.gethostname()
+    system = platform.system()
+    node = platform.node()
+    machine = platform.machine()
+    
+    # Create a unique string from system info
+    unique_string = f"{hostname}-{system}-{node}-{machine}"
+    
+    # Generate a deterministic UUID from the hash
+    hash_digest = sha256(unique_string.encode()).hexdigest()
+    # Use first 32 characters of hash to create UUID
+    return UUID(hash_digest[:32])
 
 class Settings(BaseSettings):
     """
@@ -25,15 +46,15 @@ class Settings(BaseSettings):
         # extra="ignore",
     )
 
-    # Generate a unique ID for this specific server instance
-    server_id: UUID = Field(default_factory=uuid.uuid4)
-    # server_id: ClassVar[UUID] = uuid.uuid4()
+    # Generate a deterministic ID for this server instance based on system info
+    server_id: UUID = Field(default_factory=generate_deterministic_server_id)
 
     # capacity 
-    max_local_streams: int = 8
+    max_local_streams: int = 100
 
     # Grace periods (adjust based on your RTSP cameras)
-    rtsp_grace_period_seconds: int = 300  # 5 minutes
+    zombie_detection_timeout_seconds: int = 600  # 10 minutes for RTSP
+    rtsp_grace_period_seconds: int = 600  # 10 minutes
     file_grace_period_seconds: int = 120  # 2 minute
 
     # =============================================================================
@@ -240,13 +261,13 @@ class Settings(BaseSettings):
 
     stream_db_update_interval: float = 10.0
     stream_db_activity_update_interval: float = 5.0
-    stream_stale_threshold_seconds: float = 120.0
+    stream_stale_threshold_seconds: float = 600.0
     stream_stop_timeout_seconds: float = 10.0
-    stream_manager_poll_interval_seconds: float = 30.0
+    stream_manager_poll_interval_seconds: float = 60.0  # 1 minute
     stream_manager_restart_delay_seconds: float = 15.0
 
     stream_cleanup_interval_seconds: int = 60
-    stream_healthcheck_interval_seconds: int = 120
+    stream_healthcheck_interval_seconds: int = 300  # 5 minutes (was 2-3 min)
     stream_start_stagger_delay: float = 2.0
 
     stream_ws_start_wait_attempts: int = 10
@@ -254,15 +275,48 @@ class Settings(BaseSettings):
     websocket_receive_timeout: float = 60.0
     websocket_ping_interval: float = 60.0
 
+    # Per-camera resource limits
+    max_read_retries_per_camera: int = 200  # Max retries before giving up
+    read_retry_delay_base: float = 0.1      # Base delay between retries
+    read_retry_delay_max: float = 2.0       # Max delay between retries
+    camera_health_check_interval: int = 30  # Seconds between health checks
+
+    # Multi-camera load balancing
+    enable_camera_load_balancing: bool = True
+    max_simultaneous_camera_starts: int = 3  # Start cameras in batches
+    camera_start_delay: float = 2.0          # Delay between camera starts
+
     # =============================================================================
     # RTSP
     # =============================================================================
     rtsp_transport: Literal["tcp", "udp"] = "tcp"
     rtsp_timeout: int = 30
     rtsp_connection_timeout: int = 30
-    rtsp_read_timeout: int = 30
+    rtsp_read_timeout: int = 180
     rtsp_reconnect_attempts: int = 10
     rtsp_buffer_size: int = 1
+    max_reconnect_attempts: int = 5
+    min_reconnect_interval: float = 3.0
+    
+    # Frame processing
+    target_fps: float = 15.0
+    max_frame_width: int = 640
+    buffer_size: int = 1
+
+    # ✅ OPTIMIZED: Aggressive error handling for RTSP stability
+    max_consecutive_errors: int = 100      # Down from 1000 - force recovery faster
+    max_read_timeout: float = 120.0        # Down from 180s - detect failures faster
+    recovery_interval: float = 60.0        # Up from 5s - prevent recovery spam
+    connection_health_timeout: float = 300.0  # Down from 600s - 5 min health check
+
+    # Backoff settings
+    min_backoff_delay: float = 1.0
+    max_backoff_delay: float = 15.0
+    backoff_multiplier: float = 1.5
+    
+    # Transport settings
+    prefer_tcp: bool = True
+    use_hw_accel: bool = False
 
     # =============================================================================
     # VIDEO / STREAM PERFORMANCE
@@ -292,7 +346,7 @@ class Settings(BaseSettings):
     max_shared_streams: int = 50
     max_streams_per_file: int = 50
     shared_stream_buffer_size: int = 3
-    shared_stream_timeout_seconds: int = 30
+    shared_stream_timeout_seconds: int = 600
     shared_stream_max_fps: int = 30
     shared_stream_memory_limit_mb: int = 100
 
@@ -353,7 +407,7 @@ class Settings(BaseSettings):
     celery_task_acks_late: bool = True
     celery_task_reject_on_worker_lost: bool = True
     celery_result_expires: int = 86400  # 24 hours
-    celery_task_time_limit: int =3600  # Max task duration (seconds)
+    celery_task_time_limit: int = 3600  # Max task duration (seconds)
     
     def get_celery_broker_url(self) -> str:
         """Get Celery broker URL."""

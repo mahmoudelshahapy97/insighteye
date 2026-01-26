@@ -641,11 +641,7 @@ class StreamManager:
         """
         🎬 Start stream with GUARANTEED server lock.
         
-        CRITICAL CHANGES:
-        1. Claim lock BEFORE starting processing
-        2. Verify lock was actually set
-        3. Release lock on failure
-        4. Add extensive logging
+        FIXED: Prevents infinite restart loops
         """
         stream_id_str = str(stream_id)
         workspace_id_str = str(workspace_id)
@@ -664,28 +660,79 @@ class StreamManager:
         
         async with self._safe_stream_operation(stream_id_str, "start"):
             async with self._lock:
-                # Check if already healthy
+                # ✅ FIX: Check if already ACTUALLY healthy (not just in memory)
                 if stream_id_str in self.active_streams:
                     stream_info = self.active_streams[stream_id_str]
                     task = stream_info.get('task')
                     latest_frame = stream_info.get('latest_frame')
                     last_frame_time = stream_info.get('last_frame_time')
                     
+                    # ✅ CRITICAL: Only consider healthy if:
+                    # 1. Task is alive
+                    # 2. Received frames recently (within 30s)
+                    # 3. Status is ACTIVE
                     is_healthy = False
-                    if last_frame_time:
+                    if last_frame_time and latest_frame is not None:
                         age = (datetime.now(ZoneInfo("Africa/Cairo")) - last_frame_time).total_seconds()
-                        is_healthy = age < 30 and latest_frame is not None
+                        is_healthy = age < 30
                     
                     task_alive = task and not task.done()
                     current_state = self.stream_states.get(stream_id_str)
                     
                     if current_state == StreamState.ACTIVE and is_healthy and task_alive:
-                        logger.info(f"✅ {stream_id_str} already healthy")
+                        logger.info(f"✅ {stream_id_str} already healthy on THIS server")
                         return
-                    else:
-                        logger.warning(f"🔧 {stream_id_str} unhealthy, restarting")
-                        await self._stop_stream(stream_id_str, for_restart=True)
-                        await asyncio.sleep(1.0)
+                    
+                    # ✅ FIX: If unhealthy, verify we still own the lock BEFORE restarting
+                    verify_lock_query = """
+                        SELECT locked_by_server, is_streaming, status
+                        FROM video_stream
+                        WHERE stream_id = $1
+                    """
+                    lock_check = await self.db_manager.execute_query(
+                        verify_lock_query,
+                        (stream_id,),
+                        fetch_one=True
+                    )
+                    
+                    if not lock_check:
+                        logger.error(f"❌ {stream_id_str} disappeared from database")
+                        await self._stop_stream(stream_id_str, for_restart=False)
+                        return
+                    
+                    server_id = config.server_id
+                    if lock_check['locked_by_server'] != str(server_id):
+                        logger.warning(
+                            f"⚠️ {stream_id_str} lock stolen by {lock_check['locked_by_server']}, "
+                            f"aborting restart"
+                        )
+                        await self._stop_stream(stream_id_str, for_restart=False)
+                        return
+                    
+                    if not lock_check['is_streaming']:
+                        logger.warning(
+                            f"⚠️ {stream_id_str} has is_streaming=FALSE, aborting restart"
+                        )
+                        await self._stop_stream(stream_id_str, for_restart=False)
+                        return
+                    
+                    # ✅ We verified we still own the lock, safe to restart
+                    logger.warning(f"🔧 {stream_id_str} unhealthy but lock verified, restarting")
+                    await self._stop_stream(stream_id_str, for_restart=True)
+                    await asyncio.sleep(2.0)  # Longer sleep for cleanup
+                    
+                    # ✅ CRITICAL: Re-verify lock after sleep
+                    lock_recheck = await self.db_manager.execute_query(
+                        verify_lock_query,
+                        (stream_id,),
+                        fetch_one=True
+                    )
+                    
+                    if not lock_recheck or lock_recheck['locked_by_server'] != str(server_id):
+                        logger.error(
+                            f"❌ {stream_id_str} lock lost during restart, aborting"
+                        )
+                        return
                 
                 # Transition to STARTING
                 await self._transition_stream_state(stream_id_str, StreamState.STARTING)
@@ -729,7 +776,12 @@ class StreamManager:
                 
                 # First, check current lock state
                 check_query = """
-                    SELECT locked_by_server, server_heartbeat, is_streaming, status
+                    SELECT 
+                        locked_by_server, 
+                        server_heartbeat, 
+                        is_streaming, 
+                        status,
+                        name
                     FROM video_stream
                     WHERE stream_id = $1
                 """
@@ -748,17 +800,35 @@ class StreamManager:
                         f"status={current_state['status']}"
                     )
                     
-                    # If locked by another server, fail fast
-                    if (current_state['locked_by_server'] is not None and 
-                        str(current_state['locked_by_server']) != str(server_id)):
-                        logger.error(
-                            f"❌ Camera already locked by server "
-                            f"{current_state['locked_by_server']}"
-                        )
-                        raise RuntimeError(
-                            f"Camera locked by another server: "
-                            f"{current_state['locked_by_server']}"
-                        )
+                    # ✅ Check if locked by another ACTIVE server
+                    if current_state['locked_by_server'] is not None:
+                        locked_by_server = str(current_state['locked_by_server'])
+                        
+                        if locked_by_server != str(server_id):
+                            server_heartbeat = current_state.get('server_heartbeat')
+                            
+                            if server_heartbeat:
+                                heartbeat_age = (
+                                    datetime.now(ZoneInfo("Africa/Cairo")) - server_heartbeat
+                                ).total_seconds()
+                                
+                                # If other server is alive (heartbeat < 5 minutes)
+                                if heartbeat_age < 300:
+                                    logger.warning(
+                                        f"⚠️ Camera {camera_name} running on ACTIVE server "
+                                        f"{locked_by_server} (heartbeat {heartbeat_age:.0f}s ago). "
+                                        f"Marking as running elsewhere."
+                                    )
+                                    
+                                    async with self._lock:
+                                        if stream_id_str in self.active_streams:
+                                            self.active_streams[stream_id_str].update({
+                                                'status': 'running_on_other_server',
+                                                'locked_by_server': locked_by_server,
+                                                'note': f'Running on server {locked_by_server}'
+                                            })
+                                    
+                                    return
                 
                 # Attempt to claim lock
                 claim_query = """
@@ -797,18 +867,22 @@ class StreamManager:
                 )
                 
                 if not result:
-                    logger.error(
-                        f"❌ LOCK CLAIM FAILED: stream={stream_id_str}, "
-                        f"server={server_id} (query returned no rows)"
+                    logger.warning(
+                        f"⚠️ LOCK CLAIM FAILED: stream={stream_id_str}, "
+                        f"server={server_id} (locked by active server)"
                     )
-                    raise RuntimeError(
-                        "Failed to claim lock - another server may have claimed it"
-                    )
+                    
+                    async with self._lock:
+                        if stream_id_str in self.active_streams:
+                            self.active_streams[stream_id_str].update({
+                                'status': 'running_on_other_server',
+                                'note': 'Camera is active on another server'
+                            })
+                    
+                    return
                 
                 # ==================== STEP 2: VERIFY LOCK ====================
-                logger.info(
-                    f"🔍 VERIFYING LOCK: stream={stream_id_str}"
-                )
+                logger.info(f"🔍 VERIFYING LOCK: stream={stream_id_str}")
                 
                 verify_query = """
                     SELECT locked_by_server, server_heartbeat, is_streaming
@@ -920,7 +994,6 @@ class StreamManager:
                 )
                 
                 # ==================== CLEANUP ON FAILURE ====================
-                # Remove from memory
                 async with self._lock:
                     self.active_streams.pop(stream_id_str, None)
                     self.workspace_streams[workspace_id_str].discard(stream_id_str)
@@ -931,9 +1004,7 @@ class StreamManager:
                 
                 await self._transition_stream_state(stream_id_str, StreamState.ERROR, force=True)
                 
-                # Release lock in database
-                logger.info(f"🗑️ Releasing lock due to failure: {stream_id_str}")
-                
+                # Only release lock if we actually claimed it
                 release_query = """
                     UPDATE video_stream
                     SET 
@@ -959,7 +1030,7 @@ class StreamManager:
                     )
                 
                 raise
-                
+
     async def _handle_stream_task_completion(self, stream_id_str: str, task: asyncio.Task):
         """
         Handle stream task completion with proper cleanup.
@@ -1820,7 +1891,7 @@ class StreamManager:
         5. Verifies streams are actually processing before considering them "active"
         """
         consecutive_errors = 0
-        max_consecutive_errors = 5
+        max_consecutive_errors = 1000  
         zombie_check_counter = 0
         stuck_cleanup_counter = 0
 
@@ -2133,47 +2204,51 @@ class StreamManager:
                         )
                         consecutive_errors += 1
 
-                # ==================== STEP 5: Execute Start Tasks ====================
+                    
                 if start_tasks:
-                    logger.info(f"🚀 Starting {len(start_tasks)} cameras in PARALLEL...")
+                    logger.info(f"🚀 Starting {len(start_tasks)} cameras...")
                     
-                    # CRITICAL FIX: Start ALL cameras at once using asyncio.gather
-                    batch_coros = [task for _, task in start_tasks]
-                    
-                    # Start all cameras simultaneously
-                    results = await asyncio.gather(
-                        *batch_coros, 
-                        return_exceptions=True
-                    )
-                    
-                    # Log results
-                    for idx, (stream_id, result) in enumerate(zip([sid for sid, _ in start_tasks], results)):
-                        if isinstance(result, Exception):
-                            logger.error(f"❌ Failed to start {stream_id}: {result}")
+                    # ✅ NEW: Stagger camera starts to prevent network overload
+                    if config.enable_camera_load_balancing and len(start_tasks) > config.max_simultaneous_camera_starts:
+                        logger.info(
+                            f"⚠️ Staggering {len(start_tasks)} camera starts "
+                            f"(max simultaneous: {config.max_simultaneous_camera_starts})"
+                        )
+                        
+                        # Start cameras in batches
+                        for i in range(0, len(start_tasks), config.max_simultaneous_camera_starts):
+                            batch = start_tasks[i:i + config.max_simultaneous_camera_starts]
+                            batch_coros = [task for _, task in batch]
                             
-                            # Determine error type
-                            if isinstance(result, ConnectionError):
-                                stop_reason = 'connection_error'
-                            elif isinstance(result, TimeoutError):
-                                stop_reason = 'timeout'
+                            logger.info(
+                                f"🚀 Starting batch {i // config.max_simultaneous_camera_starts + 1}: "
+                                f"{len(batch)} cameras"
+                            )
+                            
+                            results = await asyncio.gather(*batch_coros, return_exceptions=True)
+                            
+                            # Log batch results
+                            for idx, (stream_id, result) in enumerate(zip([sid for sid, _ in batch], results)):
+                                if isinstance(result, Exception):
+                                    logger.error(f"❌ Batch failed: {stream_id}: {result}")
+                                else:
+                                    logger.info(f"✅ Batch success: {stream_id}")
+                            
+                            # Delay before next batch
+                            if i + config.max_simultaneous_camera_starts < len(start_tasks):
+                                await asyncio.sleep(config.camera_start_delay)
+                                logger.info(f"⏳ Waiting {config.camera_start_delay}s before next batch...")
+                    else:
+                        # Start all at once (original behavior)
+                        batch_coros = [task for _, task in start_tasks]
+                        results = await asyncio.gather(*batch_coros, return_exceptions=True)
+                        
+                        for idx, (stream_id, result) in enumerate(zip([sid for sid, _ in start_tasks], results)):
+                            if isinstance(result, Exception):
+                                logger.error(f"❌ Failed to start {stream_id}: {result}")
                             else:
-                                stop_reason = 'system_error'
-                            
-                            # # Record failure (retry_service will pick it up)
-                            # try:
-                            #     await self.video_stream_service.record_camera_stop(
-                            #         stream_id=stream_id,
-                            #         stop_reason=stop_reason,
-                            #         stopped_by=None,
-                            #         additional_context=str(result)
-                            #     )
-                            # except Exception as record_err:
-                            #     logger.error(f"Error recording stop for {stream_id}: {record_err}")
-                        else:
-                            logger.info(f"✅ Successfully started {stream_id}")
-                else:
-                    logger.info("✅ No cameras need starting")
-                    
+                                logger.info(f"✅ Successfully started {stream_id}")
+
                 # ==================== STEP 6: Cleanup ====================
                 # Cleanup empty shared streams
                 await self.video_file_manager.cleanup_empty_streams()
@@ -2465,6 +2540,18 @@ class StreamManager:
                     
                     # ===== FIX: Enhanced retry window detection =====
                     is_rtsp = db_stream_state.get('path', '').startswith('rtsp://')
+                    # ✅ FIX: MUCH longer grace periods for RTSP
+                    if is_rtsp:
+                        # RTSP streams can take 5-10 minutes to stabilize on NVR systems
+                        stale_threshold = 600  # 10 MINUTES (was 3 minutes)
+                        retry_grace_before = 600  # 10 min before retry
+                        retry_grace_after = 600   # 10 min after retry
+                    else:
+                        # File streams - keep aggressive timeouts
+                        stale_threshold = 60
+                        retry_grace_before = 120
+                        retry_grace_after = 120
+                        
                     retry_count = db_stream_state.get('retry_count', 0)
                     next_retry_at = db_stream_state.get('next_retry_at')
                     auto_retry_enabled = db_stream_state.get('auto_retry_enabled', True)
@@ -2563,17 +2650,32 @@ class StreamManager:
                     # ✅ FIX: More lenient stale threshold for RTSP
                     stale_threshold = 180 if is_rtsp else 60  # 3 min for RTSP, 1 min for files
                     
+                    # ✅ Check for stale frames with new threshold
                     if time_since_last_frame > stale_threshold:
-                        # Before restarting, check if this is already in retry
-                        if in_retry_window:
-                            logger.info(
-                                f"⏰ Camera {stream_id_str} frozen but in retry window. "
-                                f"Letting retry system handle it."
-                            )
-                            continue
+                        # ✅ NEW: For RTSP, check if stream is making progress
+                        if is_rtsp:
+                            # Get shared stream stats
+                            try:
+                                shared_stream = await self.video_file_manager.get_shared_stream(
+                                    db_stream_state['path']
+                                )
+                                stats = await shared_stream.get_stats()
+                                
+                                total_frames = stats.get('frame_count', 0)
+                                
+                                # If shared stream is receiving frames, this stream might just be slow
+                                if total_frames > 0:
+                                    logger.info(
+                                        f"⏳ Camera {stream_id_str} frozen but shared stream "
+                                        f"has {total_frames} frames. Allowing more time..."
+                                    )
+                                    continue
+                            except:
+                                pass
                         
+                        # Still frozen after grace period
                         health_issues.append(
-                            f"{stream_id_str}: frozen ({time_since_last_frame:.0f}s since last frame)"
+                            f"{stream_id_str}: frozen ({time_since_last_frame:.0f}s > {stale_threshold}s)"
                         )
                         streams_to_restart_ids.append(stream_id_str)
                     
@@ -3219,6 +3321,67 @@ class StreamManager:
         
         return zombies_found
 
+    async def get_camera_health_report(self) -> Dict[str, Any]:
+        """
+        Generate health report for all cameras.
+        Helps identify problematic cameras.
+        """
+        async with self._lock:
+            active_cameras = list(self.active_streams.items())
+        
+        camera_health = []
+        current_time = datetime.now(ZoneInfo("Africa/Cairo"))
+        
+        for stream_id_str, stream_info in active_cameras:
+            last_frame_time = stream_info.get('last_frame_time')
+            start_time = stream_info.get('start_time')
+            
+            # Calculate health score
+            health_score = 100
+            issues = []
+            
+            # Check frame freshness
+            if last_frame_time:
+                age = (current_time - last_frame_time).total_seconds()
+                if age > 60:
+                    health_score -= 50
+                    issues.append(f"No frames for {age:.0f}s")
+                elif age > 30:
+                    health_score -= 25
+                    issues.append(f"Stale frames ({age:.0f}s)")
+            else:
+                if start_time:
+                    running_time = (current_time - start_time).total_seconds()
+                    if running_time > 30:
+                        health_score = 0
+                        issues.append(f"No frames after {running_time:.0f}s")
+            
+            # Check error rate
+            if stream_id_str in self.stream_errors:
+                error_count = len(self.stream_errors[stream_id_str])
+                if error_count > 10:
+                    health_score -= min(50, error_count * 2)
+                    issues.append(f"{error_count} errors")
+            
+            camera_health.append({
+                'stream_id': stream_id_str,
+                'camera_name': stream_info.get('camera_name'),
+                'health_score': max(0, health_score),
+                'status': 'healthy' if health_score > 75 else ('degraded' if health_score > 25 else 'critical'),
+                'issues': issues,
+                'uptime_seconds': (current_time - start_time).total_seconds() if start_time else 0,
+                'last_frame_age_seconds': (current_time - last_frame_time).total_seconds() if last_frame_time else None
+            })
+        
+        return {
+            'timestamp': current_time.isoformat(),
+            'total_cameras': len(camera_health),
+            'healthy': len([c for c in camera_health if c['health_score'] > 75]),
+            'degraded': len([c for c in camera_health if 25 < c['health_score'] <= 75]),
+            'critical': len([c for c in camera_health if c['health_score'] <= 25]),
+            'cameras': sorted(camera_health, key=lambda x: x['health_score'])
+        }
+        
 # ==================== Global Instance ====================
 
 stream_manager = StreamManager()

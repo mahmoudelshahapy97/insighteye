@@ -345,6 +345,10 @@ class DatabaseManager:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
                 detail="Error acquiring database connection."
             )
+        except asyncpg.PostgresConnectionError:
+            if conn:
+                await conn.close()
+            raise
             
         finally:
             if conn:
