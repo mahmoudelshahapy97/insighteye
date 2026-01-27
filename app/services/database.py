@@ -41,13 +41,9 @@ pool_stats = {
         f"Retrying in {retry_state.next_action.sleep} seconds..."
     )
 )
-async def init_db_pool(
-    min_connections=None,
-    max_connections=None
-):
+async def init_db_pool():
     """
     Initialize the asyncpg database connection pool with robust retry logic.
-    Optimized for remote database connections with high concurrency.
     """
     global connection_pool
     if connection_pool is not None and not connection_pool._closed:
@@ -116,10 +112,7 @@ async def init_db_pool(
         raise
 
 async def setup_asyncpg_connection(conn: asyncpg.Connection):
-    """
-    Initial setup for each connection when created.
-    Configure connection-level settings for optimal performance.
-    """
+    """Initial setup for each connection when created."""
     try:
         # Set statement timeout (fallback if not set in postgresql.conf)
         await conn.execute("SET statement_timeout = '120s'")
@@ -138,10 +131,7 @@ async def setup_asyncpg_connection(conn: asyncpg.Connection):
         raise
     
 async def setup_asyncpg_connection_types(conn: asyncpg.Connection):
-    """
-    Set up type codecs for an asyncpg connection.
-    Configure UUID to use standard Python uuid.UUID instead of asyncpg's custom UUID.
-    """
+    """Set up type codecs for an asyncpg connection."""
     try:
         # Override the default UUID codec to return standard Python UUIDs
         await conn.set_type_codec(
@@ -158,10 +148,7 @@ async def setup_asyncpg_connection_types(conn: asyncpg.Connection):
         raise
 
 async def warmup_pool(target_connections: int):
-    """
-    Pre-create connections to warm up the pool.
-    This prevents cold start delays when cameras start streaming.
-    """
+    """Pre-create connections to warm up the pool."""
     try:
         logger.info(f"Warming up connection pool with {target_connections} connections...")
         connections = []
@@ -215,10 +202,7 @@ def is_pool_healthy() -> bool:
     return connection_pool is not None and not connection_pool._closed
 
 async def check_postgres_health() -> bool:
-    """
-    Check if PostgreSQL is accessible and responsive.
-    Updates pool statistics.
-    """
+    """Check if PostgreSQL is accessible and responsive."""
     try:
         pool = get_pool()
         start_time = datetime.utcnow()
@@ -243,10 +227,7 @@ async def check_postgres_health() -> bool:
         return False
 
 def get_pool_stats() -> Dict[str, Any]:
-    """
-    Get current connection pool statistics.
-    Useful for monitoring and debugging.
-    """
+    """Get current connection pool statistics."""
     if not connection_pool or connection_pool._closed:
         return {
             'status': 'closed',
@@ -277,23 +258,28 @@ class DatabaseManager:
         """
         Acquire a connection from the pool with timeout and retry logic.
         """
-        if connection_pool is None or connection_pool._closed:
-            logger.error("Asyncpg connection pool is not initialized or closed. Attempting to re-initialize.")
-            try:
-                await init_db_pool()
-            except Exception as e:
-                logger.critical(f"Failed to re-initialize connection pool: {e}", exc_info=True)
-                raise HTTPException(
-                    status_code=503, 
-                    detail="Database service critically unavailable: Pool re-initialization failed."
-                )
+        # if connection_pool is None or connection_pool._closed:
+        #     logger.error("Asyncpg connection pool is not initialized or closed. Attempting to re-initialize.")
+        #     try:
+        #         await init_db_pool()
+        #     except Exception as e:
+        #         logger.critical(f"Failed to re-initialize connection pool: {e}", exc_info=True)
+        #         raise HTTPException(
+        #             status_code=503, 
+        #             detail="Database service critically unavailable: Pool re-initialization failed."
+        #         )
 
-            if connection_pool is None or connection_pool._closed:
-                logger.critical("Connection pool remains uninitialized after attempt.")
-                raise HTTPException(
-                    status_code=503, 
-                    detail="Database service unavailable: Pool initialization failed."
-                )
+        #     if connection_pool is None or connection_pool._closed:
+        #         logger.critical("Connection pool remains uninitialized after attempt.")
+        #         raise HTTPException(
+        #             status_code=503, 
+        #             detail="Database service unavailable: Pool initialization failed."
+        #         )
+
+        if connection_pool is None or connection_pool._closed:
+            logger.error("Asyncpg connection pool is not initialized or closed.")
+            # ✅ Don't raise HTTPException here - let caller handle it
+            raise RuntimeError("Database pool not available")
 
         conn: Optional[asyncpg.Connection] = None
         acquire_start = datetime.utcnow()
@@ -304,7 +290,7 @@ class DatabaseManager:
                 # Acquire with timeout
                 conn = await asyncio.wait_for(
                     connection_pool.acquire(),
-                    timeout=30.0
+                    timeout=60.0
                 )
                 
                 acquire_time = (datetime.utcnow() - acquire_start).total_seconds()
@@ -356,12 +342,16 @@ class DatabaseManager:
                     await connection_pool.release(conn)
                 except Exception as e:
                     logger.error(f"Error releasing connection: {e}", exc_info=True)
+                    # Try to close the bad connection
+                    try:
+                        await conn.close()
+                    except:
+                        pass
 
     @asynccontextmanager
     async def transaction(self) -> asyncpg.Connection:
         """Provides a database connection with a transaction."""
         async with self.get_connection() as conn:
-            # asyncpg's conn.transaction() handles nesting with savepoints automatically.
             async with conn.transaction():
                 yield conn
 
@@ -464,11 +454,18 @@ class DatabaseManager:
                 if query_time > 5.0:
                     logger.warning(f"Slow query detected: {query_time:.2f}s - {query[:100]}")
 
-        if connection:
-            return await _execute(connection)
-        else:
-            async with self.get_connection() as conn:
-                return await _execute(conn)
+        try:
+            if connection:
+                return await _execute(connection)
+            else:
+                async with self.get_connection() as conn:
+                    return await _execute(conn)
+        except RuntimeError as e:
+            # Convert connection errors to 503
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(e)
+            )
 
     async def execute_batch(
         self,
@@ -476,31 +473,35 @@ class DatabaseManager:
         params_list: List[tuple],
         batch_size: int = 100
     ) -> int:
-        """
-        Execute a batch of queries efficiently using executemany.
-        Returns total number of rows affected.
-        """
+        """Execute a batch of queries efficiently using executemany."""
         if not params_list:
             return 0
             
         total_affected = 0
-        
-        async with self.get_connection() as conn:
-            # Process in batches
-            for i in range(0, len(params_list), batch_size):
-                batch = params_list[i:i + batch_size]
-                
-                try:
-                    await conn.executemany(query, batch)
-                    total_affected += len(batch)
-                    logger.debug(f"Batch executed: {len(batch)} rows")
+
+        try:
+            async with self.get_connection() as conn:
+                # Process in batches
+                for i in range(0, len(params_list), batch_size):
+                    batch = params_list[i:i + batch_size]
                     
-                except Exception as e:
-                    logger.error(f"Batch execution failed: {e}", exc_info=True)
-                    pool_stats['failed_queries'] += 1
-                    raise
-        
-        return total_affected
+                    try:
+                        await conn.executemany(query, batch)
+                        total_affected += len(batch)
+                        logger.debug(f"Batch executed: {len(batch)} rows")
+                        
+                    except Exception as e:
+                        logger.error(f"Batch execution failed: {e}", exc_info=True)
+                        pool_stats['failed_queries'] += 1
+                        raise
+            
+            return total_affected
+
+        except RuntimeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(e)
+            )
 
 # Global database manager instance
 db_manager = DatabaseManager()
