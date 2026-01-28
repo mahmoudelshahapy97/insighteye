@@ -9,6 +9,7 @@ APP_DIR="/home/ubuntu/insighteye"
 
 # GitHub Private Repo Access
 USE_PAT=true
+# classic_token: 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
 GITHUB_PAT="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"
 GITHUB_REPO="https://oauth2:${GITHUB_PAT}@github.com/mahmoudelshahapy97/insighteye.git"
 
