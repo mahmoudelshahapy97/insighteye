@@ -40,6 +40,8 @@ services:
       --port 8000
     networks:
       - insighteye_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   celery_worker:
     image: insighteye_app:latest
