@@ -12,11 +12,12 @@ from typing import Dict, Optional, Any, Tuple
 from uuid import UUID
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone, timedelta
-from ultralytics import YOLO
+# from ultralytics import YOLO  # Removing direct dependency
 import concurrent.futures
 import os
 import sys
 from app.config.settings import config
+from app.services.model_loader import ModelFactory, ModelBackend
 from app.utils import send_people_count_alert_email, send_fire_alert_email
 from app.services.database import db_manager
 from app.services.user_service import user_manager
@@ -67,26 +68,52 @@ class StreamProcessingService:
         logger.info("StreamProcessingService dependencies initialized")
 
     def _initialize_models(self):
-        """Initialize YOLO models."""
+        """Initialize models using ModelFactory."""
+        # Config now resolves paths dynamically based on MODEL_BACKEND
         people_model_path = config.people_model_path
         gender_model_path = config.gender_model_path
         fire_model_path = config.fire_model_path
+        backend = config.model_backend
         
-        logger.info(f"🔍 Checking model paths:")
+        logger.info(f"🔍 Checking model paths (Backend: {backend}):")
         logger.info(f"  People: {people_model_path} (exists: {os.path.exists(people_model_path)})")
         logger.info(f"  Gender: {gender_model_path} (exists: {os.path.exists(gender_model_path)})")
         logger.info(f"  Fire: {fire_model_path} (exists: {os.path.exists(fire_model_path)})")
                 
         try:
-            self.people_model = YOLO(people_model_path)
-            self.people_model.fuse()
-            self.gender_model = YOLO(gender_model_path)
-            self.gender_model.fuse()
-            self.fire_model = YOLO(fire_model_path)
-            self.fire_model.fuse()
-            logger.info("YOLO models initialized successfully")
+            # Use ModelFactory to create loaders
+            # We pass the backend string from config, converting to Enum if needed, 
+            # but create_loader handles string if we map it or just let it auto-detect if path has extension.
+            # However, config.model_backend provides explicit intent.
+            
+            logger.info(f"Initializing models with backend: {backend}")
+            
+            self.people_model = ModelFactory.create_loader(
+                people_model_path, 
+                backend=ModelBackend(backend),
+                confidence_threshold=config.yolo_confidence
+            )
+            
+            self.gender_model = ModelFactory.create_loader(
+                gender_model_path, 
+                backend=ModelBackend(backend),
+                confidence_threshold=0.5
+            )
+            
+            self.fire_model = ModelFactory.create_loader(
+                fire_model_path, 
+                backend=ModelBackend(backend),
+                confidence_threshold=0.5
+            )
+            
+            # Load models immediately to fail fast if there's an issue
+            self.people_model.load_model()
+            self.gender_model.load_model()
+            self.fire_model.load_model()
+            
+            logger.info(f"✅ Models initialized successfully using {backend}")
         except Exception as e:
-            logger.error(f"Failed to initialize YOLO models: {e}", exc_info=True)
+            logger.error(f"Failed to initialize models: {e}", exc_info=True)
             self.people_model = None
             self.gender_model = None
             self.fire_model = None
@@ -94,9 +121,9 @@ class StreamProcessingService:
     def get_model_status(self) -> Dict[str, bool]:
         """Get status of all models for health checks."""
         return {
-            "people_model": self.people_model is not None,
-            "gender_model": self.gender_model is not None,
-            "fire_model": self.fire_model is not None
+            "people_model": self.people_model is not None and self.people_model.is_loaded,
+            "gender_model": self.gender_model is not None and self.gender_model.is_loaded,
+            "fire_model": self.fire_model is not None and self.fire_model.is_loaded
         }
 
     def detect_objects_with_threshold(
@@ -156,40 +183,56 @@ class StreamProcessingService:
             input_frame = frame
 
         try:
-            # People detection - NOW SAFE because we checked above
-            people_results = self.people_model.predict(
-                source=input_frame, conf=conf_threshold, classes=[0], verbose=False
+            # People detection
+            # New generic flow: predict -> postprocess
+            raw_people_results = self.people_model.predict(input_frame)
+            people_detections = self.people_model.postprocess(
+                raw_people_results, 
+                original_shape=(h, w),
+                input_size=(640, 640)
             )
 
-            person_count = 0
-            if people_results and len(people_results) > 0 and people_results[0].boxes is not None:
-                person_count = len(people_results[0].boxes)
+            # Filter for person class (usually class_id 0 for YOLO models on COCO)
+            # Adjust if using custom model where person is different
+            person_detections = [d for d in people_detections if d['class_id'] == 0]
+            person_count = len(person_detections)
 
             # Gender detection (every 3rd frame when people detected)
-            if person_count > 0 and frame_count % 3 == 0 and self.gender_model:
+            if person_count > 0 and frame_count % 3 == 0 and self.gender_model and self.gender_model.is_loaded:
                 try:
-                    gender_results = self.gender_model.predict(source=input_frame, conf=0.5, verbose=False)
-                    if gender_results and len(gender_results) > 0 and gender_results[0].boxes is not None:
-                        male_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 1)
-                        female_count = sum(1 for box in gender_results[0].boxes if int(box.cls[0]) == 0)
-                        cache['male_count'] = male_count
-                        cache['female_count'] = female_count
-                        cache['last_gender_frame'] = frame_count
+                    raw_gender_results = self.gender_model.predict(input_frame)
+                    gender_detections = self.gender_model.postprocess(
+                        raw_gender_results,
+                        original_shape=(h, w),
+                        input_size=(640, 640)
+                    )
+                    
+                    # Assuming class 1 = Male, 0 = Female (standard for many gender models, verify your specific model)
+                    male_count = sum(1 for d in gender_detections if d['class_id'] == 1)
+                    female_count = sum(1 for d in gender_detections if d['class_id'] == 0)
+                    
+                    cache['male_count'] = male_count
+                    cache['female_count'] = female_count
+                    cache['last_gender_frame'] = frame_count
                 except Exception as e:
                     logger.error(f"Gender detection error for stream {stream_id_str}: {e}")
 
-            # Fire detection (every 10th frame) - ✅ Check model first
-            if frame_count % 10 == 0 and self.fire_model:
+            # Fire detection (every 10th frame)
+            if frame_count % 10 == 0 and self.fire_model and self.fire_model.is_loaded:
                 try:
-                    fire_results = self.fire_model.predict(source=input_frame, conf=0.8, verbose=False)
+                    raw_fire_results = self.fire_model.predict(input_frame)
+                    fire_detections = self.fire_model.postprocess(
+                        raw_fire_results,
+                        original_shape=(h, w),
+                        input_size=(640, 640),
+                        iou_threshold=0.5
+                    )
 
                     current_fire_status = "no detection"
-                    if fire_results and len(fire_results) > 0 and fire_results[0].boxes is not None:
-                        # classes = [int(box.cls) for box in fire_results[0].boxes]
-                        classes = [int(box.cls[0]) for box in fire_results[0].boxes]
-
-                        if classes:
-                            logger.info(f"🔥 Fire model detected classes: {classes} on stream {stream_id_str}")
+                    
+                    if fire_detections:
+                        classes = [d['class_id'] for d in fire_detections]
+                        logger.info(f"🔥 Fire model detected classes: {classes} on stream {stream_id_str}")
                         
                         if 0 in classes:
                             current_fire_status = "fire"
@@ -228,10 +271,24 @@ class StreamProcessingService:
                 if less_than is not None and person_count < less_than:
                     alert_triggered = True
 
-            # Annotate frame
+            # Annotate frame - Manual Drawing since we don't have Ultralytics .plot()
             annotated_frame = input_frame.copy()
-            if people_results and len(people_results) > 0 and people_results[0].boxes is not None:
-                annotated_frame = people_results[0].plot(img=annotated_frame)
+            
+            # Draw people bounding boxes
+            for det in person_detections:
+                bbox = det['bbox'] # [x1, y1, x2, y2]
+                x1, y1, x2, y2 = bbox
+                conf = det['confidence']
+                
+                # Draw box
+                color = (0, 255, 0) # Green
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw label
+                label = f"Person {conf:.2f}"
+                t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                cv2.rectangle(annotated_frame, (x1, y1 - t_size[1] - 4), (x1 + t_size[0], y1), color, -1)
+                cv2.putText(annotated_frame, label, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
             
             # Add text overlays
             count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)

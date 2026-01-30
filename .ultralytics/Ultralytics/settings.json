@@ -17,5 +17,5 @@
   "tensorboard": false,
   "wandb": false,
   "vscode_msg": true,
-  "openvino_msg": true
+  "openvino_msg": false
 }

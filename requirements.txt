@@ -5,7 +5,7 @@ starlette
 pydantic
 opencv-python-headless==4.8.1.78
 #opencv-python==4.10.0.84
-numpy
+#numpy
 chromadb
 ultralytics==8.4.7
 Pillow
@@ -47,3 +47,11 @@ redis==4.6.0
 celery[asyncio]==5.3.4
 kombu==5.3.4
 hiredis==2.2.3
+
+# ONNX Runtime (CPU and GPU versions)
+onnxruntime==1.23.2  # CPU version
+# onnxruntime-gpu==1.23.2  # Uncomment for GPU support
+
+# OpenVINO
+openvino==2024.0.0
+openvino-dev==2024.0.0  # For model conversion tools

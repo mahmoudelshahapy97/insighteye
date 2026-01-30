@@ -211,9 +211,46 @@ class Settings(BaseSettings):
     # MODELS
     # =============================================================================
     yolo_config_dir: str = "/app/.ultralytics"
-    people_model_path: str = "models/people.pt"
-    gender_model_path: str = "models/gender.pt"
-    fire_model_path: str = "models/fire.pt"
+    # New Dynamic Model Configuration
+    model_backend: Literal["pytorch", "onnx", "openvino"] = "pytorch"
+
+    pt_people_model_path: str = "models/people.pt"
+    pt_gender_model_path: str = "models/gender.pt"
+    pt_fire_model_path: str = "models/fire.pt"
+
+    # ONNX Model Paths
+    onnx_people_model_path: str = "models/people.onnx"
+    onnx_gender_model_path: str = "models/gender.onnx"
+    onnx_fire_model_path: str = "models/fire.onnx" 
+
+    # OpenVINO Model Paths
+    openvino_people_model_path: str = "models/people_openvino"
+    openvino_gender_model_path: str = "models/gender_openvino"
+    openvino_fire_model_path: str = "models/fire_openvino"
+
+    @property
+    def people_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_people_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_people_model_path
+        return self.pt_people_model_path
+
+    @property
+    def gender_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_gender_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_gender_model_path
+        return self.pt_gender_model_path
+
+    @property
+    def fire_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_fire_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_fire_model_path
+        return self.pt_fire_model_path
 
     model_cache_dir: str = "./model_cache"
     model_device: Literal["cpu", "cuda"] = "cuda"
