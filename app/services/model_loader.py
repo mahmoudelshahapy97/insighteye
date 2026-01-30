@@ -11,6 +11,7 @@ class ModelBackend(str, Enum):
     PYTORCH = "pytorch"
     ONNX = "onnx"
     OPENVINO = "openvino"
+    TENSORRT = "tensorrt"
 
 
 class BaseModelLoader:
@@ -205,6 +206,147 @@ class ONNXModelLoader(BaseModelLoader):
             order = order[inds + 1]
         
         return keep
+
+
+class TensorRTModelLoader(BaseModelLoader):
+    """TensorRT model loader for high-performance GPU inference"""
+    
+    def load_model(self):
+        if not self.is_loaded:
+            try:
+                import tensorrt as trt
+                import pycuda.driver as cuda
+                import pycuda.autoinit  # Automatically initializes CUDA
+                
+                # Create TensorRT logger
+                self.trt_logger = trt.Logger(trt.Logger.WARNING)
+                
+                # Load serialized engine
+                model_path = Path(self.model_path)
+                
+                # Support both .engine and .trt extensions
+                if model_path.is_file():
+                    engine_file = model_path
+                else:
+                    # Try common extensions
+                    for ext in ['.engine', '.trt']:
+                        potential_file = model_path.with_suffix(ext)
+                        if potential_file.exists():
+                            engine_file = potential_file
+                            break
+                    else:
+                        raise FileNotFoundError(f"No TensorRT engine file found for {model_path}")
+                
+                print(f"🔄 Loading TensorRT engine from {engine_file}")
+                
+                with open(engine_file, 'rb') as f:
+                    runtime = trt.Runtime(self.trt_logger)
+                    self.engine = runtime.deserialize_cuda_engine(f.read())
+                
+                if self.engine is None:
+                    raise RuntimeError("Failed to deserialize TensorRT engine")
+                
+                # Create execution context
+                self.context = self.engine.create_execution_context()
+                
+                # Allocate buffers
+                self.inputs = []
+                self.outputs = []
+                self.bindings = []
+                self.stream = cuda.Stream()
+                
+                for i in range(self.engine.num_bindings):
+                    binding = self.engine[i]
+                    size = trt.volume(self.engine.get_binding_shape(i))
+                    dtype = trt.nptype(self.engine.get_binding_dtype(i))
+                    
+                    # Allocate host and device buffers
+                    host_mem = cuda.pagelocked_empty(size, dtype)
+                    device_mem = cuda.mem_alloc(host_mem.nbytes)
+                    
+                    self.bindings.append(int(device_mem))
+                    
+                    if self.engine.binding_is_input(i):
+                        self.inputs.append({'host': host_mem, 'device': device_mem})
+                        self.input_shape = self.engine.get_binding_shape(i)
+                    else:
+                        self.outputs.append({'host': host_mem, 'device': device_mem})
+                        self.output_shape = self.engine.get_binding_shape(i)
+                
+                self.is_loaded = True
+                print(f"✅ TensorRT model loaded: {engine_file}")
+                print(f"   Input shape: {self.input_shape}")
+                print(f"   Output shape: {self.output_shape}")
+                print(f"   GPU: {cuda.Device(0).name()}")
+                
+            except ImportError as e:
+                print(f"❌ TensorRT not installed: {e}")
+                print("   Install with: pip install tensorrt pycuda")
+                raise
+            except Exception as e:
+                print(f"❌ Error loading TensorRT model: {e}")
+                raise
+    
+    def predict(self, image: np.ndarray) -> np.ndarray:
+        """Run inference using TensorRT"""
+        if not self.is_loaded:
+            self.load_model()
+        
+        import pycuda.driver as cuda
+        
+        # Preprocess
+        input_tensor = self.preprocess(image)
+        
+        # Ensure correct shape
+        input_tensor = input_tensor.astype(np.float32).ravel()
+        
+        # Copy input to device
+        np.copyto(self.inputs[0]['host'], input_tensor)
+        cuda.memcpy_htod_async(
+            self.inputs[0]['device'],
+            self.inputs[0]['host'],
+            self.stream
+        )
+        
+        # Run inference
+        self.context.execute_async_v2(
+            bindings=self.bindings,
+            stream_handle=self.stream.handle
+        )
+        
+        # Copy output from device
+        cuda.memcpy_dtoh_async(
+            self.outputs[0]['host'],
+            self.outputs[0]['device'],
+            self.stream
+        )
+        
+        # Synchronize
+        self.stream.synchronize()
+        
+        # Reshape output
+        output = self.outputs[0]['host'].reshape(self.output_shape)
+        
+        return output
+    
+    def postprocess(self, outputs: np.ndarray, original_shape: Tuple[int, int],
+                   input_size: Tuple[int, int] = (640, 640),
+                   iou_threshold: float = 0.45) -> List[Dict]:
+        """Postprocess TensorRT outputs (same as ONNX)"""
+        # Reuse ONNX postprocessing logic
+        loader = ONNXModelLoader("", self.confidence_threshold)
+        return loader.postprocess(outputs, original_shape, input_size, iou_threshold)
+    
+    def unload_model(self):
+        """Cleanup TensorRT resources"""
+        if hasattr(self, 'context'):
+            del self.context
+        if hasattr(self, 'engine'):
+            del self.engine
+        if hasattr(self, 'stream'):
+            del self.stream
+        self.model = None
+        self.is_loaded = False
 
 
 class OpenVINOModelLoader(BaseModelLoader):
@@ -409,6 +551,8 @@ class ModelFactory:
                 backend = ModelBackend.ONNX
             elif path.suffix == '.pt':
                 backend = ModelBackend.PYTORCH
+            elif path.suffix in ['.engine', '.trt']:
+                backend = ModelBackend.TENSORRT
             elif path.is_dir() or path.suffix == '.xml':
                 backend = ModelBackend.OPENVINO
             else:
@@ -421,5 +565,7 @@ class ModelFactory:
             return OpenVINOModelLoader(model_path, confidence_threshold)
         elif backend == ModelBackend.PYTORCH:
             return PyTorchModelLoader(model_path, confidence_threshold)
+        elif backend == ModelBackend.TENSORRT:
+            return TensorRTModelLoader(model_path, confidence_threshold)
         else:
             raise ValueError(f"Unknown backend: {backend}")

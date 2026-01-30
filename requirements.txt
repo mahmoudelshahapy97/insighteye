@@ -8,16 +8,20 @@ opencv-python-headless==4.8.1.78
 #numpy
 chromadb
 ultralytics==8.4.7
+#torch>=2.0.0
+#torchvision>=0.15.0
 Pillow
 datetime
 uvicorn
 passlib==1.7.4
 python-multipart
+pydantic-settings
 pydantic[email]
 qdrant-client
 psycopg2-binary
 websockets
 httpx
+aiohttp
 langchain 
 langchain-ollama
 langchain_community
@@ -31,7 +35,6 @@ PyJWT
 tenacity
 apscheduler
 pytest-mock
-pytest-asyncio
 pytest-tornasync
 pytest-trio
 pytest-twisted
@@ -47,6 +50,7 @@ redis==4.6.0
 celery[asyncio]==5.3.4
 kombu==5.3.4
 hiredis==2.2.3
+loguru
 
 # ONNX Runtime (CPU and GPU versions)
 onnxruntime==1.23.2  # CPU version
@@ -55,3 +59,8 @@ onnxruntime==1.23.2  # CPU version
 # OpenVINO
 openvino==2024.0.0
 openvino-dev==2024.0.0  # For model conversion tools
+
+# TensorRT (optional - see installation guide)
+# tensorrt>=8.6.0  # Install via NVIDIA NGC or pip
+# pycuda>=2022.1   # Required for TensorRT
+# nvidia-tensorrt  # Alternative package name

@@ -211,9 +211,10 @@ class Settings(BaseSettings):
     # MODELS
     # =============================================================================
     yolo_config_dir: str = "/app/.ultralytics"
-    # New Dynamic Model Configuration
-    model_backend: Literal["pytorch", "onnx", "openvino"] = "pytorch"
+    # Model Backend Selection
+    model_backend: Literal["pytorch", "onnx", "openvino", "tensorrt"] = "pytorch"
 
+    # PyTorch Model Paths
     pt_people_model_path: str = "models/people.pt"
     pt_gender_model_path: str = "models/gender.pt"
     pt_fire_model_path: str = "models/fire.pt"
@@ -228,12 +229,24 @@ class Settings(BaseSettings):
     openvino_gender_model_path: str = "models/gender_openvino"
     openvino_fire_model_path: str = "models/fire_openvino"
 
+    # TensorRT Model Paths
+    tensorrt_people_model_path: str = "models/people.engine"
+    tensorrt_gender_model_path: str = "models/gender.engine"
+    tensorrt_fire_model_path: str = "models/fire.engine"
+
+    # TensorRT Configuration
+    tensorrt_precision: Literal["fp32", "fp16", "int8"] = "fp16"
+    tensorrt_max_batch_size: int = 8
+    tensorrt_workspace_size_mb: int = 2048  # 2GB workspace
+
     @property
     def people_model_path(self) -> str:
         if self.model_backend == "onnx":
             return self.onnx_people_model_path
         elif self.model_backend == "openvino":
             return self.openvino_people_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_people_model_path
         return self.pt_people_model_path
 
     @property
@@ -242,6 +255,8 @@ class Settings(BaseSettings):
             return self.onnx_gender_model_path
         elif self.model_backend == "openvino":
             return self.openvino_gender_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_gender_model_path
         return self.pt_gender_model_path
 
     @property
@@ -250,6 +265,8 @@ class Settings(BaseSettings):
             return self.onnx_fire_model_path
         elif self.model_backend == "openvino":
             return self.openvino_fire_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_fire_model_path
         return self.pt_fire_model_path
 
     model_cache_dir: str = "./model_cache"
