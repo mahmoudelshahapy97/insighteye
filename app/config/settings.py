@@ -43,7 +43,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        # extra="ignore",
+        extra="ignore",
     )
 
     # Generate a deterministic ID for this server instance based on system info
@@ -378,8 +378,10 @@ class Settings(BaseSettings):
     cv_frame_buffer_size: int = 1
     frame_skip: int = 300
     yolo_input_size: int = 640
-    yolo_confidence: float = 0.5
-    yolo_device: Literal["cpu", "cuda"] = "cpu"
+    people_confidence: float = 0.5
+    gender_confidence: float = 0.5
+    fire_confidence: float = 0.5
+    people_device: Literal["cpu", "cuda"] = "cpu"
 
     enable_batch_inference: bool = True
     batch_size: int = 4

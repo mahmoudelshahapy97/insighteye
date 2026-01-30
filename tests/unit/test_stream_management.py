@@ -1,6 +1,6 @@
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 from uuid import uuid4
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -53,9 +53,10 @@ async def test_create_camera(camera_service, mock_db_manager):
     )
     
     # Mock user details for limit check
-    camera_service.user_manager.get_user_by_id.return_value = {
+    # Use AsyncMock for async method calls
+    camera_service.user_manager.get_user_by_id = AsyncMock(return_value={
         "count_of_camera": 5, "role": "user"
-    }
+    })
     
     # Mock limit check count query
     mock_db_manager.execute_query.side_effect = [

@@ -2,13 +2,14 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
-from app.services.user_service import UserService
+from app.services.user_service import user_manager
 
 @pytest.fixture
 def user_service(mock_db_manager):
-    with patch('app.services.user_service.db_manager', mock_db_manager):
-        service = UserService()
-        yield service
+    # Patch the db_manager instance attribute on the singleton user_manager
+    # This is necessary because user_manager is instantiated at module level
+    with patch.object(user_manager, 'db_manager', mock_db_manager):
+        yield user_manager
 
 @pytest.mark.asyncio
 async def test_create_user(user_service, mock_db_manager):
@@ -16,7 +17,9 @@ async def test_create_user(user_service, mock_db_manager):
     user_data = {
         'username': 'testuser',
         'email': 'test@example.com',
-        'role': 'user'
+        'role': 'user',
+        'password': 'Password123!', # Added required password
+        'count_of_camera': 5
     }
     mock_db_manager.execute_query.return_value = [{'user_id': uuid4(), **user_data}]
     
@@ -24,8 +27,7 @@ async def test_create_user(user_service, mock_db_manager):
     result = await user_service.create_user(**user_data)
     
     # Verify
-    assert result is not None
-    assert result['username'] == 'testuser'
+    assert result is True
     assert mock_db_manager.execute_query.called
 
 @pytest.mark.asyncio
@@ -44,6 +46,6 @@ async def test_update_user_profile(user_service, mock_db_manager):
     update_data = {'username': 'newname'}
     mock_db_manager.execute_query.return_value = {'user_id': user_id, **update_data}
     
-    result = await user_service.update_user(user_id, update_data)
+    result = await user_service.update_user_profile(user_id, update_data)
     
     assert result['username'] == 'newname'

@@ -91,19 +91,19 @@ class StreamProcessingService:
             self.people_model = ModelFactory.create_loader(
                 people_model_path, 
                 backend=ModelBackend(backend),
-                confidence_threshold=config.yolo_confidence
+                confidence_threshold=config.people_confidence
             )
             
             self.gender_model = ModelFactory.create_loader(
                 gender_model_path, 
                 backend=ModelBackend(backend),
-                confidence_threshold=0.5
+                confidence_threshold=config.gender_confidence
             )
             
             self.fire_model = ModelFactory.create_loader(
                 fire_model_path, 
                 backend=ModelBackend(backend),
-                confidence_threshold=0.5
+                confidence_threshold=config.fire_confidence
             )
             
             # Load models immediately to fail fast if there's an issue

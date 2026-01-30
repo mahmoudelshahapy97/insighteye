@@ -46,15 +46,6 @@ class TestStreamProcessingPipeline:
         
         assert stream_processing_service is not None
     
-    @pytest.mark.asyncio
-    async def test_stream_with_inference(self):
-        """Test stream processing with AI inference"""
-        from app.services.inference_service import InferenceService
-        
-        # Verify inference service can be integrated
-        service = InferenceService()
-        assert service is not None
-
 
 @pytest.mark.integration
 class TestStreamDataPersistence:

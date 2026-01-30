@@ -34,11 +34,11 @@ class StreamCreate(BaseModel):
 
 class StreamUpdate(BaseModel):
     id: str = Field(...)
-    name: str = Field(..., max_length=50)
-    path: str = Field(..., max_length=255)
-    type: str = Field(default='local', pattern='^(rtsp|http|local|other|video file)$')
-    status: str = Field(default='inactive', pattern='^(active|inactive|error|processing)$')
-    is_streaming: bool = Field(default=False)
+    name: Optional[str] = Field(None, max_length=50)
+    path: Optional[str] = Field(None, max_length=255)
+    type: Optional[str] = Field(default='local', pattern='^(rtsp|http|local|other|video file)$')
+    status: Optional[str] = Field(default='inactive', pattern='^(active|inactive|error|processing)$')
+    is_streaming: Optional[bool] = Field(default=False)
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)

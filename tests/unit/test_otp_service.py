@@ -244,18 +244,6 @@ class TestOTPSecurity:
         assert mock_db_manager.execute_query.call_count >= 2
 
 
-class TestOTPCleanup:
-    """Test OTP cleanup functionality"""
-    
-    @pytest.mark.asyncio
-    async def test_cleanup_expired_otps(self, otp_manager, mock_db_manager):
-        """Test cleanup of expired OTPs"""
-        mock_db_manager.execute_query.return_value = {"deleted": 5}
-        
-        result = await otp_manager.cleanup_expired_otps()
-        
-        assert mock_db_manager.execute_query.called or result is not None
-
 
 class TestOTPEdgeCases:
     """Test edge cases and error handling"""

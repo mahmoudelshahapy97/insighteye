@@ -33,7 +33,9 @@ def mock_db_manager(mocker):
 async def async_client():
     """HTTP client for API testing"""
     from app.main import app
-    async with AsyncClient(app=app, base_url="http://test") as client:
+    from httpx import ASGITransport
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
 
 @pytest.fixture

@@ -5,9 +5,6 @@ from typing import List, Tuple, Optional, Dict
 from pathlib import Path
 from enum import Enum
 import onnxruntime as ort
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 class ModelBackend(str, Enum):
@@ -82,15 +79,10 @@ class ONNXModelLoader(BaseModelLoader):
                 self.input_name = self.model.get_inputs()[0].name
                 self.output_names = [output.name for output in self.model.get_outputs()]
                 
-                # Get output shape to determine model type
-                output_shape = self.model.get_outputs()[0].shape
-                logger.info(f"ONNX model output shape: {output_shape}")
-                
                 self.is_loaded = True
                 print(f"✅ ONNX model loaded: {self.model_path}")
                 print(f"   Input: {self.input_name}")
                 print(f"   Outputs: {self.output_names}")
-                print(f"   Output shape: {output_shape}")
                 
             except Exception as e:
                 print(f"❌ Error loading ONNX model: {e}")
@@ -116,102 +108,62 @@ class ONNXModelLoader(BaseModelLoader):
                    input_size: Tuple[int, int] = (640, 640),
                    iou_threshold: float = 0.45) -> List[Dict]:
         """
-        Postprocess YOLO v8 outputs with improved detection
+        Postprocess YOLO outputs
         
-        YOLO v8 can output in two formats:
-        1. (1, 84, 8400) - Standard format: [x, y, w, h, class_0_prob, ..., class_79_prob]
-        2. (1, 8400, 84) - Transposed format
+        Args:
+            outputs: Model outputs (1, num_classes + 5, 8400) or (1, 8400, num_classes + 5)
+            original_shape: Original image shape (H, W)
+            input_size: Model input size
+            iou_threshold: NMS IOU threshold
         
-        Where 84 = 4 (box) + 80 (COCO classes)
+        Returns:
+            List of detections with bbox, confidence, class_id
         """
-        logger.debug(f"Raw output shape: {outputs.shape}")
-        
         # Handle different output formats
         if len(outputs.shape) == 3:
-            batch_size, dim1, dim2 = outputs.shape
-            
-            # Determine if we need to transpose
-            # YOLO v8 typically outputs (1, 84, 8400)
-            if dim1 < dim2:  # (1, 84, 8400)
-                # Transpose to (1, 8400, 84)
+            if outputs.shape[1] > outputs.shape[2]:
+                # Format: (1, num_classes + 5, 8400) -> transpose to (1, 8400, num_classes + 5)
                 outputs = outputs.transpose(0, 2, 1)
-                logger.debug(f"Transposed to: {outputs.shape}")
         
-        # Remove batch dimension: (8400, 84)
-        predictions = outputs[0]
+        # Remove batch dimension
+        predictions = outputs[0]  # (8400, num_classes + 5)
         
-        # Split into boxes and class scores
-        # First 4 columns: [x_center, y_center, width, height]
-        # Remaining columns: class probabilities
-        boxes = predictions[:, :4]
-        class_scores = predictions[:, 4:]
+        # Extract boxes, scores, and class predictions
+        boxes = predictions[:, :4]  # (8400, 4) - x_center, y_center, width, height
+        scores = predictions[:, 4:]  # (8400, num_classes)
         
-        logger.debug(f"Boxes shape: {boxes.shape}, Class scores shape: {class_scores.shape}")
+        # Get class with highest score
+        class_ids = np.argmax(scores, axis=1)
+        confidences = np.max(scores, axis=1)
         
-        # For each prediction, find the class with highest probability
-        class_ids = np.argmax(class_scores, axis=1)
-        confidences = np.max(class_scores, axis=1)
-        
-        logger.debug(f"Confidence range: [{confidences.min():.4f}, {confidences.max():.4f}]")
-        logger.debug(f"Unique class IDs before filtering: {np.unique(class_ids)}")
-        
-        # Filter by confidence threshold
+        # Filter by confidence
         mask = confidences > self.confidence_threshold
-        num_before = len(confidences)
-        num_after = np.sum(mask)
-        
-        logger.debug(f"Detections: {num_before} before threshold, {num_after} after (threshold={self.confidence_threshold})")
-        
-        if not np.any(mask):
-            logger.warning(f"No detections above confidence threshold {self.confidence_threshold}")
-            return []
-        
         boxes = boxes[mask]
         confidences = confidences[mask]
         class_ids = class_ids[mask]
         
-        logger.debug(f"Unique class IDs after filtering: {np.unique(class_ids)}")
-        
-        # Convert from center format (x_center, y_center, w, h) to corner format (x1, y1, x2, y2)
+        # Convert from center format to corner format
         boxes_xyxy = self._xywh_to_xyxy(boxes)
         
-        # Scale boxes from model input size to original image size
-        # YOLO outputs coordinates in the input image space (640x640)
+        # Scale boxes to original image size
         scale_x = original_shape[1] / input_size[0]
         scale_y = original_shape[0] / input_size[1]
         
         boxes_xyxy[:, [0, 2]] *= scale_x
         boxes_xyxy[:, [1, 3]] *= scale_y
         
-        # Clip boxes to image boundaries
-        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, original_shape[1])
-        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, original_shape[0])
-        
-        # Apply NMS to remove overlapping boxes
+        # Apply NMS
         indices = self._nms(boxes_xyxy, confidences, iou_threshold)
         
-        logger.debug(f"After NMS: {len(indices)} detections")
-        
-        # Prepare final detections
+        # Prepare detections
         detections = []
         for idx in indices:
             x1, y1, x2, y2 = boxes_xyxy[idx]
-            
-            # Validate box dimensions
-            box_width = x2 - x1
-            box_height = y2 - y1
-            
-            # Skip invalid boxes
-            if box_width <= 0 or box_height <= 0:
-                continue
-            
             detections.append({
                 'bbox': [int(x1), int(y1), int(x2), int(y2)],
                 'confidence': float(confidences[idx]),
                 'class_id': int(class_ids[idx])
             })
-        
-        logger.info(f"Final detections: {len(detections)}")
         
         return detections
     

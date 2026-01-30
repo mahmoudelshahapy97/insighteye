@@ -76,6 +76,7 @@ coverage/
 *.cover
 *.lcov
 *.coverage
+coverage.xml
 
 # Ignore compiled Python files
 *.pyc
