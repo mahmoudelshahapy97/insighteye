@@ -20,7 +20,7 @@ def create_response(success: bool, message: str, data: Optional[Dict[str, Any]] 
     return response_dict
 
 @router.post("/generate-otp")
-async def generate_otp(request: OTPRequest): # Changed name from generate_otp_endpoint
+async def generate_otp(request: OTPRequest):
     """Generate an OTP for the given email."""
     try:
         # Check if email exists in user database
@@ -72,7 +72,7 @@ async def generate_otp(request: OTPRequest): # Changed name from generate_otp_en
         )
 
 @router.post("/send-otp")
-async def send_otp(request: OTPRequest, background_tasks: BackgroundTasks): # Changed name from send_otp_endpoint
+async def send_otp(request: OTPRequest, background_tasks: BackgroundTasks): 
     """Generate and send an OTP to the specified email."""
     try:
         email = request.email
@@ -127,7 +127,7 @@ async def send_otp(request: OTPRequest, background_tasks: BackgroundTasks): # Ch
         )
 
 @router.post("/verify-otp")
-async def verify_otp(request: OTPVerification): # Changed name from verify_otp_endpoint
+async def verify_otp(request: OTPVerification):
     """Verify an OTP for the given email."""
     try:
         is_valid = await otp_manager.verify_otp(request.email, request.otp)
@@ -156,7 +156,7 @@ async def verify_otp(request: OTPVerification): # Changed name from verify_otp_e
         )
 
 @router.delete("/delete-otp")
-async def delete_otp(request: OTPDeletion): # Changed name from delete_otp_endpoint
+async def delete_otp(request: OTPDeletion):
     """Delete an OTP for the given email."""
     try:
         success = await otp_manager.delete_otp(request.email)

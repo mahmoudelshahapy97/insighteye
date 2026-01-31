@@ -801,9 +801,6 @@ class StreamProcessingService:
 
                 # ==================== Send Email Alert ====================
                 try:
-                    from app.services.user_service import user_manager
-                    from app.utils import send_people_count_alert_email
-                    
                     user_info = await user_manager.get_user_by_id(owner_id)
                     
                     if not user_info:
