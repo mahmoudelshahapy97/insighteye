@@ -14,7 +14,7 @@ class TestSignupEndpoint:
     @pytest.mark.asyncio
     async def test_signup_success(self, async_client):
         """Test successful user registration"""
-        response = await async_client.post("/auth/signup", json={
+        response = await async_client.post("/signup", json={
             "username": f"testuser_{uuid4().hex[:8]}",
             "email": f"test_{uuid4().hex[:8]}@example.com",
             "password": "SecurePass123!",
@@ -36,11 +36,11 @@ class TestSignupEndpoint:
         }
         
         # First signup
-        await async_client.post("/auth/signup", json=user_data)
+        await async_client.post("/signup", json=user_data)
         
         # Second signup with same username
         user_data["email"] = f"test2_{uuid4().hex[:8]}@example.com"
-        response = await async_client.post("/auth/signup", json=user_data)
+        response = await async_client.post("/signup", json=user_data)
         
         assert response.status_code in [400, 409, 422]
     
@@ -55,18 +55,18 @@ class TestSignupEndpoint:
         }
         
         # First signup
-        await async_client.post("/auth/signup", json=user_data)
+        await async_client.post("/signup", json=user_data)
         
         # Second signup with same email
         user_data["username"] = f"user2_{uuid4().hex[:8]}"
-        response = await async_client.post("/auth/signup", json=user_data)
+        response = await async_client.post("/signup", json=user_data)
         
         assert response.status_code in [400, 409, 422]
     
     @pytest.mark.asyncio
     async def test_signup_weak_password(self, async_client):
         """Test signup with weak password"""
-        response = await async_client.post("/auth/signup", json={
+        response = await async_client.post("/signup", json={
             "username": f"testuser_{uuid4().hex[:8]}",
             "email": f"test_{uuid4().hex[:8]}@example.com",
             "password": "123"  # Too short
@@ -77,7 +77,7 @@ class TestSignupEndpoint:
     @pytest.mark.asyncio
     async def test_signup_invalid_email(self, async_client):
         """Test signup with invalid email format"""
-        response = await async_client.post("/auth/signup", json={
+        response = await async_client.post("/signup", json={
             "username": f"testuser_{uuid4().hex[:8]}",
             "email": "not-an-email",
             "password": "SecurePass123!"
@@ -95,7 +95,7 @@ class TestSignupEndpoint:
         ]
         
         for data in incomplete_data:
-            response = await async_client.post("/auth/signup", json=data)
+            response = await async_client.post("/signup", json=data)
             assert response.status_code in [400, 422]
 
 
@@ -109,14 +109,14 @@ class TestLoginEndpoint:
         username = f"loginuser_{uuid4().hex[:8]}"
         password = "SecurePass123!"
         
-        await async_client.post("/auth/signup", json={
+        await async_client.post("/signup", json={
             "username": username,
             "email": f"{username}@example.com",
             "password": password
         })
         
         # Then login
-        response = await async_client.post("/auth/login", json={
+        response = await async_client.post("/login", json={
             "username": username,
             "password": password
         })
@@ -131,13 +131,13 @@ class TestLoginEndpoint:
         """Test login with wrong password"""
         username = f"loginuser_{uuid4().hex[:8]}"
         
-        await async_client.post("/auth/signup", json={
+        await async_client.post("/signup", json={
             "username": username,
             "email": f"{username}@example.com",
             "password": "CorrectPass123!"
         })
         
-        response = await async_client.post("/auth/login", json={
+        response = await async_client.post("/login", json={
             "username": username,
             "password": "WrongPass123!"
         })
@@ -147,7 +147,7 @@ class TestLoginEndpoint:
     @pytest.mark.asyncio
     async def test_login_nonexistent_user(self, async_client):
         """Test login with non-existent username"""
-        response = await async_client.post("/auth/login", json={
+        response = await async_client.post("/login", json={
             "username": f"nonexistent_{uuid4().hex[:8]}",
             "password": "SomePass123!"
         })
@@ -164,7 +164,7 @@ class TestLoginEndpoint:
         ]
         
         for data in incomplete_data:
-            response = await async_client.post("/auth/login", json=data)
+            response = await async_client.post("/login", json=data)
             assert response.status_code in [400, 422]
 
 
@@ -178,13 +178,13 @@ class TestRefreshTokenEndpoint:
         username = f"refreshuser_{uuid4().hex[:8]}"
         password = "SecurePass123!"
         
-        await async_client.post("/auth/signup", json={
+        await async_client.post("/signup", json={
             "username": username,
             "email": f"{username}@example.com",
             "password": password
         })
         
-        login_response = await async_client.post("/auth/login", json={
+        login_response = await async_client.post("/login", json={
             "username": username,
             "password": password
         })
@@ -195,7 +195,7 @@ class TestRefreshTokenEndpoint:
         if refresh_token:
             # Refresh the token
             response = await async_client.post(
-                "/auth/refresh",
+                "/refresh-token",
                 headers={"Authorization": f"Bearer {refresh_token}"}
             )
             
@@ -207,7 +207,7 @@ class TestRefreshTokenEndpoint:
     async def test_refresh_with_invalid_token(self, async_client):
         """Test refresh with invalid token"""
         response = await async_client.post(
-            "/auth/refresh",
+            "/refresh-token",
             headers={"Authorization": "Bearer invalid.token.here"}
         )
         
@@ -216,7 +216,7 @@ class TestRefreshTokenEndpoint:
     @pytest.mark.asyncio
     async def test_refresh_without_token(self, async_client):
         """Test refresh without providing token"""
-        response = await async_client.post("/auth/refresh")
+        response = await async_client.post("/refresh-token")
         
         assert response.status_code == 401
 
@@ -231,13 +231,13 @@ class TestLogoutEndpoint:
         username = f"logoutuser_{uuid4().hex[:8]}"
         password = "SecurePass123!"
         
-        await async_client.post("/auth/signup", json={
+        await async_client.post("/signup", json={
             "username": username,
             "email": f"{username}@example.com",
             "password": password
         })
         
-        login_response = await async_client.post("/auth/login", json={
+        login_response = await async_client.post("/login", json={
             "username": username,
             "password": password
         })
@@ -248,7 +248,7 @@ class TestLogoutEndpoint:
         if access_token:
             # Logout
             response = await async_client.post(
-                "/auth/logout",
+                "/logout",
                 headers={"Authorization": f"Bearer {access_token}"}
             )
             
@@ -257,7 +257,7 @@ class TestLogoutEndpoint:
     @pytest.mark.asyncio
     async def test_logout_without_token(self, async_client):
         """Test logout without authentication"""
-        response = await async_client.post("/auth/logout")
+        response = await async_client.post("/logout")
         
         assert response.status_code == 401
 
@@ -273,14 +273,14 @@ class TestPasswordUpdateEndpoint:
         new_password = "NewPass123!"
         
         # Create user
-        await async_client.post("/auth/signup", json={
+        await async_client.post("/signup", json={
             "username": username,
             "email": f"{username}@example.com",
             "password": old_password
         })
         
         # Login
-        login_response = await async_client.post("/auth/login", json={
+        login_response = await async_client.post("/login", json={
             "username": username,
             "password": old_password
         })
@@ -291,7 +291,7 @@ class TestPasswordUpdateEndpoint:
         if access_token:
             # Update password
             response = await async_client.put(
-                "/auth/password",
+                "/update-password",
                 headers={"Authorization": f"Bearer {access_token}"},
                 json={
                     "old_password": old_password,
@@ -302,7 +302,7 @@ class TestPasswordUpdateEndpoint:
             assert response.status_code in [200, 204]
             
             # Verify can login with new password
-            new_login = await async_client.post("/auth/login", json={
+            new_login = await async_client.post("/login", json={
                 "username": username,
                 "password": new_password
             })
@@ -314,13 +314,13 @@ class TestPasswordUpdateEndpoint:
         username = f"pwduser_{uuid4().hex[:8]}"
         password = "CorrectPass123!"
         
-        await async_client.post("/auth/signup", json={
+        await async_client.post("/signup", json={
             "username": username,
             "email": f"{username}@example.com",
             "password": password
         })
         
-        login_response = await async_client.post("/auth/login", json={
+        login_response = await async_client.post("/login", json={
             "username": username,
             "password": password
         })
@@ -330,7 +330,7 @@ class TestPasswordUpdateEndpoint:
         
         if access_token:
             response = await async_client.put(
-                "/auth/password",
+                "/update-password",
                 headers={"Authorization": f"Bearer {access_token}"},
                 json={
                     "old_password": "WrongPass123!",
@@ -346,13 +346,13 @@ class TestPasswordUpdateEndpoint:
         username = f"pwduser_{uuid4().hex[:8]}"
         password = "SecurePass123!"
         
-        await async_client.post("/auth/signup", json={
+        await async_client.post("/signup", json={
             "username": username,
             "email": f"{username}@example.com",
             "password": password
         })
         
-        login_response = await async_client.post("/auth/login", json={
+        login_response = await async_client.post("/login", json={
             "username": username,
             "password": password
         })
@@ -362,7 +362,7 @@ class TestPasswordUpdateEndpoint:
         
         if access_token:
             response = await async_client.put(
-                "/auth/password",
+                "/update-password",
                 headers={"Authorization": f"Bearer {access_token}"},
                 json={
                     "old_password": password,
@@ -382,13 +382,13 @@ class TestProtectedEndpoint:
         username = f"protuser_{uuid4().hex[:8]}"
         password = "SecurePass123!"
         
-        await async_client.post("/auth/signup", json={
+        await async_client.post("/signup", json={
             "username": username,
             "email": f"{username}@example.com",
             "password": password
         })
         
-        login_response = await async_client.post("/auth/login", json={
+        login_response = await async_client.post("/login", json={
             "username": username,
             "password": password
         })
@@ -398,7 +398,7 @@ class TestProtectedEndpoint:
         
         if access_token:
             response = await async_client.get(
-                "/auth/protected",
+                "/protected-route",
                 headers={"Authorization": f"Bearer {access_token}"}
             )
             
@@ -407,7 +407,7 @@ class TestProtectedEndpoint:
     @pytest.mark.asyncio
     async def test_protected_route_without_token(self, async_client):
         """Test accessing protected route without token"""
-        response = await async_client.get("/auth/protected")
+        response = await async_client.get("/protected-route")
         
         assert response.status_code == 401
     
@@ -415,7 +415,7 @@ class TestProtectedEndpoint:
     async def test_protected_route_with_invalid_token(self, async_client):
         """Test accessing protected route with invalid token"""
         response = await async_client.get(
-            "/auth/protected",
+            "/protected-route",
             headers={"Authorization": "Bearer invalid.token.here"}
         )
         
@@ -428,7 +428,7 @@ class TestAuthenticationSecurity:
     @pytest.mark.asyncio
     async def test_sql_injection_prevention(self, async_client):
         """Test SQL injection prevention in login"""
-        response = await async_client.post("/auth/login", json={
+        response = await async_client.post("/login", json={
             "username": "admin' OR '1'='1",
             "password": "password' OR '1'='1"
         })
@@ -439,7 +439,7 @@ class TestAuthenticationSecurity:
     @pytest.mark.asyncio
     async def test_xss_prevention(self, async_client):
         """Test XSS prevention in signup"""
-        response = await async_client.post("/auth/signup", json={
+        response = await async_client.post("/signup", json={
             "username": "<script>alert('xss')</script>",
             "email": "test@example.com",
             "password": "SecurePass123!"
@@ -456,7 +456,7 @@ class TestAuthenticationSecurity:
         username = "ratelimituser"
         
         for _ in range(20):
-            await async_client.post("/auth/login", json={
+            await async_client.post("/login", json={
                 "username": username,
                 "password": "wrongpass"
             })

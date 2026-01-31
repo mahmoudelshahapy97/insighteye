@@ -37,20 +37,34 @@ def verify_onnx_output(onnx_path: str) -> bool:
         actual_shape = outputs[0].shape
         logger.info(f"   Actual output shape: {actual_shape}")
         
-        # Check for YOLO v8 format
+        # Check for YOLO formats
         if len(actual_shape) == 3:
             _, dim1, dim2 = actual_shape
             
-            # YOLO v8 should have 84 (4 box + 80 classes) or similar
+            # YOLO v8 standard format (4 box + 80 classes)
             if 84 in [dim1, dim2]:
                 logger.info("   ✅ Detected YOLO v8 format (84 channels)")
                 return True
+            # YOLO v5 format (deprecated)
             elif 85 in [dim1, dim2]:
                 logger.warning("   ⚠️  Detected YOLO v5 format (85 channels)")
                 logger.warning("   This model may not work correctly!")
                 return False
+            # Custom YOLO with top-K detections (e.g., 300 x 6 for single-class)
+            # Format: [batch, num_detections, 6] where 6 = [x, y, w, h, conf, class]
+            elif dim1 == 300 or dim2 == 300:
+                num_features = dim2 if dim1 == 300 else dim1
+                if num_features == 6:
+                    logger.info(f"   ✅ Detected custom YOLO format (top-{300} detections, {num_features-5} class(es))")
+                    logger.info(f"   Format: [batch, detections, features] = {actual_shape}")
+                    return True
+                else:
+                    logger.warning(f"   ⚠️  Custom format detected: {dim1} x {dim2}")
+                    logger.warning(f"   Expected 6 features but got {num_features}")
+                    return False
             else:
                 logger.warning(f"   ⚠️  Unknown format: {dim1} x {dim2}")
+                logger.warning(f"   Expected YOLO v8 (84), YOLO v5 (85), or custom (300x6)")
                 return False
         
         return True
@@ -496,4 +510,6 @@ def convert_all_models():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    convert_all_models()
+    

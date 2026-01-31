@@ -33,12 +33,36 @@ class BaseModelLoader:
         raise NotImplementedError
     
     def preprocess(self, image: np.ndarray, input_size: Tuple[int, int] = (640, 640)) -> np.ndarray:
-        """Standard YOLO preprocessing"""
-        # Resize
-        img_resized = cv2.resize(image, input_size)
+        """
+        YOLO preprocessing with letterbox (maintains aspect ratio)
+        This MUST match the preprocessing used during export!
+        """
+        # Get original dimensions
+        orig_h, orig_w = image.shape[:2]
+        target_h, target_w = input_size
+        
+        # Calculate scale to fit image within target size (letterbox)
+        scale = min(target_w / orig_w, target_h / orig_h)
+        
+        # Calculate new dimensions
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        
+        # Resize image
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Create padded image (filled with gray)
+        padded = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
+        
+        # Calculate padding offsets (center the image)
+        pad_x = (target_w - new_w) // 2
+        pad_y = (target_h - new_h) // 2
+        
+        # Place resized image in center
+        padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
         
         # Convert BGR to RGB
-        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        img_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
         
         # Normalize to [0, 1]
         img_normalized = img_rgb.astype(np.float32) / 255.0
@@ -48,6 +72,15 @@ class BaseModelLoader:
         
         # Add batch dimension
         img_batch = np.expand_dims(img_chw, axis=0)
+        
+        # Store preprocessing info for postprocessing
+        self._preprocess_info = {
+            'scale': scale,
+            'pad_x': pad_x,
+            'pad_y': pad_y,
+            'new_w': new_w,
+            'new_h': new_h
+        }
         
         return img_batch
     
@@ -62,7 +95,11 @@ class BaseModelLoader:
 
 
 class ONNXModelLoader(BaseModelLoader):
-    """ONNX Runtime model loader"""
+    """ONNX Runtime model loader with support for multiple output formats"""
+    
+    def __init__(self, model_path: str, confidence_threshold: float = 0.5):
+        super().__init__(model_path, confidence_threshold)
+        self.output_format = None  # Will be detected on first run
     
     def load_model(self):
         if not self.is_loaded:
@@ -86,15 +123,53 @@ class ONNXModelLoader(BaseModelLoader):
                 output_shape = self.model.get_outputs()[0].shape
                 logger.info(f"ONNX model output shape: {output_shape}")
                 
+                # Detect output format
+                self._detect_output_format(output_shape)
+                
                 self.is_loaded = True
                 print(f"✅ ONNX model loaded: {self.model_path}")
                 print(f"   Input: {self.input_name}")
                 print(f"   Outputs: {self.output_names}")
                 print(f"   Output shape: {output_shape}")
+                print(f"   Detected format: {self.output_format}")
                 
             except Exception as e:
                 print(f"❌ Error loading ONNX model: {e}")
                 raise
+    
+    def _detect_output_format(self, shape):
+        """
+        Detect ONNX output format:
+        - "yolov8_full": (1, 84, 8400) - Full YOLO v8 format
+        - "yolov8_simplified": (1, 300, 6) - Simplified top-K format (dynamic=False)
+        - "yolov5": (1, 25200, 85) - Legacy YOLO v5 format
+        """
+        if len(shape) != 3:
+            self.output_format = "unknown"
+            return
+        
+        _, dim1, dim2 = shape
+        
+        # YOLOv8 simplified format (what you get with dynamic=False)
+        # Format: [batch, num_detections, 6] where 6 = [x1, y1, x2, y2, conf, class]
+        if (dim1 <= 300 and dim2 == 6) or (dim1 == 6 and dim2 <= 300):
+            self.output_format = "yolov8_simplified"
+            logger.info("   Detected YOLOv8 SIMPLIFIED format (top-K detections)")
+        
+        # YOLOv8 full format
+        # Format: [batch, 84, 8400] or [batch, 8400, 84]
+        elif 84 in [dim1, dim2]:
+            self.output_format = "yolov8_full"
+            logger.info("   Detected YOLOv8 FULL format")
+        
+        # YOLOv5 format (legacy)
+        elif 85 in [dim1, dim2]:
+            self.output_format = "yolov5"
+            logger.warning("   Detected YOLOv5 format (legacy)")
+        
+        else:
+            self.output_format = "unknown"
+            logger.warning(f"   Unknown format: {dim1} x {dim2}")
     
     def predict(self, image: np.ndarray) -> np.ndarray:
         """Run inference"""
@@ -116,104 +191,252 @@ class ONNXModelLoader(BaseModelLoader):
                    input_size: Tuple[int, int] = (640, 640),
                    iou_threshold: float = 0.45) -> List[Dict]:
         """
-        Postprocess YOLO v8 outputs with improved detection
+        Postprocess YOLO outputs - handles MULTIPLE formats
         
-        YOLO v8 can output in two formats:
-        1. (1, 84, 8400) - Standard format: [x, y, w, h, class_0_prob, ..., class_79_prob]
-        2. (1, 8400, 84) - Transposed format
-        
-        Where 84 = 4 (box) + 80 (COCO classes)
+        Supports:
+        1. YOLOv8 simplified: (1, 300, 6) - [x1, y1, x2, y2, conf, class]
+        2. YOLOv8 full: (1, 84, 8400) - [x, y, w, h, class_probs...]
+        3. YOLOv5: (1, 25200, 85) - [x, y, w, h, conf, class_probs...]
         """
         logger.debug(f"Raw output shape: {outputs.shape}")
         
-        # Handle different output formats
+        # Auto-detect format if not already detected
+        if self.output_format is None:
+            self._detect_output_format(outputs.shape)
+        
+        # Route to appropriate postprocessing
+        if self.output_format == "yolov8_simplified":
+            return self._postprocess_simplified(outputs, original_shape, input_size)
+        elif self.output_format == "yolov8_full":
+            return self._postprocess_full_yolov8(outputs, original_shape, input_size, iou_threshold)
+        elif self.output_format == "yolov5":
+            return self._postprocess_yolov5(outputs, original_shape, input_size, iou_threshold)
+        else:
+            logger.error(f"Unknown output format: {outputs.shape}")
+            return []
+    
+    def _postprocess_simplified(self, outputs: np.ndarray, original_shape: Tuple[int, int],
+                               input_size: Tuple[int, int]) -> List[Dict]:
+        """
+        Postprocess YOLOv8 simplified format (dynamic=False export)
+        
+        Format: [batch, num_detections, 6]
+        Where 6 = [x1, y1, x2, y2, confidence, class_id]
+        
+        CRITICAL: Coordinates are already in xyxy format and scaled to input size!
+        """
+        logger.debug(f"Using SIMPLIFIED postprocessing")
+        
+        # Remove batch dimension
+        if len(outputs.shape) == 3:
+            detections = outputs[0]  # Shape: (num_detections, 6)
+        else:
+            detections = outputs
+        
+        # Get preprocessing info
+        preprocess_info = getattr(self, '_preprocess_info', None)
+        if not preprocess_info:
+            # Fallback to simple scaling (less accurate)
+            logger.warning("No preprocessing info available, using simple scaling")
+            scale = 1.0
+            pad_x = 0
+            pad_y = 0
+        else:
+            scale = preprocess_info['scale']
+            pad_x = preprocess_info['pad_x']
+            pad_y = preprocess_info['pad_y']
+        
+        results = []
+        for det in detections:
+            x1, y1, x2, y2, conf, cls = det
+            
+            # Filter by confidence
+            if conf < self.confidence_threshold:
+                continue
+            
+            # Convert coordinates back to original image space
+            # 1. Remove padding
+            x1 = x1 - pad_x
+            y1 = y1 - pad_y
+            x2 = x2 - pad_x
+            y2 = y2 - pad_y
+            
+            # 2. Scale back to original size
+            x1 = x1 / scale
+            y1 = y1 / scale
+            x2 = x2 / scale
+            y2 = y2 / scale
+            
+            # 3. Clip to image boundaries
+            orig_h, orig_w = original_shape
+            x1 = max(0, min(x1, orig_w))
+            y1 = max(0, min(y1, orig_h))
+            x2 = max(0, min(x2, orig_w))
+            y2 = max(0, min(y2, orig_h))
+            
+            # Validate box
+            if x2 <= x1 or y2 <= y1:
+                continue
+            
+            results.append({
+                'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                'confidence': float(conf),
+                'class_id': int(cls)
+            })
+        
+        logger.info(f"Simplified format: {len(results)} detections")
+        return results
+    
+    def _postprocess_full_yolov8(self, outputs: np.ndarray, original_shape: Tuple[int, int],
+                                 input_size: Tuple[int, int], iou_threshold: float) -> List[Dict]:
+        """
+        Postprocess YOLOv8 full format
+        
+        Format: [batch, 84, 8400] or [batch, 8400, 84]
+        Where 84 = 4 (box coords) + 80 (class scores)
+        Box coords are [x_center, y_center, width, height]
+        """
+        logger.debug(f"Using FULL YOLOv8 postprocessing")
+        
+        # Transpose if needed
         if len(outputs.shape) == 3:
             batch_size, dim1, dim2 = outputs.shape
-            
-            # Determine if we need to transpose
-            # YOLO v8 typically outputs (1, 84, 8400)
-            if dim1 < dim2:  # (1, 84, 8400)
-                # Transpose to (1, 8400, 84)
+            if dim1 < dim2:  # (1, 84, 8400) -> (1, 8400, 84)
                 outputs = outputs.transpose(0, 2, 1)
-                logger.debug(f"Transposed to: {outputs.shape}")
         
-        # Remove batch dimension: (8400, 84)
-        predictions = outputs[0]
+        # Remove batch dimension
+        predictions = outputs[0]  # Shape: (8400, 84)
         
         # Split into boxes and class scores
-        # First 4 columns: [x_center, y_center, width, height]
-        # Remaining columns: class probabilities
-        boxes = predictions[:, :4]
-        class_scores = predictions[:, 4:]
+        boxes = predictions[:, :4]  # [x_center, y_center, w, h]
+        class_scores = predictions[:, 4:]  # [class0_prob, ..., class79_prob]
         
-        logger.debug(f"Boxes shape: {boxes.shape}, Class scores shape: {class_scores.shape}")
-        
-        # For each prediction, find the class with highest probability
+        # Get best class for each detection
         class_ids = np.argmax(class_scores, axis=1)
         confidences = np.max(class_scores, axis=1)
         
-        logger.debug(f"Confidence range: [{confidences.min():.4f}, {confidences.max():.4f}]")
-        logger.debug(f"Unique class IDs before filtering: {np.unique(class_ids)}")
-        
-        # Filter by confidence threshold
+        # Filter by confidence
         mask = confidences > self.confidence_threshold
-        num_before = len(confidences)
-        num_after = np.sum(mask)
-        
-        logger.debug(f"Detections: {num_before} before threshold, {num_after} after (threshold={self.confidence_threshold})")
-        
-        if not np.any(mask):
-            logger.warning(f"No detections above confidence threshold {self.confidence_threshold}")
-            return []
-        
         boxes = boxes[mask]
         confidences = confidences[mask]
         class_ids = class_ids[mask]
         
-        logger.debug(f"Unique class IDs after filtering: {np.unique(class_ids)}")
+        if len(boxes) == 0:
+            return []
         
-        # Convert from center format (x_center, y_center, w, h) to corner format (x1, y1, x2, y2)
+        # Convert from center format to corner format
         boxes_xyxy = self._xywh_to_xyxy(boxes)
         
-        # Scale boxes from model input size to original image size
-        # YOLO outputs coordinates in the input image space (640x640)
-        scale_x = original_shape[1] / input_size[0]
-        scale_y = original_shape[0] / input_size[1]
+        # Get preprocessing info for accurate coordinate transformation
+        preprocess_info = getattr(self, '_preprocess_info', None)
+        if not preprocess_info:
+            logger.warning("No preprocessing info, using fallback scaling")
+            scale_x = original_shape[1] / input_size[0]
+            scale_y = original_shape[0] / input_size[1]
+            boxes_xyxy[:, [0, 2]] *= scale_x
+            boxes_xyxy[:, [1, 3]] *= scale_y
+        else:
+            # Accurate transformation using letterbox info
+            scale = preprocess_info['scale']
+            pad_x = preprocess_info['pad_x']
+            pad_y = preprocess_info['pad_y']
+            
+            # Remove padding
+            boxes_xyxy[:, [0, 2]] -= pad_x
+            boxes_xyxy[:, [1, 3]] -= pad_y
+            
+            # Scale back to original size
+            boxes_xyxy /= scale
         
-        boxes_xyxy[:, [0, 2]] *= scale_x
-        boxes_xyxy[:, [1, 3]] *= scale_y
+        # Clip to image boundaries
+        orig_h, orig_w = original_shape
+        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, orig_w)
+        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, orig_h)
         
-        # Clip boxes to image boundaries
-        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, original_shape[1])
-        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, original_shape[0])
-        
-        # Apply NMS to remove overlapping boxes
+        # Apply NMS
         indices = self._nms(boxes_xyxy, confidences, iou_threshold)
         
-        logger.debug(f"After NMS: {len(indices)} detections")
-        
-        # Prepare final detections
-        detections = []
+        # Build results
+        results = []
         for idx in indices:
             x1, y1, x2, y2 = boxes_xyxy[idx]
             
-            # Validate box dimensions
-            box_width = x2 - x1
-            box_height = y2 - y1
-            
-            # Skip invalid boxes
-            if box_width <= 0 or box_height <= 0:
+            if x2 <= x1 or y2 <= y1:
                 continue
             
-            detections.append({
+            results.append({
                 'bbox': [int(x1), int(y1), int(x2), int(y2)],
                 'confidence': float(confidences[idx]),
                 'class_id': int(class_ids[idx])
             })
         
-        logger.info(f"Final detections: {len(detections)}")
+        logger.info(f"Full YOLOv8 format: {len(results)} detections")
+        return results
+    
+    def _postprocess_yolov5(self, outputs: np.ndarray, original_shape: Tuple[int, int],
+                           input_size: Tuple[int, int], iou_threshold: float) -> List[Dict]:
+        """
+        Postprocess YOLOv5 format (legacy)
         
-        return detections
+        Format: [batch, 25200, 85]
+        Where 85 = 4 (box) + 1 (objectness) + 80 (class scores)
+        """
+        logger.debug(f"Using YOLOv5 postprocessing")
+        
+        predictions = outputs[0]  # Remove batch dimension
+        
+        # Split components
+        boxes = predictions[:, :4]  # [x_center, y_center, w, h]
+        objectness = predictions[:, 4]
+        class_scores = predictions[:, 5:]
+        
+        # Combine objectness with class scores
+        confidences = objectness[:, np.newaxis] * class_scores
+        class_ids = np.argmax(confidences, axis=1)
+        confidences = np.max(confidences, axis=1)
+        
+        # Filter by confidence
+        mask = confidences > self.confidence_threshold
+        boxes = boxes[mask]
+        confidences = confidences[mask]
+        class_ids = class_ids[mask]
+        
+        if len(boxes) == 0:
+            return []
+        
+        # Convert and scale boxes (same as YOLOv8 full)
+        boxes_xyxy = self._xywh_to_xyxy(boxes)
+        
+        # Transform coordinates
+        preprocess_info = getattr(self, '_preprocess_info', None)
+        if preprocess_info:
+            scale = preprocess_info['scale']
+            pad_x = preprocess_info['pad_x']
+            pad_y = preprocess_info['pad_y']
+            
+            boxes_xyxy[:, [0, 2]] -= pad_x
+            boxes_xyxy[:, [1, 3]] -= pad_y
+            boxes_xyxy /= scale
+        
+        # Clip and NMS
+        orig_h, orig_w = original_shape
+        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, orig_w)
+        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, orig_h)
+        
+        indices = self._nms(boxes_xyxy, confidences, iou_threshold)
+        
+        results = []
+        for idx in indices:
+            x1, y1, x2, y2 = boxes_xyxy[idx]
+            if x2 > x1 and y2 > y1:
+                results.append({
+                    'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                    'confidence': float(confidences[idx]),
+                    'class_id': int(class_ids[idx])
+                })
+        
+        logger.info(f"YOLOv5 format: {len(results)} detections")
+        return results
     
     def _xywh_to_xyxy(self, boxes: np.ndarray) -> np.ndarray:
         """Convert boxes from (x_center, y_center, width, height) to (x1, y1, x2, y2)"""
@@ -256,6 +479,9 @@ class ONNXModelLoader(BaseModelLoader):
         return keep
 
 
+# ... rest of the classes (TensorRT, OpenVINO, PyTorch) remain the same ...
+# I'll include them for completeness but they don't need changes
+
 class TensorRTModelLoader(BaseModelLoader):
     """TensorRT model loader for high-performance GPU inference"""
     
@@ -264,19 +490,14 @@ class TensorRTModelLoader(BaseModelLoader):
             try:
                 import tensorrt as trt
                 import pycuda.driver as cuda
-                import pycuda.autoinit  # Automatically initializes CUDA
+                import pycuda.autoinit
                 
-                # Create TensorRT logger
                 self.trt_logger = trt.Logger(trt.Logger.WARNING)
                 
-                # Load serialized engine
                 model_path = Path(self.model_path)
-                
-                # Support both .engine and .trt extensions
                 if model_path.is_file():
                     engine_file = model_path
                 else:
-                    # Try common extensions
                     for ext in ['.engine', '.trt']:
                         potential_file = model_path.with_suffix(ext)
                         if potential_file.exists():
@@ -294,21 +515,17 @@ class TensorRTModelLoader(BaseModelLoader):
                 if self.engine is None:
                     raise RuntimeError("Failed to deserialize TensorRT engine")
                 
-                # Create execution context
                 self.context = self.engine.create_execution_context()
                 
-                # Allocate buffers
                 self.inputs = []
                 self.outputs = []
                 self.bindings = []
                 self.stream = cuda.Stream()
                 
                 for i in range(self.engine.num_bindings):
-                    binding = self.engine[i]
                     size = trt.volume(self.engine.get_binding_shape(i))
                     dtype = trt.nptype(self.engine.get_binding_dtype(i))
                     
-                    # Allocate host and device buffers
                     host_mem = cuda.pagelocked_empty(size, dtype)
                     device_mem = cuda.mem_alloc(host_mem.nbytes)
                     
@@ -325,76 +542,41 @@ class TensorRTModelLoader(BaseModelLoader):
                 print(f"✅ TensorRT model loaded: {engine_file}")
                 print(f"   Input shape: {self.input_shape}")
                 print(f"   Output shape: {self.output_shape}")
-                print(f"   GPU: {cuda.Device(0).name()}")
                 
             except ImportError as e:
                 print(f"❌ TensorRT not installed: {e}")
-                print("   Install with: pip install tensorrt pycuda")
                 raise
             except Exception as e:
                 print(f"❌ Error loading TensorRT model: {e}")
                 raise
     
     def predict(self, image: np.ndarray) -> np.ndarray:
-        """Run inference using TensorRT"""
         if not self.is_loaded:
             self.load_model()
         
         import pycuda.driver as cuda
         
-        # Preprocess
         input_tensor = self.preprocess(image)
-        
-        # Ensure correct shape
         input_tensor = input_tensor.astype(np.float32).ravel()
         
-        # Copy input to device
         np.copyto(self.inputs[0]['host'], input_tensor)
-        cuda.memcpy_htod_async(
-            self.inputs[0]['device'],
-            self.inputs[0]['host'],
-            self.stream
-        )
+        cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
         
-        # Run inference
-        self.context.execute_async_v2(
-            bindings=self.bindings,
-            stream_handle=self.stream.handle
-        )
+        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
         
-        # Copy output from device
-        cuda.memcpy_dtoh_async(
-            self.outputs[0]['host'],
-            self.outputs[0]['device'],
-            self.stream
-        )
-        
-        # Synchronize
+        cuda.memcpy_dtoh_async(self.outputs[0]['host'], self.outputs[0]['device'], self.stream)
         self.stream.synchronize()
         
-        # Reshape output
         output = self.outputs[0]['host'].reshape(self.output_shape)
-        
         return output
     
     def postprocess(self, outputs: np.ndarray, original_shape: Tuple[int, int],
                    input_size: Tuple[int, int] = (640, 640),
                    iou_threshold: float = 0.45) -> List[Dict]:
-        """Postprocess TensorRT outputs (same as ONNX)"""
-        # Reuse ONNX postprocessing logic
+        # Use ONNX postprocessing (it handles multiple formats)
         loader = ONNXModelLoader("", self.confidence_threshold)
+        loader._preprocess_info = getattr(self, '_preprocess_info', None)
         return loader.postprocess(outputs, original_shape, input_size, iou_threshold)
-    
-    def unload_model(self):
-        """Cleanup TensorRT resources"""
-        if hasattr(self, 'context'):
-            del self.context
-        if hasattr(self, 'engine'):
-            del self.engine
-        if hasattr(self, 'stream'):
-            del self.stream
-        self.model = None
-        self.is_loaded = False
 
 
 class OpenVINOModelLoader(BaseModelLoader):
@@ -405,13 +587,10 @@ class OpenVINOModelLoader(BaseModelLoader):
             try:
                 from openvino.runtime import Core
                 
-                # Initialize OpenVINO
                 self.core = Core()
                 
-                # Determine model path
                 model_path = Path(self.model_path)
                 if model_path.is_dir():
-                    # Find .xml file in directory
                     xml_files = list(model_path.glob("*.xml"))
                     if not xml_files:
                         raise FileNotFoundError(f"No .xml file found in {model_path}")
@@ -419,54 +598,24 @@ class OpenVINOModelLoader(BaseModelLoader):
                 else:
                     model_file = model_path
                 
-                # Load model
                 self.model = self.core.read_model(model=str(model_file))
-                self.compiled_model = self.core.compile_model(
-                    model=self.model,
-                    device_name="CPU"  # or "GPU" if available
-                )
+                self.compiled_model = self.core.compile_model(model=self.model, device_name="CPU")
                 
-                # Get input/output info
                 self.input_layer = self.compiled_model.input(0)
                 self.output_layer = self.compiled_model.output(0)
                 
-                # Get shapes safely (handle dynamic shapes)
-                try:
-                    input_shape = self.input_layer.shape
-                    if input_shape.is_dynamic:
-                        input_shape_str = str(input_shape)
-                    else:
-                        input_shape_str = str(list(input_shape))
-                except:
-                    input_shape_str = "dynamic"
-                
-                try:
-                    output_shape = self.output_layer.shape
-                    if output_shape.is_dynamic:
-                        output_shape_str = str(output_shape)
-                    else:
-                        output_shape_str = str(list(output_shape))
-                except:
-                    output_shape_str = "dynamic"
-                
                 self.is_loaded = True
                 print(f"✅ OpenVINO model loaded: {model_file}")
-                print(f"   Input shape: {input_shape_str}")
-                print(f"   Output shape: {output_shape_str}")
                 
             except Exception as e:
                 print(f"❌ Error loading OpenVINO model: {e}")
                 raise
     
     def predict(self, image: np.ndarray) -> np.ndarray:
-        """Run inference"""
         if not self.is_loaded:
             self.load_model()
         
-        # Preprocess
         input_tensor = self.preprocess(image)
-        
-        # Run inference
         result = self.compiled_model([input_tensor])
         outputs = result[self.output_layer]
         
@@ -475,9 +624,9 @@ class OpenVINOModelLoader(BaseModelLoader):
     def postprocess(self, outputs: np.ndarray, original_shape: Tuple[int, int],
                    input_size: Tuple[int, int] = (640, 640),
                    iou_threshold: float = 0.45) -> List[Dict]:
-        """Postprocess outputs (same as ONNX)"""
-        # Reuse ONNX postprocessing logic
+        # Use ONNX postprocessing (it handles multiple formats)
         loader = ONNXModelLoader("", self.confidence_threshold)
+        loader._preprocess_info = getattr(self, '_preprocess_info', None)
         return loader.postprocess(outputs, original_shape, input_size, iou_threshold)
 
 
@@ -490,10 +639,7 @@ class PyTorchModelLoader(BaseModelLoader):
                 from ultralytics import YOLO
                 import torch
                 
-                # Load YOLO model
                 self.model = YOLO(self.model_path)
-                
-                # Set device
                 device = 'cuda' if torch.cuda.is_available() else 'cpu'
                 self.model.to(device)
                 
@@ -506,61 +652,34 @@ class PyTorchModelLoader(BaseModelLoader):
                 raise
     
     def predict(self, image: np.ndarray) -> np.ndarray:
-        """Run inference using YOLO"""
         if not self.is_loaded:
             self.load_model()
         
-        # Run YOLO inference
         results = self.model(image, conf=self.confidence_threshold, verbose=False)
         
-        # Extract predictions in YOLO format
-        # Convert to numpy array format: [batch, num_detections, 5+num_classes]
         if len(results) > 0:
             result = results[0]
             boxes = result.boxes
             
             if boxes is not None and len(boxes) > 0:
-                # Get xyxy, conf, cls
-                xyxy = boxes.xyxy.cpu().numpy()  # [N, 4]
-                conf = boxes.conf.cpu().numpy()  # [N]
-                cls = boxes.cls.cpu().numpy()    # [N]
+                xyxy = boxes.xyxy.cpu().numpy()
+                conf = boxes.conf.cpu().numpy()
+                cls = boxes.cls.cpu().numpy()
                 
-                # Combine into format expected by postprocess
-                # Format: [x1, y1, x2, y2, conf, cls]
-                detections = np.column_stack([xyxy, conf, cls])  # [N, 6]
-                
-                # Add batch dimension and transpose to match YOLO output format
-                # YOLO output format is typically [1, num_classes+5, num_detections]
-                # But we'll convert in postprocess, so return as [1, N, 6]
-                output = np.expand_dims(detections, axis=0)  # [1, N, 6]
-                
+                detections = np.column_stack([xyxy, conf, cls])
+                output = np.expand_dims(detections, axis=0)
                 return output
         
-        # Return empty predictions
         return np.zeros((1, 0, 6), dtype=np.float32)
     
     def postprocess(self, outputs: np.ndarray, original_shape: Tuple[int, int],
                    input_size: Tuple[int, int] = (640, 640),
                    iou_threshold: float = 0.45) -> List[Dict]:
-        """
-        Postprocess PyTorch YOLO outputs
-        
-        Args:
-            outputs: Model outputs in format [1, N, 6] where 6 = [x1,y1,x2,y2,conf,cls]
-            original_shape: Original image shape (H, W)
-            input_size: Model input size
-            iou_threshold: NMS IOU threshold (not used, YOLO already applied NMS)
-        
-        Returns:
-            List of detections with bbox, confidence, class_id
-        """
         if outputs.shape[1] == 0:
             return []
         
-        # Remove batch dimension
-        detections_array = outputs[0]  # [N, 6]
+        detections_array = outputs[0]
         
-        # Parse detections
         detections = []
         for det in detections_array:
             x1, y1, x2, y2, conf, cls = det
@@ -580,20 +699,9 @@ class ModelFactory:
     @staticmethod
     def create_loader(model_path: str, backend: ModelBackend = None,
                      confidence_threshold: float = 0.5) -> BaseModelLoader:
-        """
-        Create appropriate model loader based on file extension or backend
-        
-        Args:
-            model_path: Path to model file or directory
-            backend: Force specific backend
-            confidence_threshold: Detection confidence threshold
-        
-        Returns:
-            Model loader instance
-        """
+        """Create appropriate model loader based on file extension or backend"""
         path = Path(model_path)
         
-        # Auto-detect backend if not specified
         if backend is None:
             if path.suffix == '.onnx':
                 backend = ModelBackend.ONNX
@@ -606,7 +714,6 @@ class ModelFactory:
             else:
                 raise ValueError(f"Cannot determine backend for {model_path}")
         
-        # Create loader
         if backend == ModelBackend.ONNX:
             return ONNXModelLoader(model_path, confidence_threshold)
         elif backend == ModelBackend.OPENVINO:

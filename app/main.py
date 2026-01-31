@@ -14,7 +14,7 @@ from app.services.stream_processing_service import stream_processing_service
 from app.services.distributed_stream_manager import initialize_distributed_stream_manager
 
 from zoneinfo import ZoneInfo
-from datetime import datetime, timezone
+from datetime import datetime
 from app.services.database import (
     init_db_pool, close_db_pool, connection_pool, 
     get_pool,
@@ -189,25 +189,6 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-
-@app.on_event("startup")
-async def on_startup():
-    try:
-        await init_db_pool()  # Ensures retry until DB is ready
-    except Exception as e:
-        logger.error(f"Startup DB connection failed ❌: {e}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Application shutdown"""
-    
-    logging.info("Shutting down application...")
-
-    # Stop distributed manager first
-    await distributed_stream_manager.stop_management_loop()
-    # Then existing cleanup...
-    await stream_manager.shutdown()
-    logging.info("✅ Application shutdown complete")
 
 if __name__ == "__main__":
 

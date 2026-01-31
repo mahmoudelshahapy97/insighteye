@@ -7,6 +7,10 @@ from uuid import uuid4
 from httpx import AsyncClient
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from app.services.database import init_db_pool, close_db_pool
+
+os.environ['DB_HOST'] = 'test_db_host'
+os.environ['POSTGRES_DB'] = 'test_database'
 
 # Add app to path
 sys.path.append(os.getcwd())
@@ -29,13 +33,20 @@ def mock_db_manager(mocker):
     manager.fetch_all = mocker.AsyncMock()
     return manager
 
+@pytest.fixture(scope="session", autouse=True)
+async def setup_database():
+    """Initialize database pool before all tests and close after."""
+    await init_db_pool()
+    yield
+    await close_db_pool()
+
 @pytest.fixture
 async def async_client():
     """HTTP client for API testing"""
     from app.main import app
     from httpx import ASGITransport
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    async with AsyncClient(transport=transport, base_url="http://localhost:8000") as client: #https://te-s.xyz/insighteye
         yield client
 
 @pytest.fixture

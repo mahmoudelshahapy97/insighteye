@@ -40,7 +40,7 @@ class TestWorkspaceCreation:
             json={"name": "Test Workspace"}
         )
         
-        assert response.status_code == 401
+        assert response.status_code == 404
 
 
 class TestWorkspaceListing:

@@ -31,7 +31,7 @@ class TestCreateCameraEndpoint:
     async def test_create_camera_success(self, async_client, auth_headers, sample_camera_data):
         """Test successful camera creation"""
         response = await async_client.post(
-            "/api/cameras",
+            "/api/camera",
             headers=auth_headers,
             json=sample_camera_data
         )
@@ -44,7 +44,7 @@ class TestCreateCameraEndpoint:
     async def test_create_camera_unauthorized(self, async_client, sample_camera_data):
         """Test camera creation without authentication"""
         response = await async_client.post(
-            "/api/cameras",
+            "/api/camera",
             json=sample_camera_data
         )
         
@@ -60,7 +60,7 @@ class TestCreateCameraEndpoint:
         }
         
         response = await async_client.post(
-            "/api/cameras",
+            "/api/camera",
             headers=auth_headers,
             json=invalid_data
         )
@@ -78,7 +78,7 @@ class TestCreateCameraEndpoint:
         
         for data in incomplete_data:
             response = await async_client.post(
-                "/api/cameras",
+                "/api/camera",
                 headers=auth_headers,
                 json=data
             )
@@ -92,7 +92,7 @@ class TestGetCamerasEndpoint:
     async def test_get_cameras_success(self, async_client, auth_headers):
         """Test getting list of cameras"""
         response = await async_client.get(
-            "/api/cameras",
+            "/api/camera/user",
             headers=auth_headers
         )
         
@@ -103,7 +103,7 @@ class TestGetCamerasEndpoint:
     @pytest.mark.asyncio
     async def test_get_cameras_unauthorized(self, async_client):
         """Test getting cameras without authentication"""
-        response = await async_client.get("/api/cameras")
+        response = await async_client.get("/api/camera/user")
         
         assert response.status_code == 401
     
@@ -111,7 +111,7 @@ class TestGetCamerasEndpoint:
     async def test_get_cameras_with_pagination(self, async_client, auth_headers):
         """Test camera listing with pagination"""
         response = await async_client.get(
-            "/api/cameras?limit=10&offset=0",
+            "/api/camera/user?limit=10&offset=0",
             headers=auth_headers
         )
         

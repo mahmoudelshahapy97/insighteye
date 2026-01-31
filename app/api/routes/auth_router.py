@@ -116,6 +116,19 @@ async def signup_route(user_create_request: CreateUserRequest, request_obj: Fast
 
 @router.post("/login", response_model=Dict[str, Any])
 async def login_route(login_data: LoginRequest, request_obj: FastAPIRequest, response: Response):
+
+    if not login_data.username and not login_data.email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either username or email is required"
+        )
+    
+    if not login_data.password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password is required"
+        )
+
     attempted_identifier = login_data.username or login_data.email or "unknown_identifier"
     try:
         is_valid, username = await user_manager.verify_credentials(login_data.username, login_data.email, login_data.password)
@@ -138,21 +151,20 @@ async def login_route(login_data: LoginRequest, request_obj: FastAPIRequest, res
             logger.error(f"User '{username}' passed credential check but was not found by get_user_by_username.")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found after successful credential verification.")
 
-        user_id_obj = user_data.get("user_id") # This is UUID from UserManager
+        user_id_obj = user_data.get("user_id") 
         if not isinstance(user_id_obj, UUID): 
             logger.error(f"User ID for {username} is not a UUID: {type(user_id_obj)}. Value: {user_id_obj}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error: Invalid user ID format.")
 
-        active_workspace_info = await workspace_service.get_active_workspace(user_id_obj) # Expects UUID, returns Dict with UUID for workspace_id
+        active_workspace_info = await workspace_service.get_active_workspace(user_id_obj) 
         active_workspace_id_obj: Optional[UUID] = None
         
         if active_workspace_info and active_workspace_info.get("workspace_id"):
-            ws_id_raw = active_workspace_info["workspace_id"] # This should now be UUID
+            ws_id_raw = active_workspace_info["workspace_id"] 
             if isinstance(ws_id_raw, UUID):
                 active_workspace_id_obj = ws_id_raw
             else: 
                 logger.warning(f"Workspace ID for user {username} from get_active_workspace was not UUID: {type(ws_id_raw)}. Value: {ws_id_raw}")
-                # Attempt conversion if it's a string UUID
                 if isinstance(ws_id_raw, str):
                     try:
                         active_workspace_id_obj = UUID(ws_id_raw)
@@ -499,8 +511,6 @@ async def revoke_token_route(request_obj: FastAPIRequest, token: str = Depends(s
 
 @router.get("/protected-route") 
 async def protected_route(request_obj: FastAPIRequest, current_user_full_data: dict = Depends(session_manager.get_current_user_full_data_dependency)): 
-    # Dependency ensures user is authenticated and provides data
-    # current_user_full_data should contain user_id, workspace_id as UUID objects
     username = current_user_full_data.get("username")
     user_id_obj = current_user_full_data.get("user_id") 
     user_role = current_user_full_data.get("role")
@@ -517,7 +527,6 @@ async def protected_route(request_obj: FastAPIRequest, current_user_full_data: d
             status="success"
         )
         
-        # Prepare response, converting UUIDs to strings for JSON compatibility
         response_data = current_user_full_data.copy()
         if isinstance(response_data.get("user_id"), UUID):
             response_data["user_id"] = str(response_data["user_id"])
@@ -526,8 +535,7 @@ async def protected_route(request_obj: FastAPIRequest, current_user_full_data: d
             
         return {"message": "Access granted", "user": response_data}
 
-    # Most auth errors should be caught by the dependency. This handles other potential errors.
-    except asyncpg.PostgresError as db_err: # Should ideally be caught by dependency if it makes DB calls
+    except asyncpg.PostgresError as db_err: 
         logger.error(f"Database error accessing protected route for user {username}: {db_err}", exc_info=True)
         await session_manager.log_action(
             content=f"Error accessing protected route for user '{username}'. Reason: Database error.", user_id=user_id_obj, workspace_id=workspace_id_obj,
@@ -536,7 +544,7 @@ async def protected_route(request_obj: FastAPIRequest, current_user_full_data: d
         )
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="A database error occurred.")
     except HTTPException as http_exc: 
-        raise http_exc # Re-raise if dependency raised it
+        raise http_exc 
     except Exception as e:
         logger.error(f"Unexpected error accessing protected route for user {username}: {e}", exc_info=True)
         await session_manager.log_action(

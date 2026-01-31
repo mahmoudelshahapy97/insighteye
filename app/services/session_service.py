@@ -695,11 +695,17 @@ class SessionManager:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authorization credentials", headers={"WWW-Authenticate": "Bearer"})
         token = credentials.credentials
         try:
-            if await self.is_token_blacklisted(token):
+            is_blacklisted = await self.is_token_blacklisted(token)
+            if is_blacklisted:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked", headers={"WWW-Authenticate": "Bearer"})
+        except HTTPException as http_exc:
+            # If it's already an HTTP exception from blacklist check, raise it
+            raise http_exc
         except Exception as e:
-            logger.error(f"Error checking token blacklist during full data retrieval: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error verifying token status.")
+            # FIXED: Don't fail on blacklist check errors (e.g., DB unavailable)
+            # Log the error but continue to token verification
+            logger.warning(f"Error checking token blacklist (continuing to verification): {e}")
+            # Don't raise - let token verification handle validity
         
         token_data = await self.verify_token(token, expected_token_type="access")
         if not token_data:
