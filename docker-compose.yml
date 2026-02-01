@@ -27,6 +27,8 @@ services:
       - OPENCV_FFMPEG_LOGLEVEL=-8
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     ports:
       - "${APP_PORT:-8000}:8000"
     volumes:
@@ -38,6 +40,14 @@ services:
       uvicorn app.main:app
       --host 0.0.0.0
       --port 8000
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     networks:
       - insighteye_network
 
@@ -51,6 +61,8 @@ services:
       - OPENCV_FFMPEG_LOGLEVEL=-8
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - .:/app
     depends_on:
@@ -67,6 +79,14 @@ services:
       --without-gossip
       --without-mingle
       --without-heartbeat
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     networks:
       - insighteye_network
 

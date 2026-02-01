@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
@@ -17,24 +18,30 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Set python3 as default
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+
+# Upgrade pip and install uv
 RUN python -m pip install --upgrade pip setuptools wheel
 RUN pip install uv
 
+# Copy requirements
 COPY requirements.txt .
 
-# Install everything from requirements.txt (torch/tensorrt already excluded there)
+# Install Python dependencies using uv in system Python
 RUN uv pip install --system --no-cache-dir -r requirements.txt
 
-# Install torch cu121 with plain pip — uv can't handle +cu121 local tags
-RUN pip install --no-cache-dir \
-    torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu121
+# Optional: force numpy version
+RUN uv pip install --system --no-cache-dir numpy==1.26.4
 
-# TensorRT cu12 last
-RUN pip install --no-cache-dir tensorrt-cu12
-RUN pip install --no-cache-dir cuda-python
+# Optional: install PyTorch with CUDA
+# RUN uv install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
+# Copy application code
 COPY . .
+
+# Expose port
 EXPOSE 8000
+
+# Run the app
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
