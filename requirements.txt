@@ -3,7 +3,7 @@ aiofiles
 fastapi
 starlette
 pydantic
-opencv-python-headless==4.8.1.78
+#opencv-python-headless==4.8.1.78
 chromadb
 ultralytics==8.4.7
 Pillow
@@ -55,4 +55,6 @@ openvino-dev==2024.0.0
 # tensorrt installed via Dockerfile as tensorrt-cu12
 #tensorrt==10.15.1.29
 #pycuda>=2022.1
+tensorrt-cu12
+cuda-python
 numpy==1.26.4

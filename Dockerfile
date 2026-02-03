@@ -1,40 +1,63 @@
-FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+# We use the devel image to ensure all headers/libs are present
+FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
 
 WORKDIR /app
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    gcc \
-    g++ \
-    curl \
-    libgl1 \
-    libglib2.0-0 \
-    ffmpeg \
+# ===============================
+# System Dependencies
+# ===============================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git pkg-config \
+    libjpeg-dev libpng-dev libtiff-dev \
+    libavcodec-dev libavformat-dev libswscale-dev \
+    libgtk-3-dev libcanberra-gtk3-dev \
+    libxvidcore-dev libx264-dev \
+    libatlas-base-dev gfortran \
+    python3-dev python3-pip python3-numpy \
+    libgl1 libglib2.0-0 ffmpeg curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
-RUN python -m pip install --upgrade pip setuptools wheel
-RUN pip install uv
+# ===============================
+# UV and Python Dependencies
+# ===============================
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mv /root/.local/bin/uv /usr/local/bin/uv
 
-COPY requirements.txt .
+COPY requirements-base.txt requirements-gpu.txt ./
 
-# Install everything from requirements.txt (torch/tensorrt already excluded there)
-RUN uv pip install --system --no-cache-dir -r requirements.txt
+# Install requirements + nvidia-cudnn-cu12 (provides libcudnn.so.9)
+RUN uv pip install --system --no-cache \
+    -r requirements-base.txt \
+    -r requirements-gpu.txt \
+    nvidia-cudnn-cu12
 
-# Install torch cu121 with plain pip — uv can't handle +cu121 local tags
-RUN pip install --no-cache-dir \
-    torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu121
+# ===============================
+# OpenCV with CUDA
+# ===============================
+RUN uv pip install --system --no-cache \
+    https://github.com/cudawarped/opencv-python-cuda-wheels/releases/download/4.10.0.84/opencv_contrib_python-4.10.0.84-cp37-abi3-linux_x86_64.whl
 
-# TensorRT cu12 last
-RUN pip install --no-cache-dir tensorrt-cu12
-RUN pip install --no-cache-dir cuda-python
+# ===============================
+# Library Path Configuration
+# ===============================
+# This tells the system where to find libcudnn.so.9 (from pip) and CUDA libs
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
 
+RUN ldconfig
+
+# Copy application code
 COPY . .
+
 EXPOSE 8000
+
+# IMPORTANT: We removed the 'RUN python3 -c "import cv2"' line.
+# It will always fail during BUILD because there is no GPU driver access.
+# It will work at RUNTIME when you use --gpus all.
+
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

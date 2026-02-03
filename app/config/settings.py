@@ -373,6 +373,20 @@ class Settings(BaseSettings):
     use_hw_accel: bool = False
 
     # =============================================================================
+    # GPU / HARDWARE ACCELERATION
+    # =============================================================================
+    use_hw_accel: bool = True  # Enable GPU acceleration for video processing
+    gpu_device_id: int = 0  # CUDA device ID (0 for first GPU)
+    gpu_memory_limit_mb: int = 2048  # GPU memory limit in MB (2GB default)
+    enable_gpu_resize: bool = True  # Use GPU for frame resizing
+    enable_gpu_decode: bool = False  # Use GPU for video decoding (requires special OpenCV build)
+
+    # GPU Performance Settings
+    gpu_batch_size: int = 1  # Number of frames to process in GPU batch
+    gpu_async_processing: bool = True  # Use async GPU operations
+    gpu_fallback_on_error: bool = True  # Automatically fallback to CPU on GPU errors
+
+    # =============================================================================
     # VIDEO / STREAM PERFORMANCE
     # =============================================================================
     cv_frame_buffer_size: int = 1

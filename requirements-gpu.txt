@@ -1,0 +1,18 @@
+# Core numeric
+numpy==1.26.4
+xgboost
+
+# Vision / YOLO
+ultralytics==8.4.7
+
+# ONNX & inference
+onnxruntime-gpu==1.23.2
+onnxslim>=0.1.71
+
+# NVIDIA / CUDA
+tensorrt-cu12
+cuda-python
+
+# OpenVINO
+openvino==2024.0.0
+openvino-dev==2024.0.0

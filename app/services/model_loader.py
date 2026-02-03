@@ -25,6 +25,7 @@ class BaseModelLoader:
         self.confidence_threshold = confidence_threshold
         self.model = None
         self.is_loaded = False
+        self.use_gpu = True
     
     def load_model(self):
         raise NotImplementedError
@@ -32,10 +33,62 @@ class BaseModelLoader:
     def predict(self, image: np.ndarray) -> np.ndarray:
         raise NotImplementedError
     
+    # def preprocess(self, image: np.ndarray, input_size: Tuple[int, int] = (640, 640)) -> np.ndarray:
+    #     """
+    #     YOLO preprocessing with letterbox (maintains aspect ratio)
+    #     This MUST match the preprocessing used during export!
+    #     """
+    #     # Get original dimensions
+    #     orig_h, orig_w = image.shape[:2]
+    #     target_h, target_w = input_size
+        
+    #     # Calculate scale to fit image within target size (letterbox)
+    #     scale = min(target_w / orig_w, target_h / orig_h)
+        
+    #     # Calculate new dimensions
+    #     new_w = int(orig_w * scale)
+    #     new_h = int(orig_h * scale)
+        
+    #     # Resize image
+    #     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+    #     # Create padded image (filled with gray)
+    #     padded = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
+        
+    #     # Calculate padding offsets (center the image)
+    #     pad_x = (target_w - new_w) // 2
+    #     pad_y = (target_h - new_h) // 2
+        
+    #     # Place resized image in center
+    #     padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
+        
+    #     # Convert BGR to RGB
+    #     img_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+        
+    #     # Normalize to [0, 1]
+    #     img_normalized = img_rgb.astype(np.float32) / 255.0
+        
+    #     # Transpose to CHW format
+    #     img_chw = img_normalized.transpose(2, 0, 1)
+        
+    #     # Add batch dimension
+    #     img_batch = np.expand_dims(img_chw, axis=0)
+        
+    #     # Store preprocessing info for postprocessing
+    #     self._preprocess_info = {
+    #         'scale': scale,
+    #         'pad_x': pad_x,
+    #         'pad_y': pad_y,
+    #         'new_w': new_w,
+    #         'new_h': new_h
+    #     }
+        
+    #     return img_batch
+        
     def preprocess(self, image: np.ndarray, input_size: Tuple[int, int] = (640, 640)) -> np.ndarray:
         """
         YOLO preprocessing with letterbox (maintains aspect ratio)
-        This MUST match the preprocessing used during export!
+        Supports GPU acceleration via OpenCV CUDA
         """
         # Get original dimensions
         orig_h, orig_w = image.shape[:2]
@@ -48,24 +101,61 @@ class BaseModelLoader:
         new_w = int(orig_w * scale)
         new_h = int(orig_h * scale)
         
-        # Resize image
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        
-        # Create padded image (filled with gray)
-        padded = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
-        
-        # Calculate padding offsets (center the image)
-        pad_x = (target_w - new_w) // 2
-        pad_y = (target_h - new_h) // 2
-        
-        # Place resized image in center
-        padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
-        
-        # Convert BGR to RGB
-        img_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        
-        # Normalize to [0, 1]
-        img_normalized = img_rgb.astype(np.float32) / 255.0
+        if not self.use_gpu:
+            # CPU path
+            resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            padded = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
+            pad_x = (target_w - new_w) // 2
+            pad_y = (target_h - new_h) // 2
+            padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
+            img_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+            img_normalized = img_rgb.astype(np.float32) / 255.0
+        else:
+            try:
+                # GPU path
+                # Upload to GPU
+                gpu_image = cv2.cuda_GpuMat()
+                gpu_image.upload(image)
+                
+                # Resize on GPU
+                gpu_resized = cv2.cuda.resize(
+                    gpu_image, 
+                    (new_w, new_h), 
+                    interpolation=cv2.INTER_LINEAR
+                )
+                
+                # Create padded image on GPU
+                gpu_padded = cv2.cuda_GpuMat(target_h, target_w, cv2.CV_8UC3)
+                gpu_padded.setTo((114, 114, 114))
+                
+                # Calculate padding offsets (center the image)
+                pad_x = (target_w - new_w) // 2
+                pad_y = (target_h - new_h) // 2
+                
+                # Copy resized image to center of padded image
+                # Note: Direct ROI operations on GpuMat require downloading
+                resized_cpu = gpu_resized.download()
+                padded_cpu = gpu_padded.download()
+                padded_cpu[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized_cpu
+                gpu_padded.upload(padded_cpu)
+                
+                # Convert BGR to RGB on GPU
+                gpu_rgb = cv2.cuda.cvtColor(gpu_padded, cv2.COLOR_BGR2RGB)
+                
+                # Download for normalization (GPU doesn't have native division)
+                img_rgb = gpu_rgb.download()
+                img_normalized = img_rgb.astype(np.float32) / 255.0
+                
+            except Exception as e:
+                logger.warning(f"GPU preprocessing failed, falling back to CPU: {e}")
+                # CPU fallback
+                resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                padded = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
+                pad_x = (target_w - new_w) // 2
+                pad_y = (target_h - new_h) // 2
+                padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
+                img_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+                img_normalized = img_rgb.astype(np.float32) / 255.0
         
         # Transpose to CHW format
         img_chw = img_normalized.transpose(2, 0, 1)
@@ -83,7 +173,7 @@ class BaseModelLoader:
         }
         
         return img_batch
-    
+
     def postprocess(self, outputs: np.ndarray, original_shape: Tuple[int, int],
                    input_size: Tuple[int, int] = (640, 640)) -> List[Dict]:
         """Standard YOLO postprocessing"""
@@ -477,327 +567,6 @@ class ONNXModelLoader(BaseModelLoader):
             order = order[inds + 1]
         
         return keep
-
-
-# class TensorRTModelLoader(BaseModelLoader):
-#     """TensorRT model loader for high-performance GPU inference"""
-    
-#     def load_model(self):
-#         if not self.is_loaded:
-#             try:
-#                 import tensorrt as trt
-#                 import pycuda.driver as cuda
-#                 import pycuda.autoinit
-                
-#                 self.trt_logger = trt.Logger(trt.Logger.WARNING)
-                
-#                 model_path = Path(self.model_path)
-#                 if model_path.is_file():
-#                     engine_file = model_path
-#                 else:
-#                     for ext in ['.engine', '.trt']:
-#                         potential_file = model_path.with_suffix(ext)
-#                         if potential_file.exists():
-#                             engine_file = potential_file
-#                             break
-#                     else:
-#                         raise FileNotFoundError(f"No TensorRT engine file found for {model_path}")
-                
-#                 print(f"🔄 Loading TensorRT engine from {engine_file}")
-                
-#                 with open(engine_file, 'rb') as f:
-#                     runtime = trt.Runtime(self.trt_logger)
-#                     self.engine = runtime.deserialize_cuda_engine(f.read())
-                
-#                 if self.engine is None:
-#                     raise RuntimeError("Failed to deserialize TensorRT engine")
-                
-#                 self.context = self.engine.create_execution_context()
-                
-#                 self.inputs = []
-#                 self.outputs = []
-#                 self.bindings = []
-#                 self.stream = cuda.Stream()
-                
-#                 for i in range(self.engine.num_bindings):
-#                     size = trt.volume(self.engine.get_binding_shape(i))
-#                     dtype = trt.nptype(self.engine.get_binding_dtype(i))
-                    
-#                     host_mem = cuda.pagelocked_empty(size, dtype)
-#                     device_mem = cuda.mem_alloc(host_mem.nbytes)
-                    
-#                     self.bindings.append(int(device_mem))
-                    
-#                     if self.engine.binding_is_input(i):
-#                         self.inputs.append({'host': host_mem, 'device': device_mem})
-#                         self.input_shape = self.engine.get_binding_shape(i)
-#                     else:
-#                         self.outputs.append({'host': host_mem, 'device': device_mem})
-#                         self.output_shape = self.engine.get_binding_shape(i)
-                
-#                 self.is_loaded = True
-#                 print(f"✅ TensorRT model loaded: {engine_file}")
-#                 print(f"   Input shape: {self.input_shape}")
-#                 print(f"   Output shape: {self.output_shape}")
-                
-#             except ImportError as e:
-#                 print(f"❌ TensorRT not installed: {e}")
-#                 raise
-#             except Exception as e:
-#                 print(f"❌ Error loading TensorRT model: {e}")
-#                 raise
-    
-#     def predict(self, image: np.ndarray) -> np.ndarray:
-#         if not self.is_loaded:
-#             self.load_model()
-        
-#         import pycuda.driver as cuda
-        
-#         input_tensor = self.preprocess(image)
-#         input_tensor = input_tensor.astype(np.float32).ravel()
-        
-#         np.copyto(self.inputs[0]['host'], input_tensor)
-#         cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
-        
-#         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
-        
-#         cuda.memcpy_dtoh_async(self.outputs[0]['host'], self.outputs[0]['device'], self.stream)
-#         self.stream.synchronize()
-        
-#         output = self.outputs[0]['host'].reshape(self.output_shape)
-#         return output
-    
-#     def postprocess(self, outputs: np.ndarray, original_shape: Tuple[int, int],
-#                    input_size: Tuple[int, int] = (640, 640),
-#                    iou_threshold: float = 0.45) -> List[Dict]:
-#         # Use ONNX postprocessing (it handles multiple formats)
-#         loader = ONNXModelLoader("", self.confidence_threshold)
-#         loader._preprocess_info = getattr(self, '_preprocess_info', None)
-#         return loader.postprocess(outputs, original_shape, input_size, iou_threshold)
-
-
-# class TensorRTModelLoader(BaseModelLoader):
-#     """TensorRT model loader using tensorrt-cu12 + cuda-python"""
-    
-#     def load_model(self):
-#         if not self.is_loaded:
-#             try:
-#                 import tensorrt as trt
-#                 from cuda import cuda, cudart
-                
-#                 # Initialize CUDA
-#                 err, = cuda.cuInit(0)
-#                 if err != cuda.CUresult.CUDA_SUCCESS:
-#                     raise RuntimeError(f"CUDA init failed: {err}")
-                
-#                 err, device = cuda.cuDeviceGet(0)
-#                 err, self.cu_ctx = cuda.cuCtxCreate(0, device)
-#                 err, self.cu_stream = cuda.cuStreamCreate(0)
-                
-#                 self.trt_logger = trt.Logger(trt.Logger.WARNING)
-                
-#                 model_path = Path(self.model_path)
-#                 if model_path.is_file():
-#                     engine_file = model_path
-#                 else:
-#                     for ext in ['.engine', '.trt']:
-#                         potential_file = model_path.with_suffix(ext)
-#                         if potential_file.exists():
-#                             engine_file = potential_file
-#                             break
-#                     else:
-#                         raise FileNotFoundError(f"No TensorRT engine file found for {model_path}")
-                
-#                 print(f"🔄 Loading TensorRT engine from {engine_file}")
-                
-#                 with open(engine_file, 'rb') as f:
-#                     runtime = trt.Runtime(self.trt_logger)
-#                     self.engine = runtime.deserialize_cuda_engine(f.read())
-                
-#                 if self.engine is None:
-#                     raise RuntimeError("Failed to deserialize TensorRT engine")
-                
-#                 self.context = self.engine.create_execution_context()
-                
-#                 # Allocate buffers
-#                 self.inputs = []
-#                 self.outputs = []
-#                 self.bindings = []
-                
-#                 for i in range(self.engine.num_bindings):
-#                     shape = self.engine.get_binding_shape(i)
-#                     size = trt.volume(shape)
-#                     dtype = trt.nptype(self.engine.get_binding_dtype(i))
-                    
-#                     # Host buffer
-#                     host_mem = np.empty(size, dtype=dtype)
-                    
-#                     # Device buffer
-#                     err, device_mem = cuda.cuMemAlloc(host_mem.nbytes)
-                    
-#                     self.bindings.append(int(device_mem))
-                    
-#                     if self.engine.binding_is_input(i):
-#                         self.inputs.append({
-#                             'host': host_mem,
-#                             'device': device_mem,
-#                             'shape': shape
-#                         })
-#                     else:
-#                         self.outputs.append({
-#                             'host': host_mem,
-#                             'device': device_mem,
-#                             'shape': shape
-#                         })
-                
-#                 self.is_loaded = True
-#                 print(f"✅ TensorRT model loaded: {engine_file}")
-#                 print(f"   Input shape: {self.inputs[0]['shape']}")
-#                 print(f"   Output shape: {self.outputs[0]['shape']}")
-                
-#             except ImportError as e:
-#                 print(f"❌ Missing dependency: {e}")
-#                 print("   Run: pip install cuda-python tensorrt-cu12")
-#                 raise
-#             except Exception as e:
-#                 print(f"❌ Error loading TensorRT model: {e}")
-#                 raise
-    
-#     def predict(self, image: np.ndarray) -> np.ndarray:
-#         if not self.is_loaded:
-#             self.load_model()
-        
-#         from cuda import cuda
-        
-#         input_tensor = self.preprocess(image).astype(np.float32).ravel()
-        
-#         # Copy input to host buffer
-#         np.copyto(self.inputs[0]['host'], input_tensor)
-        
-#         # Host -> Device
-#         cuda.cuMemcpyHtoD(
-#             self.inputs[0]['device'],
-#             self.inputs[0]['host'],
-#             self.inputs[0]['host'].nbytes
-#         )
-        
-#         # Execute
-#         self.context.execute_v2(bindings=self.bindings)
-        
-#         # Device -> Host
-#         cuda.cuMemcpyDtoH(
-#             self.outputs[0]['host'],
-#             self.outputs[0]['device'],
-#             self.outputs[0]['host'].nbytes
-#         )
-        
-#         output = self.outputs[0]['host'].reshape(self.outputs[0]['shape'])
-#         return output
-    
-#     def postprocess(self, outputs: np.ndarray, original_shape: Tuple[int, int],
-#                    input_size: Tuple[int, int] = (640, 640),
-#                    iou_threshold: float = 0.45) -> List[Dict]:
-#         loader = ONNXModelLoader("", self.confidence_threshold)
-#         loader._preprocess_info = getattr(self, '_preprocess_info', None)
-#         loader._detect_output_format(outputs.shape)
-#         return loader.postprocess(outputs, original_shape, input_size, iou_threshold)
-
-
-# class TensorRTModelLoader(BaseModelLoader):
-#     """TensorRT model loader using tensorrt-cu12 native bindings"""
-    
-#     def load_model(self):
-#         if not self.is_loaded:
-#             try:
-#                 import tensorrt as trt
-#                 import numpy as np
-                
-#                 self.trt_logger = trt.Logger(trt.Logger.WARNING)
-                
-#                 model_path = Path(self.model_path)
-#                 if model_path.is_file():
-#                     engine_file = model_path
-#                 else:
-#                     for ext in ['.engine', '.trt']:
-#                         potential_file = model_path.with_suffix(ext)
-#                         if potential_file.exists():
-#                             engine_file = potential_file
-#                             break
-#                     else:
-#                         raise FileNotFoundError(f"No TensorRT engine file found for {model_path}")
-                
-#                 print(f"🔄 Loading TensorRT engine from {engine_file}")
-                
-#                 with open(engine_file, 'rb') as f:
-#                     runtime = trt.Runtime(self.trt_logger)
-#                     self.engine = runtime.deserialize_cuda_engine(f.read())
-                
-#                 if self.engine is None:
-#                     raise RuntimeError("Failed to deserialize TensorRT engine")
-                
-#                 self.context = self.engine.create_execution_context()
-                
-#                 # Get input/output binding info
-#                 self.input_names = []
-#                 self.output_names = []
-#                 self.input_shapes = {}
-#                 self.output_shapes = {}
-                
-#                 for i in range(self.engine.num_bindings):
-#                     name = self.engine.get_binding_name(i)
-#                     shape = self.engine.get_binding_shape(i)
-                    
-#                     if self.engine.binding_is_input(i):
-#                         self.input_names.append(name)
-#                         self.input_shapes[name] = shape
-#                     else:
-#                         self.output_names.append(name)
-#                         self.output_shapes[name] = shape
-                
-#                 self.is_loaded = True
-#                 print(f"✅ TensorRT model loaded: {engine_file}")
-#                 print(f"   Inputs: {self.input_shapes}")
-#                 print(f"   Outputs: {self.output_shapes}")
-                
-#             except ImportError as e:
-#                 print(f"❌ TensorRT not installed: {e}")
-#                 raise
-#             except Exception as e:
-#                 print(f"❌ Error loading TensorRT model: {e}")
-#                 raise
-    
-#     def predict(self, image: np.ndarray) -> np.ndarray:
-#         if not self.is_loaded:
-#             self.load_model()
-        
-#         import tensorrt as trt
-        
-#         input_tensor = self.preprocess(image).astype(np.float32)
-        
-#         # Use TensorRT's execute_async with numpy directly
-#         # tensorrt-cu12 handles memory transfer internally
-#         output_shape = list(self.output_shapes.values())[0]
-#         output = np.empty(output_shape, dtype=np.float32)
-        
-#         # Execute using the context's run_async or synchronous execute
-#         # For tensorrt-cu12 pip package, use execute_v2 with bindings
-#         self.context.execute_v2(
-#             bindings=[
-#                 input_tensor.ctypes.data,
-#                 output.ctypes.data
-#             ]
-#         )
-        
-#         return output
-    
-#     def postprocess(self, outputs: np.ndarray, original_shape: Tuple[int, int],
-#                    input_size: Tuple[int, int] = (640, 640),
-#                    iou_threshold: float = 0.45) -> List[Dict]:
-#         # Reuse ONNX postprocessing logic (handles all YOLO output formats)
-#         loader = ONNXModelLoader("", self.confidence_threshold)
-#         loader._preprocess_info = getattr(self, '_preprocess_info', None)
-#         loader._detect_output_format(outputs.shape)
-#         return loader.postprocess(outputs, original_shape, input_size, iou_threshold)
 
 
 class TensorRTModelLoader(BaseModelLoader):
