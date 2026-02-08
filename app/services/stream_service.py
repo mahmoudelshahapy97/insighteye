@@ -2165,6 +2165,7 @@ class StreamManager:
                                     await self.video_stream_service.update_stream_status(
                                         stream_id, 'inactive', is_streaming=False
                                     )
+                                    # await self.status_batcher.queue_update(stream_id, "inactive", False)
                                     continue
 
                                 # Prepare location info

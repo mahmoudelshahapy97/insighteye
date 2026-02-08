@@ -408,7 +408,7 @@ class SharedVideoStream:
         self,
         source: str,
         stream_id: str,
-        max_subscribers: int = 10,
+        max_subscribers: int = config.max_local_streams,
         enable_gpu: bool = True,
     ):
         self.source = source
@@ -1399,7 +1399,7 @@ class VideoFileManager:
         self,
         source: str,
         stream_id: Optional[Union[str, UUID, int]] = None,
-        max_subscribers: int = 10,
+        max_subscribers: int = config.max_local_streams,
     ) -> SharedVideoStream:
         async with self.lock:
             if source not in self.shared_streams:
