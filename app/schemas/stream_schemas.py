@@ -1,6 +1,7 @@
 # app/schemas/stream_schemas.py
 from pydantic import BaseModel, Field, validator
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Dict, Any
+from datetime import datetime
 
 class CameraData(BaseModel):
     camera_id: str
@@ -64,4 +65,45 @@ class LocationSearchQuery(BaseModel):
     end_date: Optional[str] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
-    
+
+
+class FrameRequest(BaseModel):
+    """Request model for retrieving frames"""
+    stream_ids: List[str] = Field(..., description="List of stream IDs to retrieve frames for")
+    limit: int = Field(default=1, ge=1, le=100, description="Number of frames per stream")
+    include_metadata: bool = Field(default=True, description="Include PostgreSQL metadata")
+    include_base64: bool = Field(default=True, description="Include base64 encoded frame")
+    start_time: Optional[datetime] = Field(None, description="Filter frames from this time")
+    end_time: Optional[datetime] = Field(None, description="Filter frames until this time")
+
+class FrameMetadata(BaseModel):
+    """Frame metadata from PostgreSQL"""
+    stream_id: str
+    camera_name: str
+    location: Optional[str]
+    area: Optional[str]
+    building: Optional[str]
+    floor_level: Optional[str]
+    zone: Optional[str]
+    timestamp: datetime
+    detection_count: Optional[int] = None
+    detections: Optional[List[Dict[str, Any]]] = None
+    is_streaming: bool
+    status: str
+
+class FrameData(BaseModel):
+    """Complete frame data"""
+    frame_id: str
+    stream_id: str
+    timestamp: datetime
+    frame_base64: Optional[str] = None
+    metadata: Optional[FrameMetadata] = None
+    qdrant_score: Optional[float] = None
+    frame_number: Optional[int] = None
+
+class BatchFrameResponse(BaseModel):
+    """Response for batch frame retrieval"""
+    total_streams: int
+    total_frames: int
+    frames: List[FrameData]
+    errors: List[Dict[str, str]] = []

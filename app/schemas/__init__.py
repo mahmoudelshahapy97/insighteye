@@ -196,6 +196,10 @@ from app.schemas.stream_schemas import (
     CameraIdsResponse,
     DeleteDataRequest,
     LocationSearchQuery,
+    FrameRequest,
+    FrameMetadata,
+    FrameData,
+    BatchFrameResponse,
 )
 
 # Stream1 Management
@@ -377,6 +381,7 @@ __all__ = [
     'CameraData', 'SearchQuery', 'StreamInputItem', 'StreamInput',
     'TimestampRangeResponse', 'CameraIdsResponse', 'DeleteDataRequest',
     'LocationSearchQuery',
+    'FrameRequest', 'FrameMetadata', 'FrameData', 'BatchFrameResponse',
     
     # Qdrant
     'VectorParams', 'CreateCollectionRequest', 'CreateCollectionRequest1',
