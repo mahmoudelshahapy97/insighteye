@@ -627,11 +627,10 @@ class SharedVideoStream:
             await asyncio.sleep(0.1)
     
     # ==================== Connection Management ====================
-    
+
     def _open_rtsp_source(self) -> bool:
         """
-        Open RTSP source with MINIMAL options (proven to work with your cameras).
-        Uses 3-strategy approach: default -> TCP -> UDP
+        Open RTSP source with MINIMAL options (proven to work with your cameras)
         """
         self.metrics.connection_attempts += 1
         
@@ -648,7 +647,10 @@ class SharedVideoStream:
         
         logger.info(f"🔌 Opening RTSP (attempt #{self.metrics.connection_attempts})")
         
-        # Mask password for logging
+        # ✅ CRITICAL FIX: Use MINIMAL FFMPEG options (proven to work)
+        # Your simple test script works because it doesn't set any special options
+        # So we'll do the same here - only set what's absolutely necessary
+        
         masked_url = self.source
         if '@' in self.source:
             parts = self.source.split('@')
@@ -656,14 +658,15 @@ class SharedVideoStream:
                 scheme_user = parts[0].split('://')
                 masked_url = f"{scheme_user[0]}://***:***@{parts[1]}"
         
+        logger.info(f"📡 Connecting to: {masked_url}")
+        
         try:
-            # ✅ STRATEGY 1: Try with NO special options (like your working test)
-            # This is what works in your simple test script
+            # ✅ STRATEGY 1: Try with NO options first (like your working test)
+            # Clear any previous FFMPEG options
             if 'OPENCV_FFMPEG_CAPTURE_OPTIONS' in os.environ:
                 del os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS']
             
-            logger.info(f"📡 Connecting to: {masked_url} (default options)")
-            
+            logger.info(f"   Strategy 1: Trying with default options...")
             self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
             
             if self.cap and self.cap.isOpened():
@@ -673,7 +676,7 @@ class SharedVideoStream:
                         ret, frame = self.cap.read()
                         if ret and frame is not None and frame.size > 0:
                             logger.info(
-                                f"✅ RTSP connected (default): {self.stream_id[:8]} - "
+                                f"✅ RTSP connected (default options): {self.stream_id[:8]} - "
                                 f"{frame.shape[1]}x{frame.shape[0]}"
                             )
                             
@@ -686,12 +689,12 @@ class SharedVideoStream:
                                 pass
                             
                             return True
-                        time.sleep(0.2)
+                        time.sleep(0.3)
                     except Exception as e:
-                        logger.debug(f"Test read {attempt + 1} failed: {e}")
-                        time.sleep(0.2)
+                        logger.warning(f"   Test read {attempt + 1} failed: {e}")
+                        time.sleep(0.3)
             
-            # Strategy 1 failed
+            # Strategy 1 failed, clean up
             if self.cap:
                 try:
                     self.cap.release()
@@ -699,10 +702,10 @@ class SharedVideoStream:
                     pass
                 self.cap = None
             
-            # ✅ STRATEGY 2: Try with MINIMAL TCP options
-            logger.info(f"📡 Trying with TCP transport...")
+            # ✅ STRATEGY 2: Try with MINIMAL options (only timeout)
+            logger.info(f"   Strategy 2: Trying with minimal options (timeout only)...")
             
-            timeout_us = self.config.rtsp_timeout * 1000000
+            timeout_us = self.config.rtsp_timeout * 1000000  # microseconds
             rtsp_options = (
                 f"rtsp_transport;tcp|"
                 f"timeout;{timeout_us}|"
@@ -720,8 +723,8 @@ class SharedVideoStream:
                         ret, frame = self.cap.read()
                         if ret and frame is not None and frame.size > 0:
                             logger.info(
-                                f"✅ RTSP connected (TCP): {self.stream_id[:8]} - "
-                                f"{frame.shape[1]}x{frame.shape[0]}"
+                                f"✅ RTSP connected (minimal options): {self.stream_id[:8]} - "
+                                f"{frame.shape[1]}x{frame.shape[0]} via TCP"
                             )
                             
                             # Set properties
@@ -733,12 +736,12 @@ class SharedVideoStream:
                                 pass
                             
                             return True
-                        time.sleep(0.2)
+                        time.sleep(0.3)
                     except Exception as e:
-                        logger.debug(f"TCP test read {attempt + 1} failed: {e}")
-                        time.sleep(0.2)
+                        logger.warning(f"   Test read {attempt + 1} failed: {e}")
+                        time.sleep(0.3)
             
-            # Strategy 2 failed
+            # Strategy 2 failed, clean up
             if self.cap:
                 try:
                     self.cap.release()
@@ -746,8 +749,8 @@ class SharedVideoStream:
                     pass
                 self.cap = None
             
-            # ✅ STRATEGY 3: Try with UDP as last resort
-            logger.info(f"📡 Trying with UDP transport...")
+            # ✅ STRATEGY 3: Last resort - try UDP
+            logger.info(f"   Strategy 3: Trying UDP transport...")
             
             rtsp_options = (
                 f"rtsp_transport;udp|"
@@ -779,27 +782,13 @@ class SharedVideoStream:
                                 pass
                             
                             return True
-                        time.sleep(0.2)
+                        time.sleep(0.3)
                     except Exception as e:
-                        logger.debug(f"UDP test read {attempt + 1} failed: {e}")
-                        time.sleep(0.2)
+                        logger.warning(f"   Test read {attempt + 1} failed: {e}")
+                        time.sleep(0.3)
             
             # All strategies failed
             logger.error(f"❌ All connection strategies failed for {self.stream_id[:8]}")
-            logger.error(
-                f"   Tried:\n"
-                f"   1. Default options (no FFMPEG options)\n"
-                f"   2. TCP transport with timeout\n"
-                f"   3. UDP transport with timeout\n"
-                f"   \n"
-                f"   Possible issues:\n"
-                f"   - Camera offline (ping {masked_url.split('/')[2].split('@')[-1].split(':')[0]})\n"
-                f"   - Wrong credentials\n"
-                f"   - Firewall blocking\n"
-                f"   - Max connections reached"
-            )
-            
-            self.metrics.last_error = "All connection strategies failed"
             
             if self.cap:
                 try:
@@ -811,8 +800,8 @@ class SharedVideoStream:
             return False
             
         except Exception as e:
-            logger.error(f"❌ VideoCapture exception for {self.stream_id[:8]}: {e}")
-            self.metrics.last_error = f"VideoCapture error: {str(e)}"
+            logger.error(f"❌ VideoCapture creation failed for {self.stream_id[:8]}: {e}")
+            self.metrics.last_error = f"VideoCapture creation error: {str(e)}"
             
             if self.cap:
                 try:
@@ -821,7 +810,7 @@ class SharedVideoStream:
                     pass
                 self.cap = None
             
-            return False
+            return False    
     
     async def _try_connection_recovery(self) -> bool:
         """Try connection recovery"""

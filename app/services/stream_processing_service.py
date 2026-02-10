@@ -1417,6 +1417,16 @@ class StreamProcessingService:
             try:
                 if shared_stream:
                     await shared_stream.remove_subscriber(stream_id_str)
+                    
+                    # ✅ FIX: If no more subscribers, stop the shared stream
+                    async with shared_stream.lock:
+                        if not shared_stream.subscribers:
+                            logger.info(
+                                f"🛑 Last subscriber removed from {source[:50]}, "
+                                f"stopping SharedVideoStream"
+                            )
+                            await shared_stream._stop_capture()
+                            
             except Exception as cleanup_err:
                 logger.error(f"Error removing subscriber: {cleanup_err}")
 

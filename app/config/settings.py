@@ -359,8 +359,8 @@ class Settings(BaseSettings):
 
     # ✅ OPTIMIZED: Aggressive error handling for RTSP stability
     max_consecutive_errors: int = 100      # Down from 1000 - force recovery faster
-    max_read_timeout: float = 120.0        # Down from 180s - detect failures faster
-    recovery_interval: float = 60.0        # Up from 5s - prevent recovery spam
+    max_read_timeout: float = 60.0        # Down from 180s - detect failures faster
+    recovery_interval: float = 10.0        # Up from 5s - prevent recovery spam
     connection_health_timeout: float = 300.0  # Down from 600s - 5 min health check
 
     # Backoff settings
@@ -370,6 +370,7 @@ class Settings(BaseSettings):
     
     # Transport settings
     prefer_tcp: bool = True
+    min_reconnect_interval = 2.0
     use_hw_accel: bool = False
 
     # =============================================================================
