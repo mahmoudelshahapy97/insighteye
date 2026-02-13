@@ -8,7 +8,7 @@ import logging
 import time
 import cv2
 import numpy as np
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, Optional, Any, Tuple, List
 from uuid import UUID
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone, timedelta
@@ -54,6 +54,7 @@ class StreamProcessingService:
         self.video_file_manager = None
         self.qdrant_service = None
         self._cached_results = {}
+        self.use_gpu = True
 
         # Initialize models
         self._initialize_models()
@@ -144,8 +145,6 @@ class StreamProcessingService:
         if self.people_model is None:
             error_msg = f"🚨 CRITICAL: People model not initialized for stream {stream_id_str}"
             logger.error(error_msg)
-            
-            # This is a system-level failure - should trigger service restart
             raise RuntimeError(error_msg)
 
         # Stream-specific frame counting
@@ -168,7 +167,7 @@ class StreamProcessingService:
             }
         cache = self._cached_results[cache_key]
 
-        # Resize frame if needed
+        # Resize frame if needed with GPU support
         max_dim = config.yolo_input_size
         h, w = frame.shape[:2]
         scale = 1.0
@@ -178,13 +177,23 @@ class StreamProcessingService:
             new_w, new_h = int(w * scale), int(h * scale)
             new_w = max(2, new_w - (new_w % 2))
             new_h = max(2, new_h - (new_h % 2))
-            input_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            
+            if self.use_gpu:
+                try:
+                    gpu_frame = cv2.cuda_GpuMat()
+                    gpu_frame.upload(frame)
+                    gpu_resized = cv2.cuda.resize(gpu_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    input_frame = gpu_resized.download()
+                except Exception as e:
+                    logger.warning(f"GPU resize failed for stream {stream_id_str}, using CPU: {e}")
+                    input_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                input_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
         else:
             input_frame = frame
 
         try:
             # People detection
-            # New generic flow: predict -> postprocess
             raw_people_results = self.people_model.predict(input_frame)
             people_detections = self.people_model.postprocess(
                 raw_people_results, 
@@ -192,8 +201,7 @@ class StreamProcessingService:
                 input_size=(640, 640)
             )
 
-            # Filter for person class (usually class_id 0 for YOLO models on COCO)
-            # Adjust if using custom model where person is different
+            # Filter for person class
             person_detections = [d for d in people_detections if d['class_id'] == 0]
             person_count = len(person_detections)
 
@@ -207,7 +215,6 @@ class StreamProcessingService:
                         input_size=(640, 640)
                     )
                     
-                    # Assuming class 1 = Male, 0 = Female (standard for many gender models, verify your specific model)
                     male_count = sum(1 for d in gender_detections if d['class_id'] == 1)
                     female_count = sum(1 for d in gender_detections if d['class_id'] == 0)
                     
@@ -245,13 +252,12 @@ class StreamProcessingService:
                     cache['fire_status'] = current_fire_status
                     cache['last_fire_frame'] = frame_count
                     
-                    # Log significant changes
                     if current_fire_status != previous_fire_status:
                         if current_fire_status in ["fire", "smoke"]:
                             logger.warning(f"🔥 Fire detection change: {stream_id_str} changed to '{current_fire_status}'")
                         else:
                             logger.info(f"🌊 Fire cleared: {stream_id_str} changed to 'no detection'")
-                    
+                        
                 except Exception as e:
                     logger.error(f"Fire detection error for stream {stream_id_str}: {e}")
 
@@ -271,63 +277,170 @@ class StreamProcessingService:
                 if less_than is not None and person_count < less_than:
                     alert_triggered = True
 
-            # Annotate frame - Manual Drawing since we don't have Ultralytics .plot()
-            annotated_frame = input_frame.copy()
-            
-            # Draw people bounding boxes
-            for det in person_detections:
-                bbox = det['bbox'] # [x1, y1, x2, y2]
-                x1, y1, x2, y2 = bbox
-                conf = det['confidence']
-                
-                # Draw box
-                color = (0, 255, 0) # Green
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                
-                # Draw label
-                label = f"Person {conf:.2f}"
-                t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-                cv2.rectangle(annotated_frame, (x1, y1 - t_size[1] - 4), (x1 + t_size[0], y1), color, -1)
-                cv2.putText(annotated_frame, label, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-            
-            # Add text overlays
-            count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)
-            count_text = f"People: {person_count} | M: {male_count} | F: {female_count}"
-            cv2.putText(
-                annotated_frame, count_text, (10, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, count_color, 2, cv2.LINE_AA
-            )
-            
-            # Fire/smoke overlay
-            if fire_status != "no detection":
-                fire_color = (0, 0, 255)
-                fire_text = f"ALERT: {fire_status.upper()}"
-                cv2.putText(
-                    annotated_frame, fire_text, (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, fire_color, 2, cv2.LINE_AA
+            # Annotate frame with GPU support
+            if self.use_gpu:
+                try:
+                    annotated_frame = self._annotate_frame_gpu(
+                        input_frame, person_detections, person_count,
+                        male_count, female_count, fire_status,
+                        alert_triggered, frame_count
+                    )
+                except Exception as e:
+                    logger.warning(f"GPU annotation failed for stream {stream_id_str}, using CPU: {e}")
+                    annotated_frame = self._annotate_frame_cpu(
+                        input_frame, person_detections, person_count,
+                        male_count, female_count, fire_status,
+                        alert_triggered, frame_count
+                    )
+            else:
+                annotated_frame = self._annotate_frame_cpu(
+                    input_frame, person_detections, person_count,
+                    male_count, female_count, fire_status,
+                    alert_triggered, frame_count
                 )
-                
-                # Blinking effect
-                if frame_count % 20 < 10:
-                    red_overlay = annotated_frame.copy()
-                    red_overlay[:] = (0, 0, 255)
-                    annotated_frame = cv2.addWeighted(annotated_frame, 0.9, red_overlay, 0.1, 0)
-
-            # Alert styling for people threshold
-            if alert_triggered:
-                red_overlay = annotated_frame.copy()
-                red_overlay[:] = (0, 0, 255)
-                annotated_frame = cv2.addWeighted(annotated_frame, 0.85, red_overlay, 0.15, 0)
-                
-            # Scale back if needed
+            
+            # Scale back if needed with GPU support
             if scale != 1.0:
-                annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
+                if self.use_gpu:
+                    try:
+                        gpu_annotated = cv2.cuda_GpuMat()
+                        gpu_annotated.upload(annotated_frame)
+                        gpu_final = cv2.cuda.resize(gpu_annotated, (w, h), interpolation=cv2.INTER_LINEAR)
+                        annotated_frame = gpu_final.download()
+                    except Exception as e:
+                        logger.warning(f"GPU resize back failed for stream {stream_id_str}, using CPU: {e}")
+                        annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
                 
             return annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status
             
         except Exception as e:
             logger.error(f"Object detection error for stream {stream_id_str}: {e}", exc_info=True)
             return frame.copy(), 0, False, 0, 0, "no detection"
+
+    def _annotate_frame_cpu(
+        self,
+        frame: np.ndarray,
+        person_detections: List[Dict],
+        person_count: int,
+        male_count: int,
+        female_count: int,
+        fire_status: str,
+        alert_triggered: bool,
+        frame_count: int
+    ) -> np.ndarray:
+        """CPU-based frame annotation"""
+        annotated_frame = frame.copy()
+        
+        # Draw people bounding boxes
+        for det in person_detections:
+            bbox = det['bbox']
+            x1, y1, x2, y2 = bbox
+            conf = det['confidence']
+            
+            color = (0, 255, 0)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            
+            label = f"Person {conf:.2f}"
+            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(annotated_frame, (x1, y1 - t_size[1] - 4), (x1 + t_size[0], y1), color, -1)
+            cv2.putText(annotated_frame, label, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        # Add text overlays
+        count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)
+        count_text = f"People: {person_count} | M: {male_count} | F: {female_count}"
+        cv2.putText(annotated_frame, count_text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, count_color, 2, cv2.LINE_AA)
+        
+        # Fire/smoke overlay
+        if fire_status != "no detection":
+            fire_color = (0, 0, 255)
+            fire_text = f"ALERT: {fire_status.upper()}"
+            cv2.putText(annotated_frame, fire_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, fire_color, 2, cv2.LINE_AA)
+            
+            if frame_count % 20 < 10:
+                red_overlay = annotated_frame.copy()
+                red_overlay[:] = (0, 0, 255)
+                annotated_frame = cv2.addWeighted(annotated_frame, 0.9, red_overlay, 0.1, 0)
+
+        # Alert styling
+        if alert_triggered:
+            red_overlay = annotated_frame.copy()
+            red_overlay[:] = (0, 0, 255)
+            annotated_frame = cv2.addWeighted(annotated_frame, 0.85, red_overlay, 0.15, 0)
+        
+        return annotated_frame
+
+    def _annotate_frame_gpu(
+        self,
+        frame: np.ndarray,
+        person_detections: List[Dict],
+        person_count: int,
+        male_count: int,
+        female_count: int,
+        fire_status: str,
+        alert_triggered: bool,
+        frame_count: int
+    ) -> np.ndarray:
+        """
+        GPU-based frame annotation
+        Note: OpenCV CUDA has limited drawing functions, so we still do drawing on CPU
+        but use GPU for color space conversions and blending operations
+        """
+        # Drawing operations must be done on CPU
+        annotated_frame = frame.copy()
+        
+        # Draw people bounding boxes
+        for det in person_detections:
+            bbox = det['bbox']
+            x1, y1, x2, y2 = bbox
+            conf = det['confidence']
+            
+            color = (0, 255, 0)
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            
+            label = f"Person {conf:.2f}"
+            t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(annotated_frame, (x1, y1 - t_size[1] - 4), (x1 + t_size[0], y1), color, -1)
+            cv2.putText(annotated_frame, label, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        # Add text overlays
+        count_color = (0, 0, 255) if alert_triggered else (255, 255, 255)
+        count_text = f"People: {person_count} | M: {male_count} | F: {female_count}"
+        cv2.putText(annotated_frame, count_text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, count_color, 2, cv2.LINE_AA)
+        
+        # Fire/smoke overlay with GPU blending
+        if fire_status != "no detection":
+            fire_color = (0, 0, 255)
+            fire_text = f"ALERT: {fire_status.upper()}"
+            cv2.putText(annotated_frame, fire_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, fire_color, 2, cv2.LINE_AA)
+            
+            if frame_count % 20 < 10:
+                # Use GPU for blending
+                gpu_annotated = cv2.cuda_GpuMat()
+                gpu_annotated.upload(annotated_frame)
+                
+                red_overlay = np.full_like(annotated_frame, (0, 0, 255), dtype=np.uint8)
+                gpu_overlay = cv2.cuda_GpuMat()
+                gpu_overlay.upload(red_overlay)
+                
+                # GPU addWeighted
+                gpu_result = cv2.cuda.addWeighted(gpu_annotated, 0.9, gpu_overlay, 0.1, 0)
+                annotated_frame = gpu_result.download()
+
+        # Alert styling with GPU blending
+        if alert_triggered:
+            gpu_annotated = cv2.cuda_GpuMat()
+            gpu_annotated.upload(annotated_frame)
+            
+            red_overlay = np.full_like(annotated_frame, (0, 0, 255), dtype=np.uint8)
+            gpu_overlay = cv2.cuda_GpuMat()
+            gpu_overlay.upload(red_overlay)
+            
+            gpu_result = cv2.cuda.addWeighted(gpu_annotated, 0.85, gpu_overlay, 0.15, 0)
+            annotated_frame = gpu_result.download()
+        
+        return annotated_frame
 
     async def _get_camera_threshold_settings(self, stream_id: UUID) -> Dict[str, Any]:
         """Get threshold settings for a camera stream."""
@@ -1304,6 +1417,16 @@ class StreamProcessingService:
             try:
                 if shared_stream:
                     await shared_stream.remove_subscriber(stream_id_str)
+                    
+                    # ✅ FIX: If no more subscribers, stop the shared stream
+                    async with shared_stream.lock:
+                        if not shared_stream.subscribers:
+                            logger.info(
+                                f"🛑 Last subscriber removed from {source[:50]}, "
+                                f"stopping SharedVideoStream"
+                            )
+                            await shared_stream._stop_capture()
+                            
             except Exception as cleanup_err:
                 logger.error(f"Error removing subscriber: {cleanup_err}")
 

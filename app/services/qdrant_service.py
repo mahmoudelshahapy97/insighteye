@@ -3343,5 +3343,92 @@ class QdrantService:
             "group_type": group_by
         }
     
+    async def retrieve_points_by_ids(
+        self,
+        workspace_id: UUID,
+        point_ids: List[str],
+        with_payload: bool = True,
+        with_vectors: bool = False
+    ) -> List:
+        """Retrieve specific points by their IDs."""
+        try:
+            client = self.get_client()
+            collection_name = get_workspace_qdrant_collection_name(workspace_id)
+            
+            points = client.retrieve(
+                collection_name=collection_name,
+                ids=point_ids,
+                with_payload=with_payload,
+                with_vectors=with_vectors
+            )
+            
+            return points
+            
+        except Exception as e:
+            logger.error(f"Error retrieving points by IDs: {e}", exc_info=True)
+            return []
+
+    async def scroll_points_ordered(
+        self,
+        workspace_id: UUID,
+        filter_conditions: Optional[Dict] = None,
+        limit: int = 10,
+        order_by_field: str = "timestamp",
+        order_direction: str = "desc",
+        with_payload: bool = True,
+        with_vectors: bool = False
+    ) -> Dict[str, Any]:
+        """Scroll through points with ordering."""
+        try:
+            client = self.get_client()
+            collection_name = get_workspace_qdrant_collection_name(workspace_id)
+            
+            from qdrant_client.http import models as qdrant_models
+            
+            # Build filter
+            filter_obj = None
+            if filter_conditions:
+                must_conditions = []
+                for key, value in filter_conditions.items():
+                    if isinstance(value, dict) and 'range' in value:
+                        must_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key=key,
+                                range=qdrant_models.Range(**value['range'])
+                            )
+                        )
+                    else:
+                        must_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key=key,
+                                match=qdrant_models.MatchValue(value=value)
+                            )
+                        )
+                
+                if must_conditions:
+                    filter_obj = qdrant_models.Filter(must=must_conditions)
+            
+            # Scroll with ordering
+            points, next_offset = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=filter_obj,
+                limit=limit,
+                with_payload=with_payload,
+                with_vectors=with_vectors,
+                order_by=qdrant_models.OrderBy(
+                    key=order_by_field,
+                    direction=qdrant_models.Direction.DESC if order_direction.lower() == "desc" else qdrant_models.Direction.ASC
+                )
+            )
+            
+            return {
+                "points": points,
+                "next_offset": next_offset
+            }
+            
+        except Exception as e:
+            logger.error(f"Error scrolling points with ordering: {e}", exc_info=True)
+            return {"points": [], "next_offset": None}
+
 
 qdrant_service = QdrantService()

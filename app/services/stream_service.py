@@ -1500,6 +1500,34 @@ class StreamManager:
                     except (asyncio.CancelledError, asyncio.TimeoutError):
                         logger.warning(f"Task cancellation timeout for {stream_id_str}")
                 
+                # ✅ FIX: Stop SharedVideoStream if it exists
+                source = stream_info.get('source')
+                if source and self.video_file_manager:
+                    try:
+                        # Check if this is the last subscriber
+                        shared_stream = await self.video_file_manager.get_shared_stream(source)
+                        
+                        if shared_stream:
+                            # Remove this subscriber
+                            await shared_stream.remove_subscriber(stream_id_str)
+                            
+                            # If no more subscribers, force stop the stream
+                            async with shared_stream.lock:
+                                if not shared_stream.subscribers:
+                                    logger.info(
+                                        f"🛑 No more subscribers for {source[:50]}, "
+                                        f"stopping SharedVideoStream"
+                                    )
+                                    
+                                    # Stop the capture
+                                    await shared_stream._stop_capture()
+                                    
+                                    # Remove from manager
+                                    await self.video_file_manager.remove_shared_stream(source)
+                                    
+                    except Exception as shared_err:
+                        logger.error(f"Error stopping SharedVideoStream: {shared_err}")
+                
                 # Clean up workspace registry
                 workspace_id = stream_info.get('workspace_id')
                 if workspace_id:
@@ -2165,6 +2193,7 @@ class StreamManager:
                                     await self.video_stream_service.update_stream_status(
                                         stream_id, 'inactive', is_streaming=False
                                     )
+                                    # await self.status_batcher.queue_update(stream_id, "inactive", False)
                                     continue
 
                                 # Prepare location info

@@ -1,0 +1,64 @@
+# Core & Web
+pyyaml
+aiofiles
+fastapi
+starlette
+uvicorn
+anyio
+httpx
+websockets
+aiohttp
+python-dotenv
+loguru
+
+# Security & Auth
+passlib==1.7.4
+argon2-cffi
+pyotp
+PyJWT
+tenacity
+
+# Pydantic
+pydantic
+pydantic-settings
+pydantic[email]
+python-multipart
+
+# Data & DB
+psycopg2-binary
+asyncpg
+pandas
+elasticsearch
+qdrant-client
+
+
+# Task Queue
+celery[redis]==5.3.4
+celery[asyncio]==5.3.4
+redis==4.6.0
+kombu==5.3.4
+hiredis==2.2.3
+
+# Scheduling
+apscheduler
+
+# LangChain ecosystem (CPU-safe)
+langchain
+langchain-core
+langchain_community
+langchain-ollama
+chromadb
+
+# Utils
+Pillow
+datetime
+twisted  # added
+
+# Testing
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
+pytest-tornasync
+pytest-trio
+pytest-twisted

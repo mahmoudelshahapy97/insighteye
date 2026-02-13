@@ -1,11 +1,12 @@
 # app/routers/stream_router.py
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends, Response, Query, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 from fastapi.encoders import jsonable_encoder
 import time
 import logging
 import asyncio
+from uuid import uuid4
 from uuid import UUID
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
@@ -14,6 +15,9 @@ import concurrent.futures
 import os
 import cv2
 import numpy as np
+import io
+from PIL import Image
+import base64
 
 from app.utils import frame_to_base64, check_workspace_access, safe_close_websocket, send_ping, handle_mark_read_message
 from app.services.stream_service import stream_manager
@@ -25,7 +29,11 @@ from app.services.user_service import user_manager
 from app.schemas import (
     StreamStartRequest,
     StreamStopRequest,
-    BatchStreamOperation
+    BatchStreamOperation,
+    FrameRequest,
+    BatchFrameResponse,
+    FrameMetadata,
+    FrameData
 )
 
 router = APIRouter(tags=["streams3"]) #prefix="/streams3", 
@@ -50,6 +58,1133 @@ async def get_workspace_id_for_user(username: str) -> UUID:
     return workspace_id_obj
 
 # ==================== Stream Lifecycle Endpoints ====================
+
+
+@router.post("/frames/batch", response_model=BatchFrameResponse)
+async def get_last_frames_batch(
+    request: FrameRequest,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Retrieve last frames for multiple streams using detection_data_service."""
+    user_id_str = str(current_user_data["user_id"])
+    username = current_user_data["username"]
+    
+    try:
+        # Use detection_data_service to retrieve single detection
+        from app.services.detection_data_service import detection_data_service
+
+        # Get workspace
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace found.")
+        
+        # Verify workspace access
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id_str),
+            workspace_id_obj,
+            required_role=None
+        )
+        
+        # Validate stream IDs
+        stream_uuids = [UUID(sid) for sid in request.stream_ids]
+        
+        # Verify streams exist and get metadata
+        access_query = """
+            SELECT vs.stream_id, vs.name, vs.workspace_id, vs.location, vs.area,
+                   vs.building, vs.floor_level, vs.zone, vs.is_streaming, vs.status
+            FROM video_stream vs
+            WHERE vs.stream_id = ANY($1) AND vs.workspace_id = $2
+        """
+        accessible_streams = await db_manager.execute_query(
+            access_query,
+            (stream_uuids, workspace_id_obj),
+            fetch_all=True
+        )
+        
+        if not accessible_streams:
+            raise HTTPException(status_code=404, detail="No accessible streams found")
+        
+        stream_map = {str(s['stream_id']): s for s in accessible_streams}
+        
+        # Get workspace role for detection_data_service
+        membership = await workspace_service.check_workspace_membership_and_get_role(
+            user_id=UUID(user_id_str),
+            workspace_id=workspace_id_obj
+        )
+        user_workspace_role = membership.get("role")
+        user_system_role = current_user_data.get("role", "user")
+        
+        frames = []
+        errors = []
+        
+        # Process each stream
+        for stream_id in request.stream_ids:
+            if stream_id not in stream_map:
+                errors.append({
+                    "stream_id": stream_id,
+                    "error": "Stream not found or access denied"
+                })
+                continue
+            
+            try:
+                stream_metadata = stream_map[stream_id]
+                
+                # Build start/end date strings for detection_data_service
+                start_date = request.start_time.strftime("%Y-%m-%d") if request.start_time else None
+                end_date = request.end_time.strftime("%Y-%m-%d") if request.end_time else None
+                start_time = request.start_time.strftime("%H:%M:%S") if request.start_time else None
+                end_time = request.end_time.strftime("%H:%M:%S") if request.end_time else None
+                
+                # Use detection_data_service to retrieve data
+                result = await detection_data_service.retrieve_detection_data(
+                    workspace_id=workspace_id_obj,
+                    user_system_role=user_system_role,
+                    user_workspace_role=user_workspace_role,
+                    requesting_username=username,
+                    camera_id=[stream_id],
+                    start_date=start_date,
+                    end_date=end_date,
+                    start_time=start_time,
+                    end_time=end_time,
+                    page=1,
+                    per_page=request.limit,
+                    include_frame=request.include_base64
+                )
+                
+                if not result or not result.get("data"):
+                    errors.append({
+                        "stream_id": stream_id,
+                        "error": "No frames found"
+                    })
+                    continue
+                
+                # Process each detection result
+                for idx, detection in enumerate(result["data"]):
+                    metadata_dict = detection.get("metadata", {})
+                    
+                    frame_data = FrameData(
+                        frame_id=detection.get("id", str(uuid4())),
+                        stream_id=stream_id,
+                        timestamp=datetime.fromtimestamp(metadata_dict.get("timestamp", 0)) if metadata_dict.get("timestamp") else datetime.now(),
+                        frame_number=idx
+                    )
+                    
+                    # Add frame if requested
+                    if request.include_base64:
+                        frame_base64 = detection.get("frame")
+                        if frame_base64:
+                            frame_data.frame_base64 = frame_base64
+                        else:
+                            logger.warning(f"No frame_base64 found for detection {detection.get('id')}")
+                    
+                    # Add metadata if requested
+                    if request.include_metadata:
+                        frame_data.metadata = FrameMetadata(
+                            stream_id=stream_id,
+                            camera_name=stream_metadata['name'],
+                            location=stream_metadata.get('location'),
+                            area=stream_metadata.get('area'),
+                            building=stream_metadata.get('building'),
+                            floor_level=stream_metadata.get('floor_level'),
+                            zone=stream_metadata.get('zone'),
+                            timestamp=frame_data.timestamp,
+                            detection_count=metadata_dict.get('person_count'),
+                            detections=None,  # Could be populated if needed
+                            is_streaming=stream_metadata['is_streaming'],
+                            status=stream_metadata['status']
+                        )
+                    
+                    frames.append(frame_data)
+                
+            except Exception as e_stream:
+                logger.error(f"Error retrieving frames for stream {stream_id}: {e_stream}", exc_info=True)
+                errors.append({
+                    "stream_id": stream_id,
+                    "error": str(e_stream)
+                })
+        
+        return BatchFrameResponse(
+            total_streams=len(request.stream_ids),
+            total_frames=len(frames),
+            frames=frames,
+            errors=errors
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in batch frame retrieval: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve frames")
+
+
+@router.get("/frames/detection/{result_id}")
+async def get_detection_with_frame(
+    result_id: str,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Get a specific detection result with frame using detection_data_service."""
+    username = current_user_data["username"]
+    
+    try:
+        # Get workspace
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace found.")
+        
+        # Use detection_data_service to retrieve single detection
+        from app.services.detection_data_service import detection_data_service
+        
+        result = await detection_data_service.retrieve_single_detection(
+            result_id=UUID(result_id),
+            workspace_id=workspace_id_obj,
+            include_frame=True
+        )
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Detection not found")
+        
+        return JSONResponse(content=result)
+        
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        logger.error(f"Invalid result_id format: {ve}")
+        raise HTTPException(status_code=400, detail="Invalid result ID format")
+    except Exception as e:
+        logger.error(f"Error retrieving detection: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve detection")
+
+
+# @router.get("/frames/image/{stream_id}/latest", response_class=StreamingResponse)
+# async def get_latest_frame_image(
+#     stream_id: str,
+#     quality: int = Query(85, ge=1, le=100, description="JPEG quality"),
+#     width: Optional[int] = Query(None, ge=1, le=4096, description="Resize width"),
+#     height: Optional[int] = Query(None, ge=1, le=4096, description="Resize height"),
+#     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+# ):
+#     """
+#     Get the latest frame as a direct image (JPEG) using detection_data_service.
+    
+#     Useful for:
+#     - Displaying in <img> tags
+#     - Thumbnail generation
+#     - Direct image downloads
+    
+#     Example usage: <img src="/api/frames/image/{stream_id}/latest?width=320&height=240" />
+#     """
+#     try:
+#         # Get workspace and user info
+#         username = current_user_data["username"]
+#         user_id = UUID(str(current_user_data["user_id"]))
+        
+#         # Get workspace
+#         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+#         if not workspace_id_obj:
+#             raise HTTPException(status_code=400, detail="No active workspace found.")
+        
+#         # Validate stream exists and user has access
+#         stream_uuid = UUID(stream_id)
+        
+#         stream_query = """
+#             SELECT vs.stream_id, vs.workspace_id, vs.name
+#             FROM video_stream vs
+#             WHERE vs.stream_id = $1 AND vs.workspace_id = $2
+#         """
+#         stream_data = await db_manager.execute_query(
+#             stream_query, (stream_uuid, workspace_id_obj), fetch_one=True
+#         )
+        
+#         if not stream_data:
+#             raise HTTPException(status_code=404, detail="Stream not found or access denied")
+        
+#         # Get workspace role
+#         membership = await workspace_service.check_workspace_membership_and_get_role(
+#             user_id=user_id,
+#             workspace_id=workspace_id_obj
+#         )
+#         user_workspace_role = membership.get("role")
+#         user_system_role = current_user_data.get("role", "user")
+        
+#         # Use detection_data_service to get latest frame
+#         from app.services.detection_data_service import detection_data_service
+        
+#         result = await detection_data_service.retrieve_detection_data(
+#             workspace_id=workspace_id_obj,
+#             user_system_role=user_system_role,
+#             user_workspace_role=user_workspace_role,
+#             requesting_username=username,
+#             camera_id=[stream_id],
+#             page=1,
+#             per_page=1,
+#             include_frame=True
+#         )
+        
+#         # Validate result
+#         if not result or not result.get("data") or len(result["data"]) == 0:
+#             raise HTTPException(status_code=404, detail="No frames found for this stream")
+        
+#         # Extract frame from first result
+#         detection = result["data"][0]
+#         frame_base64 = detection.get("frame")
+        
+#         if not frame_base64:
+#             raise HTTPException(status_code=404, detail="Frame data not available")
+        
+#         # Decode base64 to image
+#         try:
+#             img_data = base64.b64decode(frame_base64)
+#             img = Image.open(io.BytesIO(img_data))
+#         except Exception as decode_error:
+#             logger.error(f"Failed to decode frame image: {decode_error}")
+#             raise HTTPException(status_code=500, detail="Failed to decode frame image")
+        
+#         # Resize if requested
+#         if width or height:
+#             # Calculate dimensions maintaining aspect ratio
+#             original_width, original_height = img.size
+            
+#             if width and height:
+#                 # Both specified - use as is
+#                 new_size = (width, height)
+#             elif width:
+#                 # Only width specified - maintain aspect ratio
+#                 ratio = width / original_width
+#                 new_size = (width, int(original_height * ratio))
+#             else:
+#                 # Only height specified - maintain aspect ratio
+#                 ratio = height / original_height
+#                 new_size = (int(original_width * ratio), height)
+            
+#             # Resize with high-quality resampling
+#             img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+#         # Convert to JPEG
+#         buffered = io.BytesIO()
+        
+#         # Convert RGBA to RGB if necessary (JPEG doesn't support transparency)
+#         if img.mode in ('RGBA', 'LA', 'P'):
+#             # Create white background
+#             background = Image.new('RGB', img.size, (255, 255, 255))
+#             if img.mode == 'P':
+#                 img = img.convert('RGBA')
+#             background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+#             img = background
+#         elif img.mode != 'RGB':
+#             img = img.convert('RGB')
+        
+#         img.save(buffered, format="JPEG", quality=quality, optimize=True)
+#         buffered.seek(0)
+        
+#         # Get metadata for helpful headers
+#         metadata = detection.get("metadata", {})
+#         timestamp = metadata.get("timestamp")
+#         camera_name = metadata.get("name", "unknown")
+        
+#         # Generate filename
+#         timestamp_str = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S") if timestamp else "latest"
+#         filename = f"{camera_name}_{timestamp_str}.jpg"
+        
+#         return StreamingResponse(
+#             buffered,
+#             media_type="image/jpeg",
+#             headers={
+#                 "Cache-Control": "no-cache, no-store, must-revalidate",
+#                 "Pragma": "no-cache",
+#                 "Expires": "0",
+#                 "Content-Disposition": f'inline; filename="{filename}"',
+#                 "X-Frame-Timestamp": str(timestamp) if timestamp else "unknown",
+#                 "X-Camera-Name": camera_name
+#             }
+#         )
+        
+#     except HTTPException:
+#         raise
+#     except ValueError as ve:
+#         logger.error(f"Invalid stream_id format: {ve}")
+#         raise HTTPException(status_code=400, detail="Invalid stream ID format")
+#     except Exception as e:
+#         logger.error(f"Error getting frame image for stream {stream_id}: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail="Failed to retrieve frame image")
+
+
+@router.get("/frames/latest/{stream_id}")
+async def get_latest_frame(
+    stream_id: str,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(1, ge=1, le=1),
+    include_base64: bool = Query(True, description="Include base64 encoded frame"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    username = current_user_data["username"]
+    user_id = UUID(str(current_user_data["user_id"]))
+    
+    # 1. Get workspace
+    _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+    if not workspace_id_obj:
+        raise HTTPException(status_code=400, detail="No active workspace found.")
+    
+    # 2. Validate stream exists and get workspace role
+    stream_uuid = UUID(stream_id)
+    
+    stream_query = """
+        SELECT vs.stream_id, vs.workspace_id, vs.name
+        FROM video_stream vs
+        WHERE vs.stream_id = $1 AND vs.workspace_id = $2
+    """
+    stream_data = await db_manager.execute_query(
+        stream_query, (stream_uuid, workspace_id_obj), fetch_one=True
+    )
+    
+    if not stream_data:
+        raise HTTPException(status_code=404, detail="Stream not found or access denied")
+    
+    # 3. Get workspace role
+    membership = await workspace_service.check_workspace_membership_and_get_role(
+        user_id=user_id,
+        workspace_id=workspace_id_obj
+    )
+    user_workspace_role = membership.get("role")
+    
+    # 4. Use detection_data_service
+    from app.services.detection_data_service import detection_data_service
+    
+    result = await detection_data_service.retrieve_detection_data(
+        workspace_id=workspace_id_obj,
+        user_system_role=current_user_data.get("role", "user"),
+        user_workspace_role=user_workspace_role,
+        requesting_username=username,
+        camera_id=[stream_id],
+        page=page,
+        per_page=per_page,
+        include_frame=include_base64
+    )
+    
+    # 5. Process result
+    if not result or not result.get("data"):
+        raise HTTPException(status_code=404, detail="No data found")
+    
+    return result
+
+
+@router.get("/frames/image/{stream_id}/latest", response_class=StreamingResponse)
+async def get_latest_frame_image(
+    stream_id: str,
+    format: str = Query("webp", regex="^(jpeg|jpg|webp|png)$", description="Image format"),
+    quality: int = Query(85, ge=1, le=100, description="Image quality (JPEG/WebP: 1-100, PNG: ignored)"),
+    width: Optional[int] = Query(None, ge=1, le=4096, description="Resize width"),
+    height: Optional[int] = Query(None, ge=1, le=4096, description="Resize height"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get the latest frame as a direct image in multiple formats using detection_data_service.
+    
+    Supported formats:
+    - jpeg/jpg: Standard JPEG format (good compatibility, ~50-70% compression)
+    - webp: Modern WebP format (30-50% smaller than JPEG, modern browsers)
+    - png: Lossless PNG format (larger files, perfect quality)
+    
+    Useful for:
+    - Displaying in <img> tags
+    - Thumbnail generation  
+    - Direct image downloads
+    - Modern web applications (WebP recommended for best performance)
+    
+    Example usage: 
+    - <img src="/api/frames/image/{stream_id}/latest?format=webp&width=320&height=240" />
+    - <img src="/api/frames/image/{stream_id}/latest?format=jpeg&quality=90" />
+    - <img src="/api/frames/image/{stream_id}/latest?format=png" /> (lossless)
+    """
+    try:
+        # Normalize format
+        img_format = format.lower()
+        if img_format == "jpg":
+            img_format = "jpeg"
+        
+        # Get workspace and user info
+        username = current_user_data["username"]
+        user_id = UUID(str(current_user_data["user_id"]))
+        
+        # Get workspace
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace found.")
+        
+        # Validate stream exists and user has access
+        stream_uuid = UUID(stream_id)
+        
+        stream_query = """
+            SELECT vs.stream_id, vs.workspace_id, vs.name
+            FROM video_stream vs
+            WHERE vs.stream_id = $1 AND vs.workspace_id = $2
+        """
+        stream_data = await db_manager.execute_query(
+            stream_query, (stream_uuid, workspace_id_obj), fetch_one=True
+        )
+        
+        if not stream_data:
+            raise HTTPException(status_code=404, detail="Stream not found or access denied")
+        
+        # Get workspace role
+        membership = await workspace_service.check_workspace_membership_and_get_role(
+            user_id=user_id,
+            workspace_id=workspace_id_obj
+        )
+        user_workspace_role = membership.get("role")
+        user_system_role = current_user_data.get("role", "user")
+        
+        # Use detection_data_service to get latest frame
+        from app.services.detection_data_service import detection_data_service
+        
+        result = await detection_data_service.retrieve_detection_data(
+            workspace_id=workspace_id_obj,
+            user_system_role=user_system_role,
+            user_workspace_role=user_workspace_role,
+            requesting_username=username,
+            camera_id=[stream_id],
+            page=1,
+            per_page=1,
+            include_frame=True
+        )
+        
+        # Validate result
+        if not result or not result.get("data") or len(result["data"]) == 0:
+            raise HTTPException(status_code=404, detail="No frames found for this stream")
+        
+        # Extract frame from first result
+        detection = result["data"][0]
+        frame_base64 = detection.get("frame")
+        
+        if not frame_base64:
+            raise HTTPException(status_code=404, detail="Frame data not available")
+        
+        # Decode base64 to image
+        try:
+            img_data = base64.b64decode(frame_base64)
+            img = Image.open(io.BytesIO(img_data))
+        except Exception as decode_error:
+            logger.error(f"Failed to decode frame image: {decode_error}")
+            raise HTTPException(status_code=500, detail="Failed to decode frame image")
+        
+        # Resize if requested
+        if width or height:
+            # Calculate dimensions maintaining aspect ratio
+            original_width, original_height = img.size
+            
+            if width and height:
+                # Both specified - use as is
+                new_size = (width, height)
+            elif width:
+                # Only width specified - maintain aspect ratio
+                ratio = width / original_width
+                new_size = (width, int(original_height * ratio))
+            else:
+                # Only height specified - maintain aspect ratio
+                ratio = height / original_height
+                new_size = (int(original_width * ratio), height)
+            
+            # Resize with high-quality resampling
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Convert and save based on format
+        buffered = io.BytesIO()
+        
+        if img_format == "webp":
+            # WebP format - best compression
+            # Convert RGBA to RGB if necessary (WebP supports both, but RGB is smaller)
+            if img.mode in ('RGBA', 'LA'):
+                # Keep alpha channel for WebP if it exists
+                img.save(buffered, format="WEBP", quality=quality, method=6, lossless=False)
+            elif img.mode == 'P':
+                img = img.convert('RGBA')
+                img.save(buffered, format="WEBP", quality=quality, method=6, lossless=False)
+            else:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                img.save(buffered, format="WEBP", quality=quality, method=6, lossless=False)
+            
+            media_type = "image/webp"
+            file_ext = "webp"
+            
+        elif img_format == "png":
+            # PNG format - lossless
+            if img.mode in ('RGBA', 'LA', 'P'):
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                img.save(buffered, format="PNG", optimize=True)
+            else:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                img.save(buffered, format="PNG", optimize=True)
+            
+            media_type = "image/png"
+            file_ext = "png"
+            
+        else:  # jpeg
+            # JPEG format - standard
+            # Convert RGBA to RGB (JPEG doesn't support transparency)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            img.save(buffered, format="JPEG", quality=quality, optimize=True)
+            media_type = "image/jpeg"
+            file_ext = "jpg"
+        
+        buffered.seek(0)
+        
+        # Get metadata for helpful headers
+        metadata = detection.get("metadata", {})
+        timestamp = metadata.get("timestamp")
+        camera_name = metadata.get("name", "unknown")
+        
+        # Generate filename
+        timestamp_str = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S") if timestamp else "latest"
+        filename = f"{camera_name}_{timestamp_str}.{file_ext}"
+        
+        return StreamingResponse(
+            buffered,
+            media_type=media_type,
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "X-Frame-Timestamp": str(timestamp) if timestamp else "unknown",
+                "X-Camera-Name": camera_name,
+                "X-Image-Format": img_format.upper(),
+                "X-Image-Quality": str(quality) if img_format in ["jpeg", "webp"] else "lossless"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        logger.error(f"Invalid stream_id format: {ve}")
+        raise HTTPException(status_code=400, detail="Invalid stream ID format")
+    except Exception as e:
+        logger.error(f"Error getting frame image for stream {stream_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve frame image")
+
+
+@router.get("/frames/image/{stream_id}/latest/with-metadata")
+async def get_latest_frame_image_with_metadata(
+    stream_id: str,
+    quality: int = Query(85, ge=1, le=100, description="JPEG quality"),
+    width: Optional[int] = Query(None, ge=1, le=4096, description="Resize width"),
+    height: Optional[int] = Query(None, ge=1, le=4096, description="Resize height"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get the latest frame with complete metadata as JSON.
+    
+    Returns both the frame (base64) and all detection metadata including:
+    - Detection counts (person, male, female)
+    - Fire status
+    - Location information
+    - Camera details
+    - Timestamp
+    
+    Example: GET /api/frames/image/{stream_id}/latest/with-metadata?width=640&height=480
+    """
+    try:
+        # Get workspace and user info
+        username = current_user_data["username"]
+        user_id = UUID(str(current_user_data["user_id"]))
+        
+        # Get workspace
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace found.")
+        
+        # Validate stream exists and user has access
+        stream_uuid = UUID(stream_id)
+        
+        stream_query = """
+            SELECT vs.stream_id, vs.workspace_id, vs.name, vs.location, 
+                   vs.area, vs.building, vs.floor_level, vs.zone,
+                   vs.is_streaming, vs.status
+            FROM video_stream vs
+            WHERE vs.stream_id = $1 AND vs.workspace_id = $2
+        """
+        stream_data = await db_manager.execute_query(
+            stream_query, (stream_uuid, workspace_id_obj), fetch_one=True
+        )
+        
+        if not stream_data:
+            raise HTTPException(status_code=404, detail="Stream not found or access denied")
+        
+        # Get workspace role
+        membership = await workspace_service.check_workspace_membership_and_get_role(
+            user_id=user_id,
+            workspace_id=workspace_id_obj
+        )
+        user_workspace_role = membership.get("role")
+        user_system_role = current_user_data.get("role", "user")
+        
+        # Use detection_data_service to get latest frame
+        from app.services.detection_data_service import detection_data_service
+        
+        result = await detection_data_service.retrieve_detection_data(
+            workspace_id=workspace_id_obj,
+            user_system_role=user_system_role,
+            user_workspace_role=user_workspace_role,
+            requesting_username=username,
+            camera_id=[stream_id],
+            page=1,
+            per_page=1,
+            include_frame=True
+        )
+        
+        # Validate result
+        if not result or not result.get("data") or len(result["data"]) == 0:
+            raise HTTPException(status_code=404, detail="No frames found for this stream")
+        
+        # Extract detection data
+        detection = result["data"][0]
+        frame_base64 = detection.get("frame")
+        
+        if not frame_base64:
+            raise HTTPException(status_code=404, detail="Frame data not available")
+        
+        # Process image if resize requested
+        processed_frame = frame_base64
+        if width or height:
+            try:
+                img_data = base64.b64decode(frame_base64)
+                img = Image.open(io.BytesIO(img_data))
+                
+                # Calculate dimensions maintaining aspect ratio
+                original_width, original_height = img.size
+                
+                if width and height:
+                    new_size = (width, height)
+                elif width:
+                    ratio = width / original_width
+                    new_size = (width, int(original_height * ratio))
+                else:
+                    ratio = height / original_height
+                    new_size = (int(original_width * ratio), height)
+                
+                # Resize
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # Convert to JPEG
+                buffered = io.BytesIO()
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                img.save(buffered, format="JPEG", quality=quality, optimize=True)
+                buffered.seek(0)
+                processed_frame = base64.b64encode(buffered.read()).decode('utf-8')
+                
+            except Exception as e:
+                logger.warning(f"Failed to resize image: {e}, returning original")
+        
+        # Build comprehensive response
+        response_data = {
+            "frame": {
+                "base64": processed_frame,
+                "format": "jpeg",
+                "quality": quality,
+                "dimensions": {
+                    "width": width,
+                    "height": height,
+                    "resized": bool(width or height)
+                }
+            },
+            "detection": {
+                "result_id": detection.get("id"),
+                "timestamp": detection.get("metadata", {}).get("timestamp"),
+                "date": detection.get("metadata", {}).get("date"),
+                "time": detection.get("metadata", {}).get("time"),
+                "counts": {
+                    "person": detection.get("metadata", {}).get("person_count", 0),
+                    "male": detection.get("metadata", {}).get("male_count", 0),
+                    "female": detection.get("metadata", {}).get("female_count", 0)
+                },
+                "fire_status": detection.get("metadata", {}).get("fire_status", "no detection")
+            },
+            "camera": {
+                "stream_id": stream_id,
+                "name": stream_data["name"],
+                "is_streaming": stream_data["is_streaming"],
+                "status": stream_data["status"]
+            },
+            "location": {
+                "location": stream_data.get("location"),
+                "area": stream_data.get("area"),
+                "building": stream_data.get("building"),
+                "floor_level": stream_data.get("floor_level"),
+                "zone": stream_data.get("zone")
+            },
+            "metadata": {
+                "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                "workspace_id": str(workspace_id_obj)
+            }
+        }
+        
+        return JSONResponse(content=response_data)
+        
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        logger.error(f"Invalid stream_id format: {ve}")
+        raise HTTPException(status_code=400, detail="Invalid stream ID format")
+    except Exception as e:
+        logger.error(f"Error getting frame with metadata for stream {stream_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve frame with metadata")
+
+
+@router.post("/frames/images/batch", response_class=Response)
+async def get_batch_frame_images(
+    request: FrameRequest,
+    output_format: str = Query("json", regex="^(json|zip)$", description="Response format: json or zip"),
+    image_format: str = Query("webp", regex="^(jpeg|jpg|webp|png)$", description="Image format"),
+    quality: int = Query(85, ge=1, le=100, description="Image quality (JPEG/WebP)"),
+    width: Optional[int] = Query(None, ge=1, le=4096, description="Resize width"),
+    height: Optional[int] = Query(None, ge=1, le=4096, description="Resize height"),
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """
+    Get multiple frames as images in batch with metadata.
+    
+    Supports multiple image formats:
+    - jpeg: Standard JPEG (best compatibility)
+    - webp: Modern WebP (30-50% smaller, recommended)
+    - png: Lossless PNG (largest size, perfect quality)
+    
+    Supports two output formats:
+    - json: Returns array of base64 images with metadata
+    - zip: Returns a ZIP file containing images and metadata.json
+    
+    Example JSON response:
+    {
+        "frames": [
+            {
+                "stream_id": "...",
+                "camera_name": "...",
+                "image_base64": "...",
+                "timestamp": "...",
+                "detection": {...}
+            }
+        ],
+        "total_frames": 10,
+        "format": "json",
+        "image_format": "webp"
+    }
+    
+    Example ZIP contents:
+    - camera1_20240209_143022.webp
+    - camera2_20240209_143023.webp
+    - metadata.json
+    
+    Example usage:
+    - POST /frames/images/batch?output_format=zip&image_format=webp&quality=90
+    - POST /frames/images/batch?output_format=json&image_format=png
+    """
+    user_id_str = str(current_user_data["user_id"])
+    username = current_user_data["username"]
+    
+    try:
+        from app.services.detection_data_service import detection_data_service
+        import zipfile
+        
+        # Normalize image format
+        img_format = image_format.lower()
+        if img_format == "jpg":
+            img_format = "jpeg"
+        
+        # Get workspace
+        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
+        if not workspace_id_obj:
+            raise HTTPException(status_code=400, detail="No active workspace found.")
+        
+        # Verify workspace access
+        await check_workspace_access(
+            db_manager,
+            UUID(user_id_str),
+            workspace_id_obj,
+            required_role=None
+        )
+        
+        # Validate stream IDs
+        stream_uuids = [UUID(sid) for sid in request.stream_ids]
+        
+        # Verify streams exist and get metadata
+        access_query = """
+            SELECT vs.stream_id, vs.name, vs.workspace_id, vs.location, vs.area,
+                   vs.building, vs.floor_level, vs.zone, vs.is_streaming, vs.status
+            FROM video_stream vs
+            WHERE vs.stream_id = ANY($1) AND vs.workspace_id = $2
+        """
+        accessible_streams = await db_manager.execute_query(
+            access_query,
+            (stream_uuids, workspace_id_obj),
+            fetch_all=True
+        )
+        
+        if not accessible_streams:
+            raise HTTPException(status_code=404, detail="No accessible streams found")
+        
+        stream_map = {str(s['stream_id']): s for s in accessible_streams}
+        
+        # Get workspace role for detection_data_service
+        membership = await workspace_service.check_workspace_membership_and_get_role(
+            user_id=UUID(user_id_str),
+            workspace_id=workspace_id_obj
+        )
+        user_workspace_role = membership.get("role")
+        user_system_role = current_user_data.get("role", "user")
+        
+        frames_data = []
+        metadata_list = []
+        
+        # Helper function to convert image to specified format
+        def convert_image_format(frame_base64_input, target_format, target_quality, resize_width=None, resize_height=None):
+            """Convert base64 image to target format and optionally resize"""
+            try:
+                img_data = base64.b64decode(frame_base64_input)
+                img = Image.open(io.BytesIO(img_data))
+                
+                # Resize if requested
+                if resize_width or resize_height:
+                    original_width, original_height = img.size
+                    
+                    if resize_width and resize_height:
+                        new_size = (resize_width, resize_height)
+                    elif resize_width:
+                        ratio = resize_width / original_width
+                        new_size = (resize_width, int(original_height * ratio))
+                    else:
+                        ratio = resize_height / original_height
+                        new_size = (int(original_width * ratio), resize_height)
+                    
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # Convert based on format
+                buffered = io.BytesIO()
+                
+                if target_format == "webp":
+                    if img.mode in ('RGBA', 'LA'):
+                        img.save(buffered, format="WEBP", quality=target_quality, method=6, lossless=False)
+                    elif img.mode == 'P':
+                        img = img.convert('RGBA')
+                        img.save(buffered, format="WEBP", quality=target_quality, method=6, lossless=False)
+                    else:
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        img.save(buffered, format="WEBP", quality=target_quality, method=6, lossless=False)
+                    file_ext = "webp"
+                    
+                elif target_format == "png":
+                    if img.mode in ('RGBA', 'LA', 'P'):
+                        if img.mode == 'P':
+                            img = img.convert('RGBA')
+                        img.save(buffered, format="PNG", optimize=True)
+                    else:
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        img.save(buffered, format="PNG", optimize=True)
+                    file_ext = "png"
+                    
+                else:  # jpeg
+                    if img.mode in ('RGBA', 'LA', 'P'):
+                        background = Image.new('RGB', img.size, (255, 255, 255))
+                        if img.mode == 'P':
+                            img = img.convert('RGBA')
+                        background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                        img = background
+                    elif img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    img.save(buffered, format="JPEG", quality=target_quality, optimize=True)
+                    file_ext = "jpg"
+                
+                buffered.seek(0)
+                return base64.b64encode(buffered.read()).decode('utf-8'), file_ext
+                
+            except Exception as e:
+                logger.error(f"Failed to convert image: {e}")
+                return frame_base64_input, "jpg"  # Return original on error
+        
+        # Process each stream
+        for stream_id in request.stream_ids:
+            if stream_id not in stream_map:
+                continue
+            
+            try:
+                stream_metadata = stream_map[stream_id]
+                
+                # Build start/end date strings for detection_data_service
+                start_date = request.start_time.strftime("%Y-%m-%d") if request.start_time else None
+                end_date = request.end_time.strftime("%Y-%m-%d") if request.end_time else None
+                start_time = request.start_time.strftime("%H:%M:%S") if request.start_time else None
+                end_time = request.end_time.strftime("%H:%M:%S") if request.end_time else None
+                
+                # Use detection_data_service to retrieve data
+                result = await detection_data_service.retrieve_detection_data(
+                    workspace_id=workspace_id_obj,
+                    user_system_role=user_system_role,
+                    user_workspace_role=user_workspace_role,
+                    requesting_username=username,
+                    camera_id=[stream_id],
+                    start_date=start_date,
+                    end_date=end_date,
+                    start_time=start_time,
+                    end_time=end_time,
+                    page=1,
+                    per_page=request.limit,
+                    include_frame=True
+                )
+                
+                if not result or not result.get("data"):
+                    continue
+                
+                # Process each detection result
+                for detection in result["data"]:
+                    frame_base64 = detection.get("frame")
+                    if not frame_base64:
+                        continue
+                    
+                    metadata_dict = detection.get("metadata", {})
+                    timestamp = metadata_dict.get("timestamp")
+                    
+                    # Convert image to target format
+                    processed_frame, file_ext = convert_image_format(
+                        frame_base64, 
+                        img_format, 
+                        quality,
+                        width,
+                        height
+                    )
+                    
+                    # Generate filename
+                    timestamp_str = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S") if timestamp else "unknown"
+                    filename = f"{stream_metadata['name']}_{timestamp_str}.{file_ext}"
+                    
+                    frame_info = {
+                        "stream_id": stream_id,
+                        "result_id": detection.get("id"),
+                        "camera_name": stream_metadata['name'],
+                        "filename": filename,
+                        "image_base64": processed_frame,
+                        "image_format": img_format,
+                        "timestamp": timestamp,
+                        "detection": {
+                            "person_count": metadata_dict.get("person_count", 0),
+                            "male_count": metadata_dict.get("male_count", 0),
+                            "female_count": metadata_dict.get("female_count", 0),
+                            "fire_status": metadata_dict.get("fire_status", "no detection")
+                        },
+                        "location": {
+                            "location": stream_metadata.get('location'),
+                            "area": stream_metadata.get('area'),
+                            "building": stream_metadata.get('building'),
+                            "floor_level": stream_metadata.get('floor_level'),
+                            "zone": stream_metadata.get('zone')
+                        }
+                    }
+                    
+                    frames_data.append(frame_info)
+                    metadata_list.append({
+                        "filename": filename,
+                        "stream_id": stream_id,
+                        "result_id": detection.get("id"),
+                        "camera_name": stream_metadata['name'],
+                        "timestamp": timestamp,
+                        "detection": frame_info["detection"],
+                        "location": frame_info["location"]
+                    })
+                
+            except Exception as e_stream:
+                logger.error(f"Error retrieving frames for stream {stream_id}: {e_stream}", exc_info=True)
+        
+        if not frames_data:
+            raise HTTPException(status_code=404, detail="No frames found")
+        
+        # Calculate estimated size savings (WebP vs JPEG)
+        size_info = {}
+        if img_format == "webp":
+            size_info["note"] = "WebP format provides 30-50% smaller file sizes compared to JPEG"
+        elif img_format == "png":
+            size_info["note"] = "PNG format provides lossless quality but larger file sizes"
+        
+        # Return based on output format
+        if output_format == "json":
+            return JSONResponse(content={
+                "frames": frames_data,
+                "total_frames": len(frames_data),
+                "total_streams": len(request.stream_ids),
+                "format": "json",
+                "image_format": img_format,
+                "image_settings": {
+                    "quality": quality if img_format in ["jpeg", "webp"] else "lossless",
+                    "width": width,
+                    "height": height
+                },
+                "size_info": size_info,
+                "retrieved_at": datetime.now(timezone.utc).isoformat()
+            })
+        
+        elif output_format == "zip":
+            # Create ZIP file in memory
+            zip_buffer = io.BytesIO()
+            
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                # Add each image
+                for frame_info in frames_data:
+                    img_data = base64.b64decode(frame_info["image_base64"])
+                    zip_file.writestr(frame_info["filename"], img_data)
+                
+                # Add metadata JSON
+                import json
+                metadata_json = {
+                    "total_frames": len(frames_data),
+                    "total_streams": len(request.stream_ids),
+                    "image_format": img_format,
+                    "image_settings": {
+                        "quality": quality if img_format in ["jpeg", "webp"] else "lossless",
+                        "width": width,
+                        "height": height
+                    },
+                    "size_info": size_info,
+                    "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                    "frames": metadata_list
+                }
+                zip_file.writestr("metadata.json", json.dumps(metadata_json, indent=2))
+            
+            zip_buffer.seek(0)
+            
+            # Generate filename
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_filename = f"frames_batch_{img_format}_{timestamp_str}.zip"
+            
+            return Response(
+                content=zip_buffer.read(),
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{zip_filename}"'
+                }
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in batch frame image retrieval: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve batch frames")
+
 
 @router.post("/start", status_code=status.HTTP_200_OK)
 async def start_stream(

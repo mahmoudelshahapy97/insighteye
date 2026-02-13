@@ -359,8 +359,8 @@ class Settings(BaseSettings):
 
     # ✅ OPTIMIZED: Aggressive error handling for RTSP stability
     max_consecutive_errors: int = 100      # Down from 1000 - force recovery faster
-    max_read_timeout: float = 120.0        # Down from 180s - detect failures faster
-    recovery_interval: float = 60.0        # Up from 5s - prevent recovery spam
+    max_read_timeout: float = 60.0        # Down from 180s - detect failures faster
+    recovery_interval: float = 10.0        # Up from 5s - prevent recovery spam
     connection_health_timeout: float = 300.0  # Down from 600s - 5 min health check
 
     # Backoff settings
@@ -370,7 +370,22 @@ class Settings(BaseSettings):
     
     # Transport settings
     prefer_tcp: bool = True
+    min_reconnect_interval = 2.0
     use_hw_accel: bool = False
+
+    # =============================================================================
+    # GPU / HARDWARE ACCELERATION
+    # =============================================================================
+    use_hw_accel: bool = True  # Enable GPU acceleration for video processing
+    gpu_device_id: int = 0  # CUDA device ID (0 for first GPU)
+    gpu_memory_limit_mb: int = 2048  # GPU memory limit in MB (2GB default)
+    enable_gpu_resize: bool = True  # Use GPU for frame resizing
+    enable_gpu_decode: bool = False  # Use GPU for video decoding (requires special OpenCV build)
+
+    # GPU Performance Settings
+    gpu_batch_size: int = 1  # Number of frames to process in GPU batch
+    gpu_async_processing: bool = True  # Use async GPU operations
+    gpu_fallback_on_error: bool = True  # Automatically fallback to CPU on GPU errors
 
     # =============================================================================
     # VIDEO / STREAM PERFORMANCE

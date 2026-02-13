@@ -3,13 +3,9 @@ aiofiles
 fastapi
 starlette
 pydantic
-opencv-python-headless==4.8.1.78
-#opencv-python==4.10.0.84
-#numpy
+#opencv-python-headless==4.8.1.78
 chromadb
 ultralytics==8.4.7
-#torch>=2.0.0
-#torchvision>=0.15.0
 Pillow
 datetime
 uvicorn
@@ -22,10 +18,10 @@ psycopg2-binary
 websockets
 httpx
 aiohttp
-langchain 
+langchain
 langchain-ollama
 langchain_community
-langchain-core 
+langchain-core
 python-dotenv
 xgboost
 anyio
@@ -38,29 +34,27 @@ pytest-mock
 pytest-tornasync
 pytest-trio
 pytest-twisted
-pytest 
+pytest
 pytest-asyncio
 pytest-cov
 pandas
 elasticsearch
 argon2-cffi
-
 celery[redis]==5.3.4
 redis==4.6.0
 celery[asyncio]==5.3.4
 kombu==5.3.4
 hiredis==2.2.3
 loguru
-
-# ONNX Runtime (CPU and GPU versions)
-onnxruntime==1.23.2  # CPU version
-# onnxruntime-gpu==1.23.2  # Uncomment for GPU support
-
-# OpenVINO
+twisted
+onnxruntime-gpu==1.23.2
+onnxslim>=0.1.71
 openvino==2024.0.0
-openvino-dev==2024.0.0  # For model conversion tools
-
-# TensorRT (optional - see installation guide)
-# tensorrt>=8.6.0  # Install via NVIDIA NGC or pip
-# pycuda>=2022.1   # Required for TensorRT
-# nvidia-tensorrt  # Alternative package name
+openvino-dev==2024.0.0
+# torch, torchvision, torchaudio installed via Dockerfile with cu121
+# tensorrt installed via Dockerfile as tensorrt-cu12
+#tensorrt==10.15.1.29
+#pycuda>=2022.1
+tensorrt-cu12
+cuda-python
+numpy==1.26.4

@@ -113,6 +113,8 @@ from app.utils.stream_utils import (
     send_ping_with_stability_check
 )
 
+from app.utils.encode_rtsp import encode_rtsp_url
+
 __all__ = [
     # Qdrant
     'get_workspace_qdrant_collection_name',
@@ -192,5 +194,8 @@ __all__ = [
     'send_ping',
     'handle_mark_read_message',
     'send_ping_with_stability_check',
+
+    # encode
+    'encode_rtsp_url',
     
 ]
