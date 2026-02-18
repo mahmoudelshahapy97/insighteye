@@ -476,7 +476,7 @@ Examples:
     )
     parser.add_argument("model_path", nargs='?', help="Path to PyTorch .pt model file")
     parser.add_argument("--format", choices=["onnx", "openvino", "tensorrt", "all"], 
-                       default="all", help="Target format (default: all)")
+                       default="onnx", help="Target format (default: onnx)")
     parser.add_argument("--output-dir", help="Output directory (optional)")
     parser.add_argument("--direct", action="store_true",
                        help="Use direct conversion (faster, recommended)")
@@ -567,7 +567,7 @@ def convert_all_models(direct: bool = True, precision: str = "fp16", batch_size:
         return
     
     # Find all .pt files
-    pt_files = list(models_dir.glob("*.pt"))
+    pt_files = ["models/gender.pt"] #list(models_dir.glob("*.pt"))
     
     if not pt_files:
         logger.error(f"❌ No .pt model files found in {models_dir}")
@@ -583,10 +583,10 @@ def convert_all_models(direct: bool = True, precision: str = "fp16", batch_size:
         logger.warning("   TensorRT conversions will be skipped")
     
     for model_path in pt_files:
-        model_name = model_path.name
+        # model_name = model_path.name
         
         logger.info(f"\n{'='*60}")
-        logger.info(f"Converting {model_name}")
+        # logger.info(f"Converting {model_name}")
         logger.info(f"{'='*60}")
         
         try:
@@ -599,31 +599,31 @@ def convert_all_models(direct: bool = True, precision: str = "fp16", batch_size:
             output_dir = models_dir / (model_path.stem + "_openvino")
             convert_yolo_to_openvino_direct(str(model_path), str(output_dir))
             
-            # Convert to TensorRT (direct method - recommended)
-            logger.info("\n--- TensorRT Conversion ---")
-            if not tensorrt_available:
-                logger.warning("⚠️  Skipping TensorRT (requirements not met)")
-            else:
-                try:
-                    if direct:
-                        convert_yolo_to_tensorrt_direct(
-                            str(model_path),
-                            precision=precision,
-                            max_batch_size=batch_size
-                        )
-                    else:
-                        convert_to_tensorrt(
-                            onnx_path,
-                            precision=precision,
-                            max_batch_size=batch_size,
-                            workspace_size_mb=2048
-                        )
-                except Exception as e:
-                    logger.error(f"❌ TensorRT conversion failed: {e}")
-                    logger.info("   Continuing with other models...")
+            # # Convert to TensorRT (direct method - recommended)
+            # logger.info("\n--- TensorRT Conversion ---")
+            # if not tensorrt_available:
+            #     logger.warning("⚠️  Skipping TensorRT (requirements not met)")
+            # else:
+            #     try:
+            #         if direct:
+            #             convert_yolo_to_tensorrt_direct(
+            #                 str(model_path),
+            #                 precision=precision,
+            #                 max_batch_size=batch_size
+            #             )
+            #         else:
+            #             convert_to_tensorrt(
+            #                 onnx_path,
+            #                 precision=precision,
+            #                 max_batch_size=batch_size,
+            #                 workspace_size_mb=2048
+            #             )
+            #     except Exception as e:
+            #         logger.error(f"❌ TensorRT conversion failed: {e}")
+            #         logger.info("   Continuing with other models...")
             
         except Exception as e:
-            logger.error(f"❌ Error converting {model_name}: {e}")
+            # logger.error(f"❌ Error converting {model_name}: {e}")
             import traceback
             traceback.print_exc()
             continue
@@ -642,4 +642,5 @@ def convert_all_models(direct: bool = True, precision: str = "fp16", batch_size:
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    convert_all_models()
