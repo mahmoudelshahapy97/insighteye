@@ -350,7 +350,7 @@ class DistributedStreamManager:
                 logger.error(f"❌ Camera {stream_id_str} not found in database")
                 return
             
-            if verify.get('locked_by_server') != self.server_id:
+            if str(verify.get('locked_by_server')) != str(self.server_id):
                 logger.warning(f"⚠️ Camera {stream_id_str} not locked by us")
                 return
             

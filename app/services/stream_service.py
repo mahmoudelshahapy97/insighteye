@@ -659,8 +659,11 @@ class StreamManager:
             raise
         
         async with self._safe_stream_operation(stream_id_str, "start"):
+            # Use flags to avoid holding self._lock during await calls that might deadlock
+            needs_stop = False
+            for_restart = False
+            
             async with self._lock:
-                # ✅ FIX: Check if already ACTUALLY healthy (not just in memory)
                 if stream_id_str in self.active_streams:
                     stream_info = self.active_streams[stream_id_str]
                     task = stream_info.get('task')
@@ -683,57 +686,67 @@ class StreamManager:
                         logger.info(f"✅ {stream_id_str} already healthy on THIS server")
                         return
                     
-                    # ✅ FIX: If unhealthy, verify we still own the lock BEFORE restarting
-                    verify_lock_query = """
-                        SELECT locked_by_server, is_streaming, status
-                        FROM video_stream
-                        WHERE stream_id = $1
-                    """
-                    lock_check = await self.db_manager.execute_query(
-                        verify_lock_query,
-                        (stream_id,),
-                        fetch_one=True
-                    )
-                    
-                    if not lock_check:
-                        logger.error(f"❌ {stream_id_str} disappeared from database")
-                        await self._stop_stream(stream_id_str, for_restart=False)
-                        return
-                    
-                    server_id = config.server_id
-                    if lock_check['locked_by_server'] != str(server_id):
-                        logger.warning(
-                            f"⚠️ {stream_id_str} lock stolen by {lock_check['locked_by_server']}, "
-                            f"aborting restart"
-                        )
-                        await self._stop_stream(stream_id_str, for_restart=False)
-                        return
-                    
-                    if not lock_check['is_streaming']:
-                        logger.warning(
-                            f"⚠️ {stream_id_str} has is_streaming=FALSE, aborting restart"
-                        )
-                        await self._stop_stream(stream_id_str, for_restart=False)
-                        return
-                    
-                    # ✅ We verified we still own the lock, safe to restart
-                    logger.warning(f"🔧 {stream_id_str} unhealthy but lock verified, restarting")
-                    await self._stop_stream(stream_id_str, for_restart=True)
-                    await asyncio.sleep(2.0)  # Longer sleep for cleanup
-                    
-                    # ✅ CRITICAL: Re-verify lock after sleep
-                    lock_recheck = await self.db_manager.execute_query(
-                        verify_lock_query,
-                        (stream_id,),
-                        fetch_one=True
-                    )
-                    
-                    if not lock_recheck or lock_recheck['locked_by_server'] != str(server_id):
-                        logger.error(
-                            f"❌ {stream_id_str} lock lost during restart, aborting"
-                        )
-                        return
+                    # Unhealthy or needs restart - we must exit lock before calling _stop_stream
+                    needs_stop = True
+
+            if needs_stop:
+                # ✅ FIX: Verify lock and state outside of self._lock to avoid deadlock
+                verify_lock_query = """
+                    SELECT locked_by_server, is_streaming, status
+                    FROM video_stream
+                    WHERE stream_id = $1
+                """
+                lock_check = await self.db_manager.execute_query(
+                    verify_lock_query,
+                    (stream_id,),
+                    fetch_one=True
+                )
                 
+                if not lock_check:
+                    logger.error(f"❌ {stream_id_str} disappeared from database")
+                    await self._stop_stream(stream_id_str, for_restart=False)
+                    return
+                
+                # ✅ FIX: Use string comparison for UUIDs to avoid false "lock stolen"
+                current_locked_server = str(lock_check['locked_by_server']) if lock_check['locked_by_server'] else None
+                my_server_id = str(config.server_id)
+                
+                if current_locked_server != my_server_id:
+                    logger.warning(
+                        f"⚠️ {stream_id_str} lock stolen by {current_locked_server}, "
+                        f"aborting restart"
+                    )
+                    await self._stop_stream(stream_id_str, for_restart=False)
+                    return
+                
+                if not lock_check['is_streaming']:
+                    logger.warning(
+                        f"⚠️ {stream_id_str} has is_streaming=FALSE, aborting restart"
+                    )
+                    await self._stop_stream(stream_id_str, for_restart=False)
+                    return
+                
+                # ✅ We verified we still own the lock, safe to restart
+                logger.warning(f"🔧 {stream_id_str} unhealthy but lock verified, restarting")
+                await self._stop_stream(stream_id_str, for_restart=True)
+                await asyncio.sleep(2.0)  # Longer sleep for cleanup
+                
+                # ✅ CRITICAL: Re-verify lock after sleep
+                lock_recheck = await self.db_manager.execute_query(
+                    verify_lock_query,
+                    (stream_id,),
+                    fetch_one=True
+                )
+                
+                recheck_locked_server = str(lock_recheck['locked_by_server']) if lock_recheck and lock_recheck['locked_by_server'] else None
+                if not lock_recheck or recheck_locked_server != my_server_id:
+                    logger.error(
+                        f"❌ {stream_id_str} lock lost during restart, aborting"
+                    )
+                    return
+
+            # Re-acquire lock for state transition and registration
+            async with self._lock:
                 # Transition to STARTING
                 await self._transition_stream_state(stream_id_str, StreamState.STARTING)
                 
