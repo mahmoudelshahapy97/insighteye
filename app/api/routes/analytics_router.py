@@ -190,12 +190,12 @@ async def get_frame_counts_per_camera(
         query = f"""
             SELECT
                 camera_name,
-                camera_id,
-                location,
-                area,
-                building,
-                zone,
-                floor_level,
+                MAX(camera_id) AS camera_id,
+                MAX(location) AS location,
+                MAX(area) AS area,
+                MAX(building) AS building,
+                MAX(zone) AS zone,
+                MAX(floor_level) AS floor_level,
                 COUNT(*) AS total_frames,
                 MIN(timestamp) AS first_frame,
                 MAX(timestamp) AS last_frame
@@ -204,7 +204,7 @@ async def get_frame_counts_per_camera(
               AND camera_name IS NOT NULL
               {date_filter}
               {location_where}
-            GROUP BY camera_name, camera_id, location, area, building, zone, floor_level
+            GROUP BY camera_name
             ORDER BY total_frames DESC
         """
         
@@ -279,12 +279,12 @@ async def get_average_people_per_camera(
         query = f"""
             SELECT
                 camera_name,
-                camera_id,
-                location,
-                area,
-                building,
-                zone,
-                floor_level,
+                MAX(camera_id) AS camera_id,
+                MAX(location) AS location,
+                MAX(area) AS area,
+                MAX(building) AS building,
+                MAX(zone) AS zone,
+                MAX(floor_level) AS floor_level,
                 AVG(person_count) AS avg_person_count,
                 MAX(person_count) AS max_person_count,
                 MIN(person_count) AS min_person_count,
@@ -295,100 +295,7 @@ async def get_average_people_per_camera(
               AND person_count IS NOT NULL
               {date_filter}
               {location_where}
-            GROUP BY camera_name, camera_id, location, area, building, zone, floor_level
-            ORDER BY avg_person_count DESC
-        """
-        
-        async with db_manager.get_connection() as conn:
-            results = await conn.fetch(query, *params)
-            
-        data = [{
-            **dict(row),
-            'avg_person_count': round(float(row['avg_person_count'])) if row['avg_person_count'] else 0
-        } for row in results]
-        
-        return {
-            "success": True,
-            "count": len(data),
-            "filters_applied": {
-                "start_date": start_date.isoformat() if start_date else None,
-                "end_date": end_date.isoformat() if end_date else None,
-                "locations": parse_string_or_list(locations),
-                "areas": parse_string_or_list(areas),
-                "buildings": parse_string_or_list(buildings),
-                "floor_levels": parse_string_or_list(floor_levels),
-                "zones": parse_string_or_list(zones)
-            },
-            "data": data
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching average people: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/cameras/average-people")
-async def get_average_people_per_camera(
-    request: Request,
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
-    areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
-    buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
-    floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
-    zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get average number of people recorded by each camera with filters"""
-    user_id_obj = current_user_data["user_id"]
-    username = current_user_data["username"]
-    
-    try:
-        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-        if not workspace_id_obj:
-            raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
-
-        await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
-        
-        params = [workspace_id_obj]
-        param_count = 1
-        date_filter = ""
-        
-        if start_date:
-            param_count += 1
-            params.append(start_date)
-            date_filter += f" AND date >= ${param_count}"
-        if end_date:
-            param_count += 1
-            params.append(end_date)
-            date_filter += f" AND date <= ${param_count}"
-        
-        location_filters, param_count = build_location_filters(
-            params, param_count, locations, areas, buildings, floor_levels, zones
-        )
-        location_where = " AND " + " AND ".join(location_filters) if location_filters else ""
-            
-        query = f"""
-            SELECT
-                camera_name,
-                camera_id,
-                location,
-                area,
-                building,
-                zone,
-                floor_level,
-                AVG(person_count) AS avg_person_count,
-                MAX(person_count) AS max_person_count,
-                MIN(person_count) AS min_person_count,
-                COUNT(*) AS sample_size
-            FROM stream_results
-            WHERE workspace_id = $1
-              AND camera_name IS NOT NULL
-              AND person_count IS NOT NULL
-              {date_filter}
-              {location_where}
-            GROUP BY camera_name, camera_id, location, area, building, zone, floor_level
+            GROUP BY camera_name
             ORDER BY avg_person_count DESC
         """
         
@@ -469,12 +376,12 @@ async def get_average_gender_per_camera(
         query = f"""
             SELECT
                 camera_name,
-                camera_id,
-                location,
-                area,
-                building,
-                zone,
-                floor_level,
+                MAX(camera_id) AS camera_id,
+                MAX(location) AS location,
+                MAX(area) AS area,
+                MAX(building) AS building,
+                MAX(zone) AS zone,
+                MAX(floor_level) AS floor_level,
                 AVG({count_column}) AS avg_count,
                 MAX({count_column}) AS max_count,
                 MIN({count_column}) AS min_count,
@@ -485,7 +392,7 @@ async def get_average_gender_per_camera(
               AND {count_column} IS NOT NULL
               {date_filter}
               {location_where}
-            GROUP BY camera_name, camera_id, location, area, building, zone, floor_level
+            GROUP BY camera_name
             ORDER BY avg_count DESC
         """
         
@@ -495,6 +402,8 @@ async def get_average_gender_per_camera(
         data = [{
             **dict(row),
             'avg_count': round(float(row['avg_count'])) if row['avg_count'] else 0,
+            'max_count': round(float(row['max_count'])) if row['max_count'] else 0,
+            'min_count': round(float(row['min_count'])) if row['min_count'] else 0,
             'gender': gender
         } for row in results]
         
@@ -1028,19 +937,19 @@ async def get_camera_frame_comparison(
             WITH frame_counts AS (
                 SELECT
                     camera_name,
-                    camera_id,
-                    location,
-                    area,
-                    building,
-                    zone,
-                    floor_level,
+                    MAX(camera_id) AS camera_id,
+                    MAX(location) AS location,
+                    MAX(area) AS area,
+                    MAX(building) AS building,
+                    MAX(zone) AS zone,
+                    MAX(floor_level) AS floor_level,
                     COUNT(*) AS frame_count
                 FROM stream_results
                 WHERE workspace_id = $1
                   AND camera_name IS NOT NULL
                   {date_filter}
                   {location_where}
-                GROUP BY camera_name, camera_id, location, area, building, zone, floor_level
+                GROUP BY camera_name
             ),
             avg_frame AS (
                 SELECT AVG(frame_count) AS avg_frame_count
@@ -1289,12 +1198,12 @@ async def get_fire_detections_by_camera(
         query = f"""
             SELECT
                 camera_name,
-                camera_id,
-                location,
-                area,
-                building,
-                zone,
-                floor_level,
+                MAX(camera_id) AS camera_id,
+                MAX(location) AS location,
+                MAX(area) AS area,
+                MAX(building) AS building,
+                MAX(zone) AS zone,
+                MAX(floor_level) AS floor_level,
                 COUNT(*) AS total_checks,
                 
                 -- Breakdown by detection type
@@ -1336,7 +1245,7 @@ async def get_fire_detections_by_camera(
               AND camera_name IS NOT NULL
               {date_filter}
               {location_where}
-            GROUP BY camera_name, camera_id, location, area, building, zone, floor_level
+            GROUP BY camera_name
             ORDER BY total_detections DESC, fire_detections DESC, smoke_detections DESC, camera_name
         """
         
@@ -2201,12 +2110,12 @@ async def get_fire_status_by_camera(
         query = f"""
             SELECT
                 camera_name,
-                camera_id,
-                location,
-                area,
-                building,
-                zone,
-                floor_level,
+                MAX(camera_id) AS camera_id,
+                MAX(location) AS location,
+                MAX(area) AS area,
+                MAX(building) AS building,
+                MAX(zone) AS zone,
+                MAX(floor_level) AS floor_level,
                 fire_status,
                 COUNT(*) AS status_count,
                 MIN(timestamp) AS first_detection,
@@ -2218,7 +2127,7 @@ async def get_fire_status_by_camera(
               AND fire_status IN ('smoke', 'fire')
               {date_filter}
               {location_where}
-            GROUP BY camera_name, camera_id, location, area, building, zone, floor_level, fire_status
+            GROUP BY camera_name, fire_status
             ORDER BY camera_name, fire_status
         """
         
@@ -2291,197 +2200,6 @@ async def get_fire_status_by_camera(
     except Exception as e:
         logger.error(f"Error fetching threshold violations: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-# @router.get("/fire/threshold-violations-by-camera")
-# async def get_threshold_violations_by_camera(
-#     request: Request,
-#     start_date: Optional[date] = None,
-#     end_date: Optional[date] = None,
-#     locations: Optional[Union[str, List[str]]] = Query(None, description="Filter by location(s)"),
-#     areas: Optional[Union[str, List[str]]] = Query(None, description="Filter by area(s)"),
-#     buildings: Optional[Union[str, List[str]]] = Query(None, description="Filter by building(s)"),
-#     floor_levels: Optional[Union[str, List[str]]] = Query(None, description="Filter by floor level(s)"),
-#     zones: Optional[Union[str, List[str]]] = Query(None, description="Filter by zone(s)"),
-#     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-# ):
-#     """Get person count threshold violations per camera with location filters"""
-#     user_id_obj = current_user_data["user_id"]
-#     username = current_user_data["username"]
-    
-#     try:
-#         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-#         if not workspace_id_obj:
-#             raise HTTPException(status_code=400, detail="No active workspace. Please set an active workspace.")
-
-#         await check_workspace_access(db_manager, user_id_obj, workspace_id_obj, required_role=None)
-        
-#         params = [workspace_id_obj]
-#         param_count = 1
-#         date_filter = ""
-        
-#         if start_date:
-#             param_count += 1
-#             params.append(start_date)
-#             date_filter += f" AND sr.date >= ${param_count}"
-#         if end_date:
-#             param_count += 1
-#             params.append(end_date)
-#             date_filter += f" AND sr.date <= ${param_count}"
-        
-#         location_filters, param_count = build_location_filters(
-#             params, param_count, locations, areas, buildings, floor_levels, zones
-#         )
-        
-#         # Need to prefix location filters with "sr." for this query
-#         location_where = ""
-#         if location_filters:
-#             prefixed_filters = [f.replace("location", "sr.location")
-#                                   .replace("area", "sr.area")
-#                                   .replace("building", "sr.building")
-#                                   .replace("floor_level", "sr.floor_level")
-#                                   .replace("zone", "sr.zone") 
-#                                for f in location_filters]
-#             location_where = " AND " + " AND ".join(prefixed_filters)
-            
-#         query = f"""
-#             SELECT
-#                 sr.camera_name,
-#                 sr.camera_id,
-#                 sr.location,
-#                 sr.area,
-#                 sr.building,
-#                 sr.zone,
-#                 sr.floor_level,
-#                 vs.count_threshold_greater,
-#                 vs.count_threshold_less,
-#                 COUNT(CASE 
-#                     WHEN vs.count_threshold_greater IS NOT NULL 
-#                          AND sr.person_count > vs.count_threshold_greater 
-#                     THEN 1 
-#                 END) AS above_max_count,
-#                 COUNT(CASE 
-#                     WHEN vs.count_threshold_less IS NOT NULL 
-#                          AND sr.person_count < vs.count_threshold_less 
-#                     THEN 1 
-#                 END) AS below_min_count,
-#                 COUNT(*) AS total_checks,
-#                 AVG(sr.person_count) AS avg_person_count,
-#                 MAX(sr.person_count) AS max_person_count,
-#                 MIN(sr.person_count) AS min_person_count,
-#                 MAX(CASE 
-#                     WHEN vs.count_threshold_greater IS NOT NULL 
-#                          AND sr.person_count > vs.count_threshold_greater 
-#                     THEN sr.timestamp 
-#                 END) AS last_above_max_time,
-#                 MAX(CASE 
-#                     WHEN vs.count_threshold_less IS NOT NULL 
-#                          AND sr.person_count < vs.count_threshold_less 
-#                     THEN sr.timestamp 
-#                 END) AS last_below_min_time
-#             FROM stream_results sr
-#             JOIN video_stream vs ON sr.stream_id = vs.stream_id
-#             WHERE sr.workspace_id = $1
-#               AND sr.camera_name IS NOT NULL
-#               AND sr.person_count IS NOT NULL
-#               AND vs.alert_enabled = TRUE
-#               AND (vs.count_threshold_greater IS NOT NULL OR vs.count_threshold_less IS NOT NULL)
-#               {date_filter}
-#               {location_where}
-#             GROUP BY 
-#                 sr.camera_name, 
-#                 sr.camera_id, 
-#                 sr.location, 
-#                 sr.area, 
-#                 sr.building, 
-#                 sr.zone,
-#                 sr.floor_level,
-#                 vs.count_threshold_greater,
-#                 vs.count_threshold_less
-#             HAVING COUNT(CASE 
-#                     WHEN vs.count_threshold_greater IS NOT NULL 
-#                          AND sr.person_count > vs.count_threshold_greater 
-#                     THEN 1 
-#                 END) > 0
-#                 OR COUNT(CASE 
-#                     WHEN vs.count_threshold_less IS NOT NULL 
-#                          AND sr.person_count < vs.count_threshold_less 
-#                     THEN 1 
-#                 END) > 0
-#             ORDER BY (
-#                 COUNT(CASE 
-#                     WHEN vs.count_threshold_greater IS NOT NULL 
-#                          AND sr.person_count > vs.count_threshold_greater 
-#                     THEN 1 
-#                 END) + 
-#                 COUNT(CASE 
-#                     WHEN vs.count_threshold_less IS NOT NULL 
-#                          AND sr.person_count < vs.count_threshold_less 
-#                     THEN 1 
-#                 END)
-#             ) DESC, sr.camera_name
-#         """
-        
-#         async with db_manager.get_connection() as conn:
-#             results = await conn.fetch(query, *params)
-            
-#         data = [{
-#             'camera_name': row['camera_name'],
-#             'camera_id': row['camera_id'],
-#             'location': row['location'],
-#             'area': row['area'],
-#             'building': row['building'],
-#             'zone': row['zone'],
-#             'floor_level': row['floor_level'],
-#             'max_threshold': row['count_threshold_greater'],
-#             'min_threshold': row['count_threshold_less'],
-#             'above_max_count': row['above_max_count'],
-#             'below_min_count': row['below_min_count'],
-#             'total_violations': row['above_max_count'] + row['below_min_count'],
-#             'total_checks': row['total_checks'],
-#             'violation_rate': round(
-#                 ((row['above_max_count'] + row['below_min_count']) / row['total_checks'] * 100), 
-#                 2
-#             ) if row['total_checks'] > 0 else 0,
-#             'avg_person_count': round(float(row['avg_person_count'])) if row['avg_person_count'] else 0,
-#             'max_person_count': row['max_person_count'],
-#             'min_person_count': row['min_person_count'],
-#             'last_above_max_time': row['last_above_max_time'].isoformat() if row['last_above_max_time'] else None,
-#             'last_below_min_time': row['last_below_min_time'].isoformat() if row['last_below_min_time'] else None
-#         } for row in results]
-        
-#         total_above_max = sum(d['above_max_count'] for d in data)
-#         total_below_min = sum(d['below_min_count'] for d in data)
-#         cameras_with_violations = len(data)
-        
-#         return {
-#             "success": True,
-#             "summary": {
-#                 "cameras_with_violations": cameras_with_violations,
-#                 "total_above_max_violations": total_above_max,
-#                 "total_below_min_violations": total_below_min,
-#                 "total_violations": total_above_max + total_below_min,
-#                 "cameras_with_above_max": len([d for d in data if d['above_max_count'] > 0]),
-#                 "cameras_with_below_min": len([d for d in data if d['below_min_count'] > 0])
-#             },
-#             "filters_applied": {
-#                 "start_date": start_date.isoformat() if start_date else None,
-#                 "end_date": end_date.isoformat() if end_date else None,
-#                 "locations": parse_string_or_list(locations),
-#                 "areas": parse_string_or_list(areas),
-#                 "buildings": parse_string_or_list(buildings),
-#                 "floor_levels": parse_string_or_list(floor_levels),
-#                 "zones": parse_string_or_list(zones)
-#             },
-#             "count": len(data),
-#             "data": data
-#         }
-        
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.error(f"Error fetching threshold violations: {e}", exc_info=True)
-#         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.get("/fire/threshold-violations-by-camera")
 async def get_threshold_violations_by_camera(
@@ -2614,15 +2332,15 @@ async def get_threshold_violations_by_camera(
         query = f"""
             SELECT
                 sr.camera_name,
-                sr.camera_id,
-                sr.location,
-                sr.area,
-                sr.building,
-                sr.zone,
-                sr.floor_level,
-                vs.count_threshold_greater,
-                vs.count_threshold_less,
-                vs.alert_enabled,
+                MAX(sr.camera_id) AS camera_id,
+                MAX(sr.location) AS location,
+                MAX(sr.area) AS area,
+                MAX(sr.building) AS building,
+                MAX(sr.zone) AS zone,
+                MAX(sr.floor_level) AS floor_level,
+                MAX(vs.count_threshold_greater) AS count_threshold_greater,
+                MAX(vs.count_threshold_less) AS count_threshold_less,
+                MAX(vs.alert_enabled::int)::boolean AS alert_enabled,
                 COUNT(CASE 
                     WHEN vs.count_threshold_greater IS NOT NULL 
                          AND sr.person_count > vs.count_threshold_greater 
@@ -2656,17 +2374,7 @@ async def get_threshold_violations_by_camera(
               AND (vs.count_threshold_greater IS NOT NULL OR vs.count_threshold_less IS NOT NULL)
               {date_filter}
               {location_where}
-            GROUP BY 
-                sr.camera_name, 
-                sr.camera_id, 
-                sr.location, 
-                sr.area, 
-                sr.building, 
-                sr.zone,
-                sr.floor_level,
-                vs.count_threshold_greater,
-                vs.count_threshold_less,
-                vs.alert_enabled
+            GROUP BY sr.camera_name
             {having_clause}
             ORDER BY (
                 COUNT(CASE 
