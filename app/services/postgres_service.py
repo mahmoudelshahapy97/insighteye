@@ -163,12 +163,28 @@ class PostgresService:
             
             async with self.db_manager.transaction() as conn:
                 for detection in detection_batch:
-                    result_id = uuid4()
+                    # Use the result_id from Redis (matches Qdrant frame ID)
+                    # Fall back to a new UUID for backwards compatibility
+                    result_id = UUID(detection['result_id']) if detection.get('result_id') else uuid4()
                     
                     # Process frame if provided
                     frame_base64 = None
                     if 'frame' in detection and detection['frame'] is not None:
                         frame_base64 = frame_to_base64(detection['frame'])
+                    
+                    # ===== DATA VALIDATION: Ensure gender counts don't exceed person count =====
+                    person_count = max(0, detection['person_count'])
+                    male_count = max(0, detection.get('male_count', 0))
+                    female_count = max(0, detection.get('female_count', 0))
+                    
+                    gender_sum = male_count + female_count
+                    if gender_sum > person_count:
+                        logger.warning(
+                            f"Batch gender mismatch: male({male_count}) + female({female_count}) = "
+                            f"{gender_sum} > person_count({person_count}). Adjusting person_count."
+                        )
+                        person_count = gender_sum
+                    # ===========================================================================
                     
                     # Insert result
                     result_query = """
@@ -197,10 +213,10 @@ class PostgresService:
                             detection['camera_name'],
                             datetime.fromtimestamp(detection['timestamp'], tz=ZoneInfo("Africa/Cairo")),
                             datetime.fromisoformat(detection['date']).date(),
-                            datetime.fromisoformat(detection['time']).time(),
-                            detection['person_count'],
-                            detection.get('male_count', 0),
-                            detection.get('female_count', 0),
+                            dt_time.fromisoformat(detection['time']),
+                            person_count,
+                            male_count,
+                            female_count,
                             detection.get('fire_status', 'no detection'),
                             detection['username'],
                             location_info.get('location'),

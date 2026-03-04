@@ -464,6 +464,10 @@ class Settings(BaseSettings):
     redis_max_connections: int = 50
     redis_socket_timeout: int = 5
     redis_socket_connect_timeout: int = 5
+
+    # Detection batch buffering
+    detection_batch_flush_interval: int = 300  # seconds between Redis → PG flushes (5 min)
+    detection_batch_size: int = 100            # max records fetched per flush per key
     
     # Celery configuration
     celery_broker_url: Optional[str] = None  # Will default to Redis

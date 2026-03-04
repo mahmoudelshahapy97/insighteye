@@ -11,6 +11,11 @@ from app.schemas import LocationSearchQuery
 
 logger = logging.getLogger(__name__)
 
+# Lazy import to avoid circular dependency at module load time
+def _get_redis_batch_service():
+    from app.services.redis_batch_service import redis_batch_service
+    return redis_batch_service
+
 class DetectionDataService:
     """service for handling detection data across PostgreSQL and Qdrant"""
     
@@ -53,28 +58,50 @@ class DetectionDataService:
         result_id = uuid4()
         
         try:
-            # 1. Insert metadata into PostgreSQL first
-            pg_success = await self.postgres_service.insert_detection_data(
-                stream_id=stream_id,
-                workspace_id=workspace_id,
-                user_id=user_id,
+            # 1. Push metadata to Redis batch buffer (flushes → PG every 5 min)
+            redis_svc = _get_redis_batch_service()
+            redis_ok = await redis_svc.push_detection(
+                stream_id=str(stream_id),
+                workspace_id=str(workspace_id),
+                user_id=str(user_id),
                 camera_name=camera_name,
                 username=username,
                 person_count=person_count,
                 male_count=male_count,
                 female_count=female_count,
                 fire_status=fire_status,
-                frame=frame if save_frame_in_postgres else None,
                 location_info=location_info,
-                save_frame=save_frame_in_postgres,
-                result_id=result_id
+                result_id=str(result_id),
             )
-            
-            if not pg_success:
-                logger.error(f"Failed to insert detection data into PostgreSQL for result_id {result_id}")
-                return False
-            
-            # 2. Insert frame into Qdrant
+
+            if not redis_ok:
+                # Redis unavailable — fall back to direct PostgreSQL insert
+                logger.warning(
+                    f"Redis push failed for stream {stream_id}; "
+                    "falling back to direct PostgreSQL insert."
+                )
+                pg_success = await self.postgres_service.insert_detection_data(
+                    stream_id=stream_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    camera_name=camera_name,
+                    username=username,
+                    person_count=person_count,
+                    male_count=male_count,
+                    female_count=female_count,
+                    fire_status=fire_status,
+                    frame=frame if save_frame_in_postgres else None,
+                    location_info=location_info,
+                    save_frame=save_frame_in_postgres,
+                    result_id=result_id,
+                )
+                if not pg_success:
+                    logger.error(
+                        f"Fallback PG insert also failed for result_id {result_id}"
+                    )
+                    return False
+
+            # 2. Insert frame into Qdrant (always direct — frames are too large for Redis)
             if frame is not None:
                 qdrant_success = await self.qdrant_service.insert_detection_data(
                     username=username,
@@ -87,15 +114,18 @@ class DetectionDataService:
                     frame=frame,
                     workspace_id=workspace_id,
                     location_info=location_info if save_metadata_in_qdrant else None,
-                    result_id=result_id
+                    result_id=result_id,
                 )
-                
+
                 if not qdrant_success:
                     logger.warning(f"Failed to insert frame into Qdrant for result_id {result_id}")
-            
-            logger.info(f"Successfully inserted detection data with ID: {result_id}")
+
+            logger.info(
+                f"Detection queued/saved — result_id={result_id} "
+                f"({'Redis batch' if redis_ok else 'direct PG fallback'})"
+            )
             return True
-            
+
         except Exception as e:
             logger.error(f"Error in detection data insertion: {e}", exc_info=True)
             return False

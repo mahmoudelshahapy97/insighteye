@@ -12,6 +12,7 @@ from app.api.routes import router
 from app.services.stream_service import stream_manager, initialize_stream_manager
 from app.services.stream_processing_service import stream_processing_service
 from app.services.distributed_stream_manager import initialize_distributed_stream_manager
+from app.services.redis_batch_service import redis_batch_service
 
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -62,6 +63,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize StreamManager: {e}", exc_info=True)
 
+    # Start Redis batch flush loop (buffers detections → PG every 5 min)
+    try:
+        await redis_batch_service.start_flush_loop()
+        logger.info("Redis detection batch flush loop started.")
+    except Exception as e:
+        logger.error(f"Failed to start Redis batch flush loop: {e}", exc_info=True)
+
     logger.info("Application startup complete (async).")
     yield
     # Shutdown
@@ -77,6 +85,13 @@ async def lifespan(app: FastAPI):
             logger.info("Stream manager shutdown complete.")
         except Exception as e:
             logger.error(f"Error during StreamManager shutdown: {e}", exc_info=True)
+
+    # Final Redis flush → PostgreSQL before closing DB pool
+    try:
+        await redis_batch_service.stop_flush_loop()
+        logger.info("Redis batch flush loop stopped and final flush complete.")
+    except Exception as e:
+        logger.error(f"Error stopping Redis batch service: {e}", exc_info=True)
 
     if connection_pool and not connection_pool._closed: # Check if pool exists and not closed
         try:
