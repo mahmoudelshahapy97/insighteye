@@ -130,7 +130,11 @@ async def reset_password_route(
             )
         success = await user_manager.reset_password(user_data["username"], request.new_password)
         if success:
-            return {"message": "Password reset successfully"}
+            # Revoke ALL active tokens so the user must re-login on every device
+            user_id = current_user.get("user_id")
+            if user_id:
+                await session_manager.invalidate_all_user_tokens(str(user_id))
+            return {"message": "Password reset successfully. Please log in again with your new password."}
         else:
             raise HTTPException(status_code=404, detail="User not found")
     except HTTPException as http_exc:

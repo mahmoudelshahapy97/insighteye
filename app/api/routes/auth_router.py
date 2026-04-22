@@ -374,23 +374,11 @@ async def logout_route(request_obj: FastAPIRequest, token: str = Depends(session
         user_id_for_log = UUID(token_data.user_id)
         workspace_id_for_log = UUID(token_data.workspace_id) if token_data.workspace_id else None
 
-        # session_manager.invalidate_token should be async, handle blacklisting and DB update
-        success = await session_manager.invalidate_token(token) 
-        
-        if not success: # Token might have been invalidated by another request, or not found
-            await session_manager.log_action(
-                content="Failed to invalidate token pair during logout (token might be already invalid or not found in DB).",
-                user_id=user_id_for_log,
-                workspace_id=workspace_id_for_log,
-                action_type="Logout_Invalidation_Warning", # Changed from Failed to Warning as logout is still "successful" from user POV
-                ip_address=request_obj.client.host if request_obj.client else "N/A",
-                user_agent=request_obj.headers.get("user-agent"),
-                status="warning" 
-            )
-            # Proceed with logout message, as user intent is to logout.
+        # Revoke ALL active tokens for this user so every device/session is forced to re-login
+        await session_manager.invalidate_all_user_tokens(token_data.user_id)
 
         await session_manager.log_action(
-            content="User logged out successfully.",
+            content="User logged out successfully. All active tokens revoked.",
             user_id=user_id_for_log,
             workspace_id=workspace_id_for_log,
             action_type="Logout_Success",
@@ -398,7 +386,7 @@ async def logout_route(request_obj: FastAPIRequest, token: str = Depends(session
             user_agent=request_obj.headers.get("user-agent"),
             status="success"
         )
-        return {"message": "Logged out successfully", "token_revoked": True}
+        return {"message": "Logged out successfully. All sessions have been revoked.", "tokens_revoked": True}
 
     except asyncpg.PostgresError as db_err:
         logger.error(f"Database error during logout for user {user_id_for_log or 'unknown'}: {db_err}", exc_info=True)
@@ -598,12 +586,15 @@ async def update_password_route(
                 detail="Failed to update password due to an unexpected internal error."
             )
 
+        # Revoke ALL active tokens so the user must re-login on every device
+        await session_manager.invalidate_all_user_tokens(str(user_id_obj))
+
         await session_manager.log_action(
-            content=f"Password updated successfully for user '{username}'.",
+            content=f"Password updated successfully for user '{username}'. All active tokens revoked.",
             user_id=user_id_obj, workspace_id=workspace_id_obj, action_type="Update_Password_Success",
             ip_address=request_obj.client.host if request_obj.client else "N/A", user_agent=request_obj.headers.get("user-agent"), status="success"
         )
-        return {"message": "Password updated successfully"}
+        return {"message": "Password updated successfully. Please log in again with your new password."}
 
     except asyncpg.PostgresError as db_err:
         logger.error(f"Database error updating password for user {username}: {db_err}", exc_info=True)
