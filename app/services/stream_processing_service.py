@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 from typing import Dict, Optional, Any, Tuple, List
 from uuid import UUID
+import uuid
+import tempfile
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone, timedelta
 # from ultralytics import YOLO  # Removing direct dependency
@@ -1282,10 +1284,6 @@ class StreamProcessingService:
 
                     # ---------- Shoplifting Event DB Insertion ----------
                     if is_shoplifting and frames_since_last_shoplifting_save > 120:
-                        import tempfile
-                        import cv2
-                        import uuid
-                        import os
                         from app.services.s3_service import s3_service
                         from app.services.shoplifting_service import shoplifting_service
                         

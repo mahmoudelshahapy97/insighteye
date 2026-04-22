@@ -281,6 +281,11 @@ class DetectionDataService:
                 "source": "PostgreSQL"
             }
             
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error retrieving single detection: {e}", exc_info=True)
+            return None
 
 
 # Global instance
