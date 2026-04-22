@@ -42,24 +42,3 @@ def ensure_uuid_str(value: Any) -> Optional[str]:
     """
     uuid_obj = ensure_uuid(value)
     return str(uuid_obj) if uuid_obj else None
-
-def validate_uuid_list(values: list) -> list[UUID]:
-    """
-    Validate and convert list of values to UUID objects.
-    
-    Args:
-        values: List of UUID strings or objects
-        
-    Returns:
-        List of UUID objects
-        
-    Raises:
-        ValueError: If any value is invalid
-    """
-    result = []
-    for val in values:
-        if val:  # Skip None/empty
-            uuid_obj = ensure_uuid(val)
-            if uuid_obj:
-                result.append(uuid_obj)
-    return result

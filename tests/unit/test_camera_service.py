@@ -339,7 +339,7 @@ class TestCameraServiceDeletion:
         # Mock some cameras can be deleted, others cannot
         # This would require more sophisticated mocking based on your implementation
         
-        deleted, unauthorized, not_found, qdrant_failures = await camera_service.delete_cameras(
+        deleted, unauthorized, not_found, failures = await camera_service.delete_cameras(
             camera_ids=camera_ids,
             user_id=user_id,
             current_user_role="user"

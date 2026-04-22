@@ -268,8 +268,6 @@ class CameraService:
             )
             
             if rows_affected and rows_affected > 0:
-                # Update Qdrant if needed
-                await self._update_qdrant_metadata(stream_update, stream_id_str, str(stream_workspace_id))
                 return True, None
             else:
                 return False, f"Update affected 0 rows for stream {stream_id_str}"
@@ -278,31 +276,15 @@ class CameraService:
             logger.error(f"Error updating stream: {e}", exc_info=True)
             return False, str(e)
 
-    async def _update_qdrant_metadata(
-        self, 
-        stream_update: StreamUpdate, 
-        stream_id: str, 
-        workspace_id: str
-    ) -> None:
-        """Update Qdrant metadata for a camera."""
-        try:
-            await self.postgres_service.update_camera_metadata(
-                stream_update=stream_update,
-                stream_id=stream_id,
-                workspace_id=workspace_id
-            )
-        except Exception as e:
-            logger.error(f"Failed to update Qdrant for stream {stream_id}: {e}", exc_info=True)
-
     async def delete_cameras(
         self,
         camera_ids: List[str],
         user_id: UUID,
         current_user_role: str
-    ) -> Tuple[List[str], List[str], List[str], List[str]]:
+    ) -> Tuple[List[str], List[str], List[str]]:
         """
         Delete multiple cameras. 
-        Returns (deleted_ids, unauthorized_ids, not_found_ids, qdrant_failures).
+        Returns (deleted_ids, unauthorized_ids, not_found_ids).
         """
         valid_ids = []
         unauthorized_ids = []
@@ -357,7 +339,6 @@ class CameraService:
                 unauthorized_ids.append(id_str)
         
         deleted_ids = []
-        qdrant_failures = []
         
         if valid_ids:
             # Delete from PostgreSQL
@@ -373,11 +354,8 @@ class CameraService:
             
             if deleted_count and deleted_count > 0:
                 deleted_ids = valid_ids.copy()
-                
-                # Delete from Qdrant
-                qdrant_failures = await self.postgres_service.delete_camera_data_from_workspaces(workspace_camera_mapping)
         
-        return deleted_ids, unauthorized_ids, not_found_ids, qdrant_failures
+        return deleted_ids, unauthorized_ids, not_found_ids
 
     async def get_workspace_data_timestamp_range(
         self,

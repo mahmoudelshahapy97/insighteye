@@ -20,7 +20,7 @@ from app.services.notification_service import notification_service
 from app.services.video_stream_service import video_stream_service
 from app.services.parameter_service import parameter_service
   
-from app.services.unified_data_service import unified_data_service as qdrant_service
+
 from app.services.workspace_service import workspace_service
 from app.services.shared_stream_service import video_file_manager
 from app.services.stream_processing_service import stream_processing_service
@@ -192,7 +192,7 @@ class StreamManager:
         # Core dependencies
         self.db_manager = db_manager
         self.video_file_manager = video_file_manager
-        self.qdrant_service = qdrant_service
+
         self.retry_service = retry_service
         self.status_batcher = StreamStatusBatcher(self.db_manager, batch_interval=5.0)
         
@@ -264,8 +264,7 @@ class StreamManager:
         # Initialize processing service
         self.processing_service.initialize(
             stream_manager=self,
-            video_file_manager=self.video_file_manager,
-            qdrant_service=self.qdrant_service
+            video_file_manager=self.video_file_manager
         )
         
         logging.info("StreamManager initialized with workspace integration")
@@ -947,9 +946,7 @@ class StreamManager:
                     "errors": 0
                 }
 
-                # Ensure Qdrant collection
-                if self.qdrant_service:
-                    await self.qdrant_service.ensure_workspace_collection(workspace_id)
+
 
                 # Create processing task
                 stop_event = asyncio.Event()
@@ -2993,13 +2990,6 @@ class StreamManager:
         self.retry_task = None
         
         logger.info("✅ All background tasks stopped")
-
-    async def _ensure_collection_for_stream_workspace(self, workspace_id: UUID):
-        """Ensure Qdrant collection exists for workspace."""
-        try:
-            await self.qdrant_service.ensure_workspace_collection(workspace_id)
-        except Exception as e:
-            logger.error(f"Error ensuring Qdrant collection for workspace {workspace_id}: {e}")
 
     # ==================== Shutdown ====================
 

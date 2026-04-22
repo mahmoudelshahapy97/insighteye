@@ -264,7 +264,7 @@ async def delete_streams(
         if not stream_ids_payload.ids:
             return {"message": "No stream IDs provided for deletion."}
 
-        deleted_ids, unauthorized_ids, not_found_ids, qdrant_failures = await camera_service.delete_cameras(
+        deleted_ids, unauthorized_ids, not_found_ids = await camera_service.delete_cameras(
             stream_ids_payload.ids,
             user_id_obj,
             user_role
@@ -274,8 +274,6 @@ async def delete_streams(
         log_content = f"User '{username}' attempted to delete {len(stream_ids_payload.ids)} camera(s)."
         if deleted_ids:
             log_content += f" Deleted: {', '.join(deleted_ids)}."
-        if qdrant_failures:
-            log_content += f" Qdrant failures: {', '.join(qdrant_failures)}."
         if unauthorized_ids:
             log_content += f" Unauthorized: {', '.join(unauthorized_ids)}."
         if not_found_ids:
@@ -291,15 +289,12 @@ async def delete_streams(
         )
 
         response_message = f"Deleted: {len(deleted_ids)}"
-        if qdrant_failures:
-            response_message += f", Qdrant failures: {len(qdrant_failures)}"
 
         return {
             "message": response_message,
             "deleted_ids": deleted_ids,
             "unauthorized_ids": unauthorized_ids,
-            "not_found_ids": not_found_ids,
-            "qdrant_deletion_failures": qdrant_failures
+            "not_found_ids": not_found_ids
         }
         
     except HTTPException:

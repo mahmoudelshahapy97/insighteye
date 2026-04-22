@@ -31,11 +31,10 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 
 COPY requirements-base.txt requirements-gpu.txt ./
 
-# Install requirements + nvidia-cudnn-cu12 (provides libcudnn.so.9)
-RUN uv pip install --system --no-cache \
-    -r requirements-base.txt \
-    -r requirements-gpu.txt \
-    nvidia-cudnn-cu12
+# Install requirements step-by-step to reduce peak disk space usage during extraction
+RUN uv pip install --system --no-cache -r requirements-base.txt
+RUN uv pip install --system --no-cache -r requirements-gpu.txt
+# RUN uv pip install --system --no-cache nvidia-cudnn-cu12
 
 # ===============================
 # OpenCV with CUDA
@@ -54,10 +53,10 @@ RUN ldconfig
 # Copy application code
 COPY . .
 
-EXPOSE 8000
+EXPOSE 8001
 
 # IMPORTANT: We removed the 'RUN python3 -c "import cv2"' line.
 # It will always fail during BUILD because there is no GPU driver access.
 # It will work at RUNTIME when you use --gpus all.
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]

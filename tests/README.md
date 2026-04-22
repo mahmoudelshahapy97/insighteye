@@ -42,8 +42,7 @@ Create a `.env.test` file or set environment variables:
 ```bash
 export TEST_DATABASE_URL="postgresql://test_user:test_pass@localhost:5432/test_insighteye"
 export TEST_REDIS_URL="redis://localhost:6379/1"
-export TEST_QDRANT_URL="http://localhost:6333"
-export TEST_ELASTICSEARCH_URL="http://localhost:9200"
+
 ```
 
 ## Running Tests

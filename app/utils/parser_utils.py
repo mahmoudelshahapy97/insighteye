@@ -123,14 +123,6 @@ def parse_date_format(date_str: str) -> dt_date:
     raise ValueError(f"Could not parse date string: '{date_str}' with known formats.")
 
 
-def parse_iso_date(date_str: str) -> dt_date:
-    """Ensures the date is in YYYY-MM-DD format before parsing. Returns datetime.date."""
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid date format: '{date_str}'. Expected YYYY-MM-DD.")
-
-
 def parse_time_string(time_str: Optional[str], default_time: dt_time) -> dt_time:
     """Parses HH:MM or HH:MM:SS format, returns default on failure or None input."""
     if time_str is None:
@@ -149,22 +141,3 @@ def parse_time_string(time_str: Optional[str], default_time: dt_time) -> dt_time
     except (ValueError, IndexError) as e:
         logger.warning(f"Could not parse time string '{time_str}': {e}. Using default: {default_time.isoformat()}")
         return default_time
-
-
-def validate_prompt(prompt: str) -> str:
-    """Clean and validate prompt to match utils.py (using re)."""
-    if not prompt:
-        return ""
-    # Using re.sub as in utils.py for consistency
-    prompt = re.sub(r'[^\w\s,.!?-]', '', prompt)
-    return prompt.strip()
-
-def validate_text(text: str) -> str:
-    """Validate and clean text (e.g., for TTS), ensuring it's printable."""
-    if not text:
-        raise ValueError("Text cannot be empty") # Match utils.py
-    
-    # Remove non-printable characters
-    text = ''.join(char for char in text if char.isprintable())
-    return text.strip()
-    

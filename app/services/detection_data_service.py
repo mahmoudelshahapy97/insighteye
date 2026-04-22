@@ -4,9 +4,7 @@ from typing import Dict, Any, Optional, List, Union
 from uuid import UUID, uuid4
 import logging
 import numpy as np
-from app.services.qdrant_service import qdrant_service
 from app.services.postgres_service import postgres_service
-from app.utils import get_workspace_qdrant_collection_name
 from app.schemas import LocationSearchQuery
 
 logger = logging.getLogger(__name__)
@@ -17,10 +15,9 @@ def _get_redis_batch_service():
     return redis_batch_service
 
 class DetectionDataService:
-    """service for handling detection data across PostgreSQL and Qdrant"""
+    """service for handling detection data in PostgreSQL"""
     
     def __init__(self):
-        self.qdrant_service = qdrant_service
         self.postgres_service = postgres_service
     
     async def insert_detection_data(
@@ -36,16 +33,14 @@ class DetectionDataService:
         fire_status: str,
         frame: Optional[np.ndarray] = None,
         location_info: Optional[Dict[str, Any]] = None,
-        save_frame_in_postgres: bool = False,
-        save_metadata_in_qdrant: bool = False
+        save_frame_in_postgres: bool = False
     ) -> bool:
         """
-        Insert detection data into both PostgreSQL and Qdrant with synchronized IDs.
+        Insert detection data into PostgreSQL with synchronized IDs.
         
         Strategy:
         - Generate single result_id
         - Save metadata in PostgreSQL (stream_results)
-        - Save frame in Qdrant (with optional metadata)
         - Optionally save frame in PostgreSQL too (stream_frames)
         
         Returns:
@@ -101,24 +96,7 @@ class DetectionDataService:
                     )
                     return False
 
-            # 2. Insert frame into Qdrant (always direct — frames are too large for Redis)
-            if frame is not None:
-                qdrant_success = await self.qdrant_service.insert_detection_data(
-                    username=username,
-                    camera_id_str=str(stream_id),
-                    camera_name=camera_name,
-                    count=person_count if save_metadata_in_qdrant else 0,
-                    male_count=male_count if save_metadata_in_qdrant else 0,
-                    female_count=female_count if save_metadata_in_qdrant else 0,
-                    fire_status=fire_status if save_metadata_in_qdrant else "no detection",
-                    frame=frame,
-                    workspace_id=workspace_id,
-                    location_info=location_info if save_metadata_in_qdrant else None,
-                    result_id=result_id,
-                )
 
-                if not qdrant_success:
-                    logger.warning(f"Failed to insert frame into Qdrant for result_id {result_id}")
 
             logger.info(
                 f"Detection queued/saved — result_id={result_id} "
@@ -151,10 +129,9 @@ class DetectionDataService:
         include_frame: bool = True
     ) -> Dict[str, Any]:
         """
-        Retrieve detection data from both PostgreSQL and Qdrant with filtering.
+        Retrieve detection data from PostgreSQL with filtering.
         
-        This method combines metadata from PostgreSQL with frames from Qdrant,
-        supporting all the same filters as workspace_search_results_with_location.
+        This method supports all the same filters as workspace_search_results_with_location.
         
         Args:
             workspace_id: Target workspace UUID
@@ -173,10 +150,10 @@ class DetectionDataService:
             zone: Zone filter
             page: Page number for pagination
             per_page: Results per page (None for all results)
-            include_frame: Whether to include frame data from Qdrant
+            include_frame: Whether to include frame data
             
         Returns:
-            Dictionary containing combined results with metadata and frames
+            Dictionary containing metadata results
         """
         try:
             # Build search query
@@ -212,30 +189,13 @@ class DetectionDataService:
                     "num_of_pages": 0,
                     "total_count": 0,
                     "per_page": per_page,
-                    "source": "(PostgreSQL + Qdrant)",
-                    "frames_included": include_frame
+                    "source": "PostgreSQL",
+                    "frames_included": False
                 }
             
-            # If frames requested, fetch from Qdrant
-            if include_frame:
-                result_ids = [item["id"] for item in pg_results["data"]]
-                frames_map = await self._fetch_frames_from_qdrant(
-                    workspace_id=workspace_id,
-                    result_ids=result_ids
-                )
-                
-                # Merge frames with metadata
-                for item in pg_results["data"]:
-                    result_id = item["id"]
-                    if result_id in frames_map:
-                        item["frame"] = frames_map[result_id]
-                    else:
-                        item["frame"] = None
-                        logger.debug(f"No frame found in Qdrant for result_id {result_id}")
-            
             # Add source information
-            pg_results["source"] = "(PostgreSQL metadata + Qdrant frames)"
-            pg_results["frames_included"] = include_frame
+            pg_results["source"] = "PostgreSQL"
+            pg_results["frames_included"] = False
             pg_results["filters_applied"] = {
                 "camera_id": camera_id,
                 "date_range": {
@@ -271,7 +231,7 @@ class DetectionDataService:
         Args:
             result_id: Unique ID of the detection result
             workspace_id: Workspace ID for validation
-            include_frame: Whether to include frame from Qdrant
+            include_frame: Whether to include frame
             
         Returns:
             Dictionary with combined metadata and frame, or None if not found
@@ -318,65 +278,10 @@ class DetectionDataService:
                 "latitude": float(metadata['latitude']) if metadata['latitude'] else None,
                 "longitude": float(metadata['longitude']) if metadata['longitude'] else None,
                 "created_at": metadata['created_at'].isoformat() if metadata['created_at'] else None,
-                "source": "(PostgreSQL + Qdrant)"
+                "source": "PostgreSQL"
             }
             
-            # Get frame from Qdrant if requested
-            if include_frame:
-                frames_map = await self._fetch_frames_from_qdrant(
-                    workspace_id=workspace_id,
-                    result_ids=[str(result_id)]
-                )
-                result["frame"] = frames_map.get(str(result_id))
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error retrieving single detection data: {e}", exc_info=True)
-            return None
-    
-    async def _fetch_frames_from_qdrant(
-        self,
-        workspace_id: UUID,
-        result_ids: List[str]
-    ) -> Dict[str, str]:
-        """
-        Fetch frames from Qdrant by result IDs.
-        
-        Args:
-            workspace_id: Workspace UUID
-            result_ids: List of result IDs to fetch
-            
-        Returns:
-            Dictionary mapping result_id to frame_base64
-        """
-        frames_map = {}
-        
-        if not result_ids:
-            return frames_map
-        
-        try:
-            client = self.qdrant_service.get_client()
-            collection_name = get_workspace_qdrant_collection_name(workspace_id)
-            
-            # Batch retrieve points by IDs
-            points = client.retrieve(
-                collection_name=collection_name,
-                ids=result_ids,
-                with_payload=["frame_base64"],
-                with_vectors=False
-            )
-            
-            for point in points:
-                if point.payload and point.payload.get("frame_base64"):
-                    frames_map[str(point.id)] = point.payload["frame_base64"]
-            
-            logger.debug(f"Retrieved {len(frames_map)} frames from Qdrant out of {len(result_ids)} requested")
-            
-        except Exception as e:
-            logger.error(f"Error fetching frames from Qdrant: {e}", exc_info=True)
-        
-        return frames_map
+
 
 # Global instance
 detection_data_service = DetectionDataService()

@@ -110,32 +110,3 @@ async def handle_mark_read_message(message: dict, user_id_str: str, username_for
                 })
     except Exception as e:
         logger.error(f"Error handling mark_read for {username_for_log}: {e}")
-
-
-async def send_ping_with_stability_check(websocket: WebSocket, username_for_log: str):
-    try:
-        ping_interval = float(config.websocket_ping_interval)  # Longer interval
-        consecutive_ping_failures = 0
-        max_ping_failures = 3
-        
-        while (websocket.client_state == WebSocketState.CONNECTED and 
-               consecutive_ping_failures < max_ping_failures):
-            await asyncio.sleep(ping_interval)
-            
-            if websocket.client_state == WebSocketState.CONNECTED:
-                try:
-                    await websocket.send_json({
-                        "type": "ping", 
-                        "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).timestamp()
-                    })
-                    consecutive_ping_failures = 0  # Reset on success
-                except Exception as e:
-                    consecutive_ping_failures += 1
-                    logging.warning(f"Ping failed for {username_for_log} (#{consecutive_ping_failures}): {e}")
-                    if consecutive_ping_failures >= max_ping_failures:
-                        break
-            else:
-                break
-                
-    except Exception as e:
-        logging.debug(f"Ping task ended for {username_for_log}: {e}")

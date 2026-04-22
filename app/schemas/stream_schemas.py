@@ -98,7 +98,7 @@ class FrameData(BaseModel):
     timestamp: datetime
     frame_base64: Optional[str] = None
     metadata: Optional[FrameMetadata] = None
-    qdrant_score: Optional[float] = None
+
     frame_number: Optional[int] = None
 
 class BatchFrameResponse(BaseModel):

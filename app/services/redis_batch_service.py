@@ -9,7 +9,7 @@ Flow:
   detection → push_detection() → Redis list
   background loop (every 5 min) → flush_all_to_postgres() → batch_insert_detection_data()
 
-Qdrant writes are NOT buffered here — frames go directly to Qdrant.
+Writes are buffered here.
 """
 
 import asyncio

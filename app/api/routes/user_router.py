@@ -120,6 +120,14 @@ async def reset_password_route(
 
     try:
         user_data = await user_manager.get_user_by_email(request.email)
+        current_username = current_user.get("username")
+    
+        # Check if user can perform reset password
+        if current_username != user_data["username"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only reset your own password."
+            )
         success = await user_manager.reset_password(user_data["username"], request.new_password)
         if success:
             return {"message": "Password reset successfully"}
@@ -209,7 +217,6 @@ async def delete_user_completely(
     Completely delete a user from all systems.
     
     This will:
-    - Remove all camera data from Qdrant
     - Remove user from all workspaces
     - Delete all database records (cascading)
     - Clean up all related resources

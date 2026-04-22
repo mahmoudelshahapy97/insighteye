@@ -374,32 +374,6 @@ async def activate_workspace(
         )
 
 
-# Admin endpoints
-@router.post("/workspaces/migrate")
-async def migrate_to_workspace_model(
-    request: Request,
-    current_user_data: Dict = Depends(get_current_user_full_data_dependency)
-):
-    """Migrate data to workspace model (admin only)."""
-    if not workspace_service.is_system_admin(current_user_data):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only system admin users can perform migration."
-        )
-    
-    await workspace_service.migrate_to_workspace_model()
-    
-    await session_manager.log_action(
-        content=f"Admin user '{current_user_data['username']}' performed migration to workspace model",
-        user_id=str(current_user_data['user_id']),
-        action_type="Workspace_Migration",
-        ip_address=request.client.host if request.client else "N/A",
-        user_agent=request.headers.get("user-agent")
-    )
-    
-    return {"message": "Migration to workspace model completed successfully"}
-
-
 @router.get("/admin/all-workspaces", response_model=List[dict])
 async def admin_get_all_workspaces(
     include_inactive: bool = Query(False, description="Include inactive workspaces"),

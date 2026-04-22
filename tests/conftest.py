@@ -93,23 +93,6 @@ def mock_redis(mocker):
     redis_mock.delete = mocker.AsyncMock(return_value=True)
     return redis_mock
 
-@pytest.fixture
-def mock_qdrant(mocker):
-    """Mock Qdrant client"""
-    qdrant_mock = mocker.AsyncMock()
-    qdrant_mock.search = mocker.AsyncMock(return_value=[])
-    qdrant_mock.upsert = mocker.AsyncMock(return_value=True)
-    qdrant_mock.delete = mocker.AsyncMock(return_value=True)
-    return qdrant_mock
-
-@pytest.fixture
-def mock_elasticsearch(mocker):
-    """Mock Elasticsearch client"""
-    es_mock = mocker.AsyncMock()
-    es_mock.search = mocker.AsyncMock(return_value={"hits": {"hits": []}})
-    es_mock.index = mocker.AsyncMock(return_value={"result": "created"})
-    return es_mock
-
 # Configure pytest-asyncio
 def pytest_configure(config):
     """Configure pytest with custom markers"""

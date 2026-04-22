@@ -17,28 +17,6 @@ logger = logging.getLogger(__name__)
 _models: Dict[str, Any] = {}
 
 
-def get_ChatOpenAI_model(
-    model_id: str, 
-    base_url: str, 
-    temperature: float, 
-    num_predict: int, 
-    format_: str
-):
-    """Get or create ChatOpenAI model instance."""
-    cache_key = f"openai_{model_id}_{base_url}_{temperature}_{num_predict}_{format_}"
-    if cache_key not in _models:
-        _models[cache_key] = ChatOpenAI(
-            base_url=base_url,
-            model=model_id,
-            api_key="na",
-            max_tokens=num_predict,
-            temperature=temperature,
-            top_p=1,
-            frequency_penalty=1.1,
-        )
-    return _models[cache_key]
-
-
 def get_ChatOllama_model(
     model_id: str, 
     temperature: float, 
@@ -139,33 +117,3 @@ def format_chat_history(
                 logger.warning(f"Skipping invalid history message (must be dict with 'role' and 'content'): {msg}")
     messages.extend(valid_history_messages)
     return messages
-
-
-def get_user_message(messages: List[Dict[str, str]]) -> List[str]: # Return List[str]
-    """Get user messages (human or user role) from messages list."""
-    # Content can be complex (list of parts for multimodal), so convert to str
-    return [str(msg['content']) for msg in messages if msg.get('role') in ['human', 'user']]
-
-
-def get_assistant_message(messages: List[Dict[str, str]]) -> List[str]: # Return List[str]
-    """Get assistant messages from messages list."""
-    return [str(msg['content']) for msg in messages if msg.get('role') == 'assistant']
-
-
-def validate_prompt(prompt: str) -> str:
-    """Clean and validate prompt to match utils.py (using re)."""
-    if not prompt:
-        return ""
-    # Using re.sub as in utils.py for consistency
-    prompt = re.sub(r'[^\w\s,.!?-]', '', prompt)
-    return prompt.strip()
-
-def validate_text(text: str) -> str:
-    """Validate and clean text (e.g., for TTS), ensuring it's printable."""
-    if not text:
-        raise ValueError("Text cannot be empty") # Match utils.py
-    
-    # Remove non-printable characters
-    text = ''.join(char for char in text if char.isprintable())
-    return text.strip()
-    

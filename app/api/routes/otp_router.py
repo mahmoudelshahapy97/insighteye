@@ -19,58 +19,6 @@ def create_response(success: bool, message: str, data: Optional[Dict[str, Any]] 
         response_dict["data"] = data
     return response_dict
 
-@router.post("/generate-otp")
-async def generate_otp(request: OTPRequest):
-    """Generate an OTP for the given email."""
-    try:
-        # Check if email exists in user database
-        user_data = await user_manager.get_user_by_email(request.email)
-        if not user_data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                # Matched message from otp.py
-                detail=create_response(success=False, message="Email not registered")
-            )
-
-        # Generate OTP
-        # OTPManager.generate_otp returns Tuple[bool, str]: (success_status, value_or_error_msg)
-        # Use keyword arguments for email and length. `purpose` will take its default value in OTPManager.
-        success_status, value_or_error_msg = await otp_manager.generate_otp(
-            email=request.email,
-            length=request.length  # Assuming OTPRequest has a 'length' attribute
-        )
-
-        otp_value: str
-        if not success_status:
-            # If generation failed, value_or_error_msg is the error message string
-            error_message = value_or_error_msg
-            status_code = status.HTTP_429_TOO_MANY_REQUESTS if "frequent" in error_message.lower() else status.HTTP_500_INTERNAL_SERVER_ERROR
-            raise HTTPException(
-                status_code=status_code,
-                detail=create_response(success=False, message=error_message)
-            )
-        else:
-            # If generation succeeded, value_or_error_msg is the OTP string
-            otp_value = value_or_error_msg
-
-        return create_response(
-            success=True,
-            # Matched message and data structure from otp.py
-            message="OTP generated successfully (but not sent)",
-            data={"email": request.email, "otp": otp_value}
-        )
-
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        # Matched logging style from otp.py (removed purpose)
-        logger.error(f"Error in generate_otp endpoint for {request.email}: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            # Matched message from otp.py
-            detail=create_response(success=False, message="Failed to generate OTP due to an internal error")
-        )
-
 @router.post("/send-otp")
 async def send_otp(request: OTPRequest, background_tasks: BackgroundTasks): 
     """Generate and send an OTP to the specified email."""
@@ -153,33 +101,4 @@ async def verify_otp(request: OTPVerification):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             # Matched message from otp.py
             detail=create_response(success=False, message="Failed to verify OTP due to an internal error")
-        )
-
-@router.delete("/delete-otp")
-async def delete_otp(request: OTPDeletion):
-    """Delete an OTP for the given email."""
-    try:
-        success = await otp_manager.delete_otp(request.email)
-        if not success:
-            # Matched logging and error handling from otp.py
-            logger.error(f"otp_manager.delete_otp failed unexpectedly for {request.email}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=create_response(success=False, message="Failed to delete OTP due to an internal error")
-            )
-
-        return create_response(
-            success=True,
-            # Matched message from otp.py (removed purpose)
-            message=f"OTP for {request.email} deleted if it existed"
-        )
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        # Matched logging style from otp.py (removed purpose)
-        logger.error(f"Error in delete_otp endpoint for {request.email}: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            # Matched message from otp.py
-            detail=create_response(success=False, message="Failed to delete OTP due to an internal error")
         )

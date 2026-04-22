@@ -64,29 +64,3 @@ async def check_workspace_access(
             )
     
     return {"role": user_role}
-
-def check_resource_ownership(
-    resource_owner_id: UUID,
-    requesting_user_id: UUID,
-    workspace_role: Optional[str] = None,
-    system_role: Optional[str] = None
-) -> bool:
-    """
-    Check if user can access a resource.
-    
-    Returns:
-        True if access granted, False otherwise
-    """
-    # System admin
-    if system_role == "admin":
-        return True
-    
-    # Workspace admin
-    if workspace_role in ["admin", "owner"]:
-        return True
-    
-    # Resource owner
-    if resource_owner_id == requesting_user_id:
-        return True
-    
-    return False

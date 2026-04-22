@@ -1,7 +1,7 @@
 # app/services/stream_processing_service.py
 """
 Stream Processing Service - Handles video frame processing, object detection, and alerts.
-Now includes Qdrant data storage after each detection.
+Stream Processing Service - Handles video frame processing, object detection, and alerts.
 """
 import asyncio
 import logging
@@ -50,9 +50,10 @@ class StreamProcessingService:
         self.people_model = None
         self.gender_model = None
         self.fire_model = None
+        self.shoplifting_model = None
         self.stream_manager = None
         self.video_file_manager = None
-        self.qdrant_service = None
+
         self._cached_results = {}
         self.use_gpu = True
 
@@ -61,11 +62,10 @@ class StreamProcessingService:
         
         logger.info("StreamProcessingService initialized")
 
-    def initialize(self, stream_manager, video_file_manager, qdrant_service):
+    def initialize(self, stream_manager, video_file_manager):
         """Initialize service with dependencies."""
         self.stream_manager = stream_manager
         self.video_file_manager = video_file_manager
-        self.qdrant_service = qdrant_service
         logger.info("StreamProcessingService dependencies initialized")
 
     def _initialize_models(self):
@@ -74,12 +74,14 @@ class StreamProcessingService:
         people_model_path = config.people_model_path
         gender_model_path = config.gender_model_path
         fire_model_path = config.fire_model_path
+        shoplifting_model_path = config.shoplifting_model_path
         backend = config.model_backend
         
         logger.info(f"🔍 Checking model paths (Backend: {backend}):")
         logger.info(f"  People: {people_model_path} (exists: {os.path.exists(people_model_path)})")
         logger.info(f"  Gender: {gender_model_path} (exists: {os.path.exists(gender_model_path)})")
         logger.info(f"  Fire: {fire_model_path} (exists: {os.path.exists(fire_model_path)})")
+        logger.info(f"  Shoplifting: {shoplifting_model_path} (exists: {os.path.exists(shoplifting_model_path)})")
                 
         try:
             # Use ModelFactory to create loaders
@@ -107,10 +109,14 @@ class StreamProcessingService:
                 confidence_threshold=config.fire_confidence
             )
             
+            from app.services.shoplifting_inference import shoplifting_engine
+            self.shoplifting_engine = shoplifting_engine
+            
             # Load models immediately to fail fast if there's an issue
             self.people_model.load_model()
             self.gender_model.load_model()
             self.fire_model.load_model()
+            self.shoplifting_engine.load_models()
             
             logger.info(f"✅ Models initialized successfully using {backend}")
         except Exception as e:
@@ -118,13 +124,15 @@ class StreamProcessingService:
             self.people_model = None
             self.gender_model = None
             self.fire_model = None
+            self.shoplifting_engine = None
 
     def get_model_status(self) -> Dict[str, bool]:
         """Get status of all models for health checks."""
         return {
             "people_model": self.people_model is not None and self.people_model.is_loaded,
             "gender_model": self.gender_model is not None and self.gender_model.is_loaded,
-            "fire_model": self.fire_model is not None and self.fire_model.is_loaded
+            "fire_model": self.fire_model is not None and self.fire_model.is_loaded,
+            "shoplifting_model": self.shoplifting_engine is not None and self.shoplifting_engine.get_status()
         }
 
     def detect_objects_with_threshold(
@@ -133,13 +141,13 @@ class StreamProcessingService:
         conf_threshold: float = 0.5,
         threshold_settings: Dict[str, Any] = None,
         stream_id_str: str = None
-    ) -> Tuple[np.ndarray, int, bool, int, int, str]:
+    ) -> Tuple[np.ndarray, int, bool, int, int, str, bool, float, List[str]]:
         """
         Detect objects in frame with threshold checking.
-        Returns: (annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status)
+        Returns: (annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status, is_shoplifting, shoplifting_conf, shoplifting_objects)
         """
         if frame is None or frame.size == 0:
-            return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection"
+            return np.zeros((100, 100, 3), dtype=np.uint8), 0, False, 0, 0, "no detection", False, 0.0, []
 
         # ✅ CRITICAL CHECK: This should NEVER happen now
         if self.people_model is None:
@@ -261,6 +269,35 @@ class StreamProcessingService:
                 except Exception as e:
                     logger.error(f"Fire detection error for stream {stream_id_str}: {e}")
 
+            # Shoplifting detection (temporal sequence sliding window)
+            # We run it on all frames available to keep the buffer flowing smoothly
+            is_shoplifting = False
+            shoplifting_conf = 0.0
+            shoplifting_objects = []
+            
+            if self.shoplifting_engine and self.shoplifting_engine.get_status():
+                try:
+                    # Stream ID dictates the buffer to which the frame's features are added
+                    label, conf, alert = self.shoplifting_engine.process_frame(stream_id_str, input_frame)
+                    
+                    if label != "Buffering...":
+                        if alert:
+                            is_shoplifting = True
+                            shoplifting_conf = conf
+                            logger.info(f"🚨 Shoplifting detected on stream {stream_id_str} with {conf:.2f} conf")
+                            
+                            cv2.putText(input_frame, f"Shoplifting (Temp): {conf:.2f}", (10, input_frame.shape[0] - 20), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        else:
+                            cv2.putText(input_frame, f"State: {label}", (10, input_frame.shape[0] - 20), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(input_frame, f"State: Buffering...", (10, input_frame.shape[0] - 20), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        
+                except Exception as e:
+                    logger.error(f"Shoplifting detection error for stream {stream_id_str}: {e}")
+
             # Use cached results
             male_count = cache['male_count']
             female_count = cache['female_count']
@@ -313,11 +350,11 @@ class StreamProcessingService:
                 else:
                     annotated_frame = cv2.resize(annotated_frame, (w, h), interpolation=cv2.INTER_LINEAR)
                 
-            return annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status
+            return annotated_frame, person_count, alert_triggered, male_count, female_count, fire_status, is_shoplifting, shoplifting_conf, shoplifting_objects
             
         except Exception as e:
             logger.error(f"Object detection error for stream {stream_id_str}: {e}", exc_info=True)
-            return frame.copy(), 0, False, 0, 0, "no detection"
+            return frame.copy(), 0, False, 0, 0, "no detection", False, 0.0, []
 
     def _annotate_frame_cpu(
         self,
@@ -497,7 +534,7 @@ class StreamProcessingService:
         location_info: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
-        Save detection data to both Qdrant and PostgreSQL databases.
+        Save detection data to PostgreSQL database.
         This is called periodically based on frame_skip configuration.
         """
         try:
@@ -538,136 +575,6 @@ class StreamProcessingService:
             logger.error(f"Error saving detection data for stream {stream_id_str}: {e}", exc_info=True)
             return False
 
-    async def _save_detection_old(
-        self,
-        stream_id_str: str,
-        camera_name: str,
-        owner_username: str,
-        person_count: int,
-        male_count: int,
-        female_count: int,
-        fire_status: str,
-        frame: np.ndarray,
-        workspace_id: UUID,
-        location_info: Optional[Dict[str, Any]] = None
-    ) -> bool:
-        """
-        Save detection data to both Qdrant and PostgreSQL databases.
-        This is called periodically based on frame_skip configuration.
-        """
-        qdrant_success = False
-        postgres_success = False
-        
-        try:
-            # Save to Qdrant
-            if self.qdrant_service:
-                qdrant_success = await self.qdrant_service.insert_detection_data(
-                    username=owner_username,
-                    camera_id_str=stream_id_str,
-                    camera_name=camera_name,
-                    count=person_count,
-                    male_count=male_count,
-                    female_count=female_count,
-                    fire_status=fire_status,
-                    frame=frame,
-                    workspace_id=workspace_id,
-                    location_info=location_info
-                )
-                
-                if qdrant_success:
-                    logger.debug(f"✅ Qdrant: Saved detection data for stream {stream_id_str}")
-                else:
-                    logger.warning(f"⚠️ Qdrant: Failed to save detection data for stream {stream_id_str}")
-            else:
-                logger.warning("Qdrant service not initialized, skipping Qdrant save")
-            
-            # Save to PostgreSQL
-            if self.postgres_service:
-                # Get user_id from stream info
-                stream_info = await video_stream_service.get_video_stream_by_id(UUID(stream_id_str))
-                
-                if stream_info:
-                    postgres_success = await self.postgres_service.insert_detection_data(
-                        stream_id=UUID(stream_id_str),
-                        workspace_id=workspace_id,
-                        user_id=stream_info['user_id'],
-                        camera_name=camera_name,
-                        username=owner_username,
-                        person_count=person_count,
-                        male_count=male_count,
-                        female_count=female_count,
-                        fire_status=fire_status,
-                        frame=None,
-                        location_info=location_info,
-                        save_frame=False
-                    )
-                    
-                    if postgres_success:
-                        logger.debug(f"✅ PostgreSQL: Saved detection data for stream {stream_id_str}")
-                    else:
-                        logger.warning(f"⚠️ PostgreSQL: Failed to save detection data for stream {stream_id_str}")
-                else:
-                    logger.error(f"Could not get stream info for {stream_id_str}, skipping PostgreSQL save")
-            else:
-                logger.warning("PostgreSQL service not initialized, skipping PostgreSQL save")
-            
-            # Return success if at least one database succeeded
-            overall_success = qdrant_success or postgres_success
-            
-            if overall_success:
-                logger.debug(
-                    f"Detection saved for {stream_id_str}: "
-                    f"count={person_count}, male={male_count}, female={female_count}, fire={fire_status} "
-                    f"(Qdrant: {'✓' if qdrant_success else '✗'}, PostgreSQL: {'✓' if postgres_success else '✗'})"
-                )
-            
-            return overall_success
-            
-        except Exception as e:
-            logger.error(f"Error saving detection data for stream {stream_id_str}: {e}", exc_info=True)
-            return False
-
-    async def verify_qdrant_save(
-        self,
-        workspace_id: UUID,
-        stream_id_str: str,
-        max_wait: float = 5.0
-    ) -> bool:
-        """
-        Verify that data was actually saved to Qdrant.
-        Returns True if data found, False otherwise.
-        """
-        try:
-            if not self.qdrant_service:
-                return False
-            
-            start_time = time.time()
-            
-            # Try to query recent data for this stream
-            while time.time() - start_time < max_wait:
-                try:
-                    # Query Qdrant for recent detections
-                    results = await self.qdrant_service.query_detections(
-                        workspace_id=workspace_id,
-                        camera_id=stream_id_str,
-                        limit=1
-                    )
-                    
-                    if results and len(results) > 0:
-                        logger.info(f"✅ Verified Qdrant save for stream {stream_id_str}")
-                        return True
-                    
-                except Exception as e:
-                    logger.debug(f"Query failed during verification: {e}")
-                
-                await asyncio.sleep(0.5)
-            
-            logger.warning(f"⚠️ Could not verify Qdrant save for stream {stream_id_str}")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error verifying Qdrant save: {e}")
-            return False
 
     async def _handle_people_count_alert(
         self,
@@ -1170,6 +1077,10 @@ class StreamProcessingService:
 
         frame_count = 0
         frames_since_last_save = 0
+        
+        from collections import deque
+        video_buffer = deque(maxlen=120)
+        frames_since_last_shoplifting_save = 999
 
         last_db_update_activity = datetime.now(ZoneInfo("Africa/Cairo"))
         last_heartbeat = datetime.now(ZoneInfo("Africa/Cairo"))
@@ -1260,6 +1171,11 @@ class StreamProcessingService:
                             
                     frame_count += 1
                     frames_since_last_save += 1
+                    frames_since_last_shoplifting_save += 1
+                    
+                    # Buffer resized frame to save memory
+                    small_frame = cv2.resize(frame, (640, 480))
+                    video_buffer.append(small_frame)
 
                     current_time = datetime.now(ZoneInfo("Africa/Cairo"))
 
@@ -1301,6 +1217,9 @@ class StreamProcessingService:
                             male_count,
                             female_count,
                             fire_status,
+                            is_shoplifting,
+                            shoplifting_conf,
+                            shoplifting_objects
                         ) = await loop.run_in_executor(
                             thread_pool,
                             self.detect_objects_with_threshold,
@@ -1360,6 +1279,78 @@ class StreamProcessingService:
                         except Exception as save_err:
                             logger.error(f"Error saving detection: {save_err}")
                             # ✅ Don't crash, just log and continue
+
+                    # ---------- Shoplifting Event DB Insertion ----------
+                    if is_shoplifting and frames_since_last_shoplifting_save > 120:
+                        import tempfile
+                        import cv2
+                        import uuid
+                        import os
+                        from app.services.s3_service import s3_service
+                        from app.services.shoplifting_service import shoplifting_service
+                        
+                        try:
+                            # 1. Take a snapshot of the buffer
+                            shoplifting_frames = list(video_buffer)
+                            
+                            async def save_shoplifting_video(frames, s_id, w_id, u_id, conf, objs):
+                                if not frames: return
+                                
+                                # Setup temp file
+                                temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
+                                
+                                def write_video():
+                                    try:
+                                        h, w = frames[0].shape[:2]
+                                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                        out = cv2.VideoWriter(temp_path, fourcc, 10.0, (w, h))
+                                        for f in frames:
+                                            out.write(f)
+                                        out.release()
+                                        return True
+                                    except Exception as e:
+                                        logger.error(f"Error writing video: {e}")
+                                        return False
+                                        
+                                success = await asyncio.to_thread(write_video)
+                                if not success: return
+                                
+                                # Upload video to S3
+                                s3_path = await s3_service.upload_video_file_to_s3(temp_path)
+                                
+                                # Cleanup temp file
+                                try:
+                                    if os.path.exists(temp_path):
+                                        os.remove(temp_path)
+                                except Exception:
+                                    pass
+                                    
+                                if s3_path:
+                                    # Save to DB
+                                    await shoplifting_service.insert_surveillance_frame(
+                                        session_id=uuid.uuid4(),
+                                        stream_id=s_id,
+                                        workspace_id=w_id,
+                                        user_id=u_id,
+                                        is_shoplifting=True,
+                                        behavior_state="suspicious",
+                                        behavior_category="shoplifting",
+                                        confidence=float(conf),
+                                        objects_detected=objs,
+                                        image_path=s3_path   # Re-using image_path column for video S3 path
+                                    )
+                                    logger.info(f"✅ Saved shoplifting video to {s3_path}")
+                                    
+                            # Create task so it doesn't block stream processing
+                            asyncio.create_task(save_shoplifting_video(
+                                shoplifting_frames, stream_id, workspace_id, owner_id, 
+                                shoplifting_conf, shoplifting_objects
+                            ))
+                            
+                            frames_since_last_shoplifting_save = 0
+                            
+                        except Exception as e:
+                            logger.error(f"Error triggering shoplifting video save for stream {stream_id_str}: {e}")
 
                     # ---------- ALERTS (with error isolation) ----------
                     try:
@@ -1446,7 +1437,7 @@ class StreamProcessingService:
         """Process a single frame and return annotated frame with detection data."""
         loop = asyncio.get_event_loop()
         
-        annotated_frame, person_count, _, male_count, female_count, fire_status = \
+        annotated_frame, person_count, _, male_count, female_count, fire_status, is_shoplifting, shoplifting_conf, _ = \
             await loop.run_in_executor(
                 thread_pool,
                 self.detect_objects_with_threshold,
@@ -1460,7 +1451,9 @@ class StreamProcessingService:
             "person_count": person_count,
             "male_count": male_count,
             "female_count": female_count,
-            "fire_status": fire_status
+            "fire_status": fire_status,
+            "is_shoplifting": is_shoplifting,
+            "shoplifting_confidence": shoplifting_conf
         }
         
         return annotated_frame, detection_data

@@ -14,6 +14,7 @@ import csv
 import io
 
 from app.services.database import db_manager
+from app.services.s3_service import s3_service
 from app.utils import (
     parse_camera_ids, parse_date_format, parse_time_string,
     frame_to_base64
@@ -129,7 +130,11 @@ class PostgresService:
                     try:
                         _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                         frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                        frame_size = len(frame_base64)
+                        
+                        s3_path = await s3_service.upload_image_base64_to_s3(frame_base64)
+                        frame_size = len(buffer)
+                        
+                        image_path_or_base64 = s3_path if s3_path else frame_base64
                         
                         frame_query = """
                             INSERT INTO stream_frames (
@@ -140,7 +145,7 @@ class PostgresService:
                         
                         await self.db_manager.execute_query(
                             frame_query,
-                            (uuid4(), result_id, stream_id_obj, frame_base64, frame_size, now_utc),
+                            (uuid4(), result_id, stream_id_obj, image_path_or_base64, frame_size, now_utc),
                             connection=conn
                         )
                     except Exception as frame_error:
@@ -163,7 +168,7 @@ class PostgresService:
             
             async with self.db_manager.transaction() as conn:
                 for detection in detection_batch:
-                    # Use the result_id from Redis (matches Qdrant frame ID)
+                    # Use the result_id from Redis
                     # Fall back to a new UUID for backwards compatibility
                     result_id = UUID(detection['result_id']) if detection.get('result_id') else uuid4()
                     
@@ -233,6 +238,10 @@ class PostgresService:
                     
                     # Insert frame if available
                     if frame_base64 and detection.get('save_frame', True):
+                        s3_path = await s3_service.upload_image_base64_to_s3(frame_base64)
+                        image_path_or_base64 = s3_path if s3_path else frame_base64
+                        frame_size = int(len(frame_base64) * 0.75) if s3_path else len(frame_base64)
+
                         frame_query = """
                             INSERT INTO stream_frames (
                                 frame_id, result_id, stream_id,
@@ -242,7 +251,7 @@ class PostgresService:
                         await self.db_manager.execute_query(
                             frame_query,
                             (uuid4(), result_id, UUID(detection['camera_id']), 
-                             frame_base64, len(frame_base64), datetime.now(ZoneInfo("Africa/Cairo"))),
+                             image_path_or_base64, frame_size, datetime.now(ZoneInfo("Africa/Cairo"))),
                             connection=conn
                         )
                     

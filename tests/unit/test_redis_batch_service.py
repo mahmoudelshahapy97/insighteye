@@ -222,8 +222,7 @@ class TestRedisFailureFallback:
         """
         from app.services.detection_data_service import DetectionDataService
 
-        mock_qdrant = AsyncMock()
-        mock_qdrant.insert_detection_data = AsyncMock(return_value=True)
+
 
         mock_pg = AsyncMock()
         mock_pg.insert_detection_data = AsyncMock(return_value=True)
@@ -234,7 +233,7 @@ class TestRedisFailureFallback:
         import numpy as np
 
         svc = DetectionDataService()
-        svc.qdrant_service = mock_qdrant
+
         svc.postgres_service = mock_pg
 
         with patch(

@@ -29,7 +29,7 @@ Enterprise-grade video streaming and object detection system with workspace-base
 
 ### 📊 Data Storage
 - **PostgreSQL**: User/workspace/camera metadata, detection history, alerts
-- **Qdrant**: Vector embeddings for frame storage and similarity search
+
 - **Time-series**: Efficient querying by timestamp ranges
 
 ## Architecture

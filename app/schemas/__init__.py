@@ -16,7 +16,6 @@ Structure:
 - location_schemas.py: Location hierarchy and management
 - stream_schemas.py: Stream data and search
 - stream_schemas1.py: Stream data and search
-- qdrant_schemas.py: Vector database operations
 - system_schemas.py: System information and metadata
 - utils.py: Validation and helper functions
 """
@@ -263,29 +262,6 @@ from app.schemas.stream_schemas1 import (
     BatchOperationResponse,
 )
 
-# Qdrant Management
-from app.schemas.qdrant_schemas import (
-    VectorParams,
-    CreateCollectionRequest,
-    CreateCollectionRequest1,
-    VectorConfig,
-    AdvancedCreateCollectionRequest,
-    DeleteCollectionRequest,
-    QdrantLocationItem,
-    QdrantLocationListResponse,
-    QdrantAreaItem,
-    QdrantAreaListResponse,
-    QdrantBuildingItem,
-    QdrantBuildingListResponse,
-    QdrantFloorLevelItem,
-    QdrantFloorLevelListResponse,
-    QdrantZoneItem,
-    QdrantZoneListResponse,
-    TimeRange,
-    QdrantLocationAnalyticsItem,
-    QdrantLocationAnalyticsResponse,
-)
-
 # System Management
 from app.schemas.system_schemas import (
     ContactCreate,
@@ -301,8 +277,6 @@ from app.schemas.system_schemas import (
 # Utility Functions
 from app.schemas.utils import (
     validate_camera_alert_thresholds,
-    sanitize_camera_data_with_alerts,
-    validate_location_hierarchy,
     sanitize_string,
 )
 
@@ -383,21 +357,10 @@ __all__ = [
     'LocationSearchQuery',
     'FrameRequest', 'FrameMetadata', 'FrameData', 'BatchFrameResponse',
     
-    # Qdrant
-    'VectorParams', 'CreateCollectionRequest', 'CreateCollectionRequest1',
-    'VectorConfig', 'AdvancedCreateCollectionRequest',
-    'DeleteCollectionRequest', 'QdrantLocationItem',
-    'QdrantLocationListResponse', 'QdrantAreaItem', 'QdrantAreaListResponse',
-    'QdrantBuildingItem', 'QdrantBuildingListResponse',
-    'QdrantFloorLevelItem', 'QdrantFloorLevelListResponse', 'QdrantZoneItem',
-    'QdrantZoneListResponse', 'TimeRange', 'QdrantLocationAnalyticsItem',
-    'QdrantLocationAnalyticsResponse',
-    
     # System
     'ContactCreate', 'ContactResponse', 'MessageRequest', 'MessageResponse',
     'SystemInfo', 'ProjectMetadata', 'SQLQueryRequest', 'SQLQueryResponse',
     
     # Utils
-    'validate_camera_alert_thresholds', 'sanitize_camera_data_with_alerts',
-    'validate_location_hierarchy', 'sanitize_string',
+    'validate_camera_alert_thresholds', 'sanitize_string',
 ]

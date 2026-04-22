@@ -40,17 +40,3 @@ def frame_to_base64(frame: np.ndarray) -> str:
         logger.error("cv2.imencode failed during frame_to_base64 conversion.")
         return ""
     return base64.b64encode(buffer).decode('utf-8')
-
-
-def base64_to_frame(base64_string: str) -> Optional[np.ndarray]:
-    """Converts a base64 encoded string back to an OpenCV frame."""
-    if not base64_string: 
-        return None
-    try:
-        img_bytes = base64.b64decode(base64_string)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        return frame
-    except Exception as e:
-        logger.error(f"Error decoding base64 string to frame: {e}", exc_info=True)
-        return None

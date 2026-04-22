@@ -459,7 +459,6 @@ class UserManager:
     ) -> Dict:
         """
         Completely delete a user from all systems including:
-        - Qdrant collections (all camera data)
         - Database tables (cascading deletes)
         - Workspace memberships
         - All associated resources
@@ -475,7 +474,7 @@ class UserManager:
         deletion_results = {
             "username": username,
             "user_id": None,
-            "qdrant_deletion": {"success": False, "deleted_cameras": [], "failed_cameras": []},
+
             "workspace_removal": {"success": False, "workspaces_removed": []},
             "database_deletion": {"success": False, "tables_affected": []},
             "errors": [],
@@ -504,20 +503,7 @@ class UserManager:
             # Step 3: Check if user is the only admin in any workspace
             await self._check_workspace_admin_constraints(user_id)
             
-            # Step 4: Get all cameras owned by user (for Qdrant deletion)
-            camera_workspace_mapping = await self._get_user_cameras_by_workspace(user_id)
-            
-            if camera_workspace_mapping:
-                try:
-                      
-                    qdrant_result = await postgres_service.delete_user_camera_data(camera_workspace_mapping)
-                    deletion_results["qdrant_deletion"] = qdrant_result
-                except Exception as qdrant_err:
-                    logger.error(f"Qdrant deletion failed for user {username}: {qdrant_err}")
-                    deletion_results["qdrant_deletion"]["success"] = False
-                    deletion_results["qdrant_deletion"]["error"] = str(qdrant_err)
-                    deletion_results["errors"].append(f"Qdrant deletion error: {str(qdrant_err)}")
-            
+
             # Step 6: Delete from database (with cascading)
             db_result = await self._delete_user_from_database(user_id, username)
             deletion_results["database_deletion"] = db_result
@@ -530,7 +516,6 @@ class UserManager:
                 event_data={
                     "deleted_username": username,
                     "deleted_user_id": str(user_id),
-                    "cameras_deleted": len(deletion_results["qdrant_deletion"]["deleted_cameras"]),
                     "tables_affected": len(deletion_results["database_deletion"]["tables_affected"])
                 }
             )

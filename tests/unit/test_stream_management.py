@@ -23,7 +23,6 @@ def stream_manager(mock_db_manager):
     with patch('app.services.stream_service.db_manager', mock_db_manager):
          # Mock all the dependencies
         with patch('app.services.stream_service.video_file_manager'), \
-             patch('app.services.stream_service.qdrant_service'), \
              patch('app.services.stream_service.retry_service'), \
              patch('app.services.stream_service.fire_detection_service'), \
              patch('app.services.stream_service.people_count_service'), \

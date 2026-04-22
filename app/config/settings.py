@@ -165,33 +165,9 @@ class Settings(BaseSettings):
     db_retry_delay_max: int = 30
 
     # =============================================================================
-    # QDRANT
-    # =============================================================================
-    qdrant_host: str = "172.31.25.133"
-    qdrant_url: str = "http://172.31.25.133"
-    qdrant_port_http: int = 6333
-    qdrant_port_grpc: int = 6334
-
-    qdrant_collection_name: str = "person_counts"
-    qdrant_query_timeout: int = 50
-    qdrant_fetch_limit: int = 50
-    qdrant_vector_size: int = 1
-
-    # =============================================================================
     # DATA BACKEND
     # =============================================================================
-    data_backend: Literal["qdrant", "elasticsearch"] = "qdrant"
-
-    # =============================================================================
-    # ELASTICSEARCH
-    # =============================================================================
-    elasticsearch_hosts: List[str] = ["http://172.31.25.133:9200"]
-    elasticsearch_index_name: str = "person_counts"
-    elasticsearch_timeout: float = 60.0
-    elasticsearch_version: int = 8
-    elasticsearch_shards: int = 1
-    elasticsearch_replicas: int = 1
-    elasticsearch_refresh_interval: str = "1s"
+    data_backend: Literal["postgres"] = "postgres"
 
     prediction_data_points_limit: int = 1000
 
@@ -208,6 +184,14 @@ class Settings(BaseSettings):
     smtp_timeout: int = 30
 
     # =============================================================================
+    # AWS S3
+    # =============================================================================
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_region: str = "us-east-1"
+    s3_bucket_name: Optional[str] = None
+
+    # =============================================================================
     # MODELS
     # =============================================================================
     yolo_config_dir: str = "/app/.ultralytics"
@@ -218,21 +202,29 @@ class Settings(BaseSettings):
     pt_people_model_path: str = "models/people.pt"
     pt_gender_model_path: str = "models/gender.pt"
     pt_fire_model_path: str = "models/fire.pt"
+    pt_shoplifting_model_path: str = "models/shoplifting.pt"
 
     # ONNX Model Paths
     onnx_people_model_path: str = "models/people.onnx"
     onnx_gender_model_path: str = "models/gender.onnx"
     onnx_fire_model_path: str = "models/fire.onnx" 
+    onnx_shoplifting_model_path: str = "models/shoplifting.onnx"
 
     # OpenVINO Model Paths
     openvino_people_model_path: str = "models/people_openvino"
     openvino_gender_model_path: str = "models/gender_openvino"
     openvino_fire_model_path: str = "models/fire_openvino"
+    openvino_shoplifting_model_path: str = "models/shoplifting_openvino"
 
     # TensorRT Model Paths
     tensorrt_people_model_path: str = "models/people.engine"
     tensorrt_gender_model_path: str = "models/gender.engine"
     tensorrt_fire_model_path: str = "models/fire.engine"
+    tensorrt_shoplifting_model_path: str = "models/shoplifting.engine"
+
+    # Pose Model (for temporal sequence extraction)
+    pt_pose_model_path: str = "models/yolo26m-pose.pt"
+    shoplifting_num_frames: int = 120
 
     # TensorRT Configuration
     tensorrt_precision: Literal["fp32", "fp16", "int8"] = "fp16"
@@ -268,6 +260,16 @@ class Settings(BaseSettings):
         elif self.model_backend == "tensorrt":
             return self.tensorrt_fire_model_path
         return self.pt_fire_model_path
+
+    @property
+    def shoplifting_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_shoplifting_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_shoplifting_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_shoplifting_model_path
+        return self.pt_shoplifting_model_path
 
     model_cache_dir: str = "./model_cache"
     model_device: Literal["cpu", "cuda"] = "cuda"
@@ -396,6 +398,7 @@ class Settings(BaseSettings):
     people_confidence: float = 0.5
     gender_confidence: float = 0.5
     fire_confidence: float = 0.5
+    shoplifting_confidence: float = 0.5
     people_device: Literal["cpu", "cuda"] = "cpu"
 
     enable_batch_inference: bool = True
@@ -442,6 +445,7 @@ class Settings(BaseSettings):
     people_detect_interval: float = 2.0
     gender_detect_interval: float = 10.0
     fire_detect_interval: float = 5.0
+    shoplifting_detect_interval: float = 2.0
     fire_state_cleanup_interval_seconds: int = 3600
 
     people_count_cooldown_duration_seconds: int = 300

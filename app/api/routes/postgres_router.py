@@ -34,7 +34,7 @@ async def workspace_search_results(
     include_frame: bool = Query(True),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
-    """Search workspace data using detection_data_service (PostgreSQL metadata + Qdrant frames)"""
+    """Search workspace data using detection_data_service (PostgreSQL metadata)"""
     try:
         requesting_user_id = current_user_data["user_id"]
         username = current_user_data["username"]
@@ -116,7 +116,7 @@ async def workspace_search_results(
         # Add search scope info
         results["search_scope"] = {
             "workspace_id": str(workspace_id_obj),
-            "database": "postgresql_qdrant_combined",
+            "database": "postgresql",
             "filters_applied": {
                 "camera_id": parsed_camera_ids,
                 "start_date": start_date,
@@ -243,31 +243,6 @@ async def workspace_search_results_with_location(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error during location-based search."
         )
-
-@router.get("/search_results")
-async def search_results_user_active_workspace(
-    camera_id: Optional[str] = Query(None),
-    start_date: Optional[str] = Query(None),
-    end_date: Optional[str] = Query(None),
-    start_time: Optional[str] = Query(None),
-    end_time: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    per_page: Optional[str] = Query(None),
-    include_frame: bool = Query(True),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Search in user's active workspace (delegates to workspace_search_results)"""
-    return await workspace_search_results(
-        camera_id_param=camera_id,
-        start_date=start_date,
-        end_date=end_date,
-        start_time=start_time,
-        end_time=end_time,
-        page=page,
-        per_page=per_page,
-        include_frame=include_frame,
-        current_user_data=current_user_data
-    )
 
 # ========== Prediction Endpoints ==========
 

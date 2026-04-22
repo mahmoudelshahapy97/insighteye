@@ -28,8 +28,8 @@ python-multipart
 psycopg2-binary
 asyncpg
 pandas
-elasticsearch
-qdrant-client
+
+
 
 
 # Task Queue
@@ -62,3 +62,5 @@ pytest-mock
 pytest-tornasync
 pytest-trio
 pytest-twisted
+boto3
+aioboto3

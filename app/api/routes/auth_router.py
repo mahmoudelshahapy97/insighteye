@@ -635,7 +635,7 @@ async def update_password_route(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while updating password.")
 
 @router.post("/contact", status_code=status.HTTP_201_CREATED)
-async def create_contact_route(contact: ContactCreate, request_obj: FastAPIRequest): # Renamed for consistency
+async def create_contact_route(contact: ContactCreate, request_obj: FastAPIRequest):
     log_action_type_prefix = "Contact_Form"
     try:
         admin_email_recipient = config.sender_email
