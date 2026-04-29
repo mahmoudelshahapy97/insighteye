@@ -40,12 +40,3 @@ async def test_get_user_by_email(user_service, mock_db_manager):
     assert user is not None
     assert user['email'] == email
 
-@pytest.mark.asyncio
-async def test_update_user_profile(user_service, mock_db_manager):
-    user_id = uuid4()
-    update_data = {'username': 'newname'}
-    mock_db_manager.execute_query.return_value = {'user_id': user_id, **update_data}
-    
-    result = await user_service.update_user_profile(user_id, update_data)
-    
-    assert result['username'] == 'newname'

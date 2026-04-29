@@ -30,22 +30,6 @@ class TestUserProfileEndpoint:
         response = await async_client.get("/api/users")
         
         assert response.status_code == 404
-    
-    @pytest.mark.asyncio
-    async def test_update_user_profile(self, async_client, auth_headers):
-        """Test updating user profile"""
-        update_data = {
-            "display_name": "Updated Name",
-            "bio": "Updated bio"
-        }
-        
-        response = await async_client.put(
-            "/api/users",
-            headers=auth_headers,
-            json=update_data
-        )
-        
-        assert response.status_code in [200, 204, 404]
 
 
 class TestUserManagementEndpoint:

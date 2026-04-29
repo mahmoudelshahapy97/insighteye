@@ -32,59 +32,7 @@ class BaseModelLoader:
     
     def predict(self, image: np.ndarray) -> np.ndarray:
         raise NotImplementedError
-    
-    # def preprocess(self, image: np.ndarray, input_size: Tuple[int, int] = (640, 640)) -> np.ndarray:
-    #     """
-    #     YOLO preprocessing with letterbox (maintains aspect ratio)
-    #     This MUST match the preprocessing used during export!
-    #     """
-    #     # Get original dimensions
-    #     orig_h, orig_w = image.shape[:2]
-    #     target_h, target_w = input_size
-        
-    #     # Calculate scale to fit image within target size (letterbox)
-    #     scale = min(target_w / orig_w, target_h / orig_h)
-        
-    #     # Calculate new dimensions
-    #     new_w = int(orig_w * scale)
-    #     new_h = int(orig_h * scale)
-        
-    #     # Resize image
-    #     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        
-    #     # Create padded image (filled with gray)
-    #     padded = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
-        
-    #     # Calculate padding offsets (center the image)
-    #     pad_x = (target_w - new_w) // 2
-    #     pad_y = (target_h - new_h) // 2
-        
-    #     # Place resized image in center
-    #     padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
-        
-    #     # Convert BGR to RGB
-    #     img_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        
-    #     # Normalize to [0, 1]
-    #     img_normalized = img_rgb.astype(np.float32) / 255.0
-        
-    #     # Transpose to CHW format
-    #     img_chw = img_normalized.transpose(2, 0, 1)
-        
-    #     # Add batch dimension
-    #     img_batch = np.expand_dims(img_chw, axis=0)
-        
-    #     # Store preprocessing info for postprocessing
-    #     self._preprocess_info = {
-    #         'scale': scale,
-    #         'pad_x': pad_x,
-    #         'pad_y': pad_y,
-    #         'new_w': new_w,
-    #         'new_h': new_h
-    #     }
-        
-    #     return img_batch
-        
+         
     def preprocess(self, image: np.ndarray, input_size: Tuple[int, int] = (640, 640)) -> np.ndarray:
         """
         YOLO preprocessing with letterbox (maintains aspect ratio)

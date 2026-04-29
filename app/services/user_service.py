@@ -94,18 +94,6 @@ class UserManager:
             logger.error(f"Unexpected error during HIBP check: {e_gen}", exc_info=True)
             return False
 
-    async def get_user_id_by_username_str(self, username: str) -> Optional[str]: 
-        user_data = await self.get_user_by_username(username)
-        if user_data and user_data.get("user_id"):
-            return str(user_data["user_id"]) # user_id from get_user_by_username is UUID
-        return None
-
-    async def get_user_id_by_username_uuid(self, username: str) -> Optional[UUID]: 
-        user_data = await self.get_user_by_username(username)
-        if user_data and user_data.get("user_id"):
-            return user_data["user_id"]
-        return None
-
     async def _log_security_event(self, user_id: Optional[Union[str, UUID]], event_type: str, severity: str, event_data: dict, ip_address: Optional[str] = None, workspace_id: Optional[Union[str, UUID]] = None):
         query = """
             INSERT INTO security_events 
@@ -219,50 +207,6 @@ class UserManager:
         user = await self.db_manager.execute_query(query, (db_param_user_id,), fetch_one=True)
         return dict(user) if user else None 
 
-    async def get_user_password_hash(self, user_id: UUID) -> Optional[str]:
-        """Get password hash for a user."""
-        query = "SELECT password_hash FROM user_accounts WHERE user_id = $1"
-        result = await self.db_manager.execute_query(query, (user_id,), fetch_one=True)
-        return result["password_hash"] if result else None
-    
-    async def update_user_last_login(self, user_id: UUID) -> None:
-        """Update user's last login timestamp."""
-        query = "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE user_id = $1"
-        await self.db_manager.execute_query(query, (user_id,))
-        logger.debug(f"Updated last login for user {user_id}")
-
-    async def update_user_profile(
-        self, user_id: UUID, updates: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Update user profile fields."""
-        allowed_fields = ["username", "email", "count_of_camera", "is_subscribed"]
-        filtered_updates = {k: v for k, v in updates.items() if k in allowed_fields}
-
-        if not filtered_updates:
-            return None
-
-        set_clause = ", ".join([f"{k} = ${i+2}" for i, k in enumerate(filtered_updates.keys())])
-        query = f"UPDATE users SET {set_clause} WHERE user_id = $1 RETURNING *"
-        params = (user_id, *filtered_updates.values())
-
-        try:
-            result = await self.db_manager.execute_query(query, params, fetch_one=True)
-            if not result:
-                raise HTTPException(status_code=404, detail="Not found")
-        except asyncpg.PostgresError as e:
-            logger.error(f"Database error: {e}")
-            raise HTTPException(status_code=500, detail="Database error")
-        
-        return result
-
-    async def deactivate_user(self, user_id: UUID) -> bool:
-        """Soft delete a user."""
-        query = "UPDATE users SET is_active = FALSE WHERE user_id = $1"
-        rows = await self.db_manager.execute_query(query, (user_id,), return_rowcount=True)
-        if rows > 0:
-            logger.info(f"Deactivated user {user_id}")
-        return rows > 0
-    
     async def reset_password(self, username: str, new_password: str) -> bool:
         user_info = await self.get_user_by_username(username)
         if not user_info: return False
@@ -341,29 +285,6 @@ class UserManager:
                 detail=f"Cannot delete user. User is the only admin in workspace(s): {', '.join(blocking_workspaces)}. "
                     f"Please assign another admin first."
             )
-
-    async def _get_user_cameras_by_workspace(self, user_id: UUID) -> Dict[str, List[str]]:
-        """
-        Get all cameras owned by user, grouped by workspace.
-        
-        Returns:
-            Dict mapping workspace_id (str) to list of camera_ids (str)
-        """
-        query = """
-            SELECT workspace_id, stream_id
-            FROM video_stream
-            WHERE user_id = $1
-        """
-        
-        cameras = await self.db_manager.execute_query(query, (user_id,), fetch_all=True)
-        
-        workspace_mapping = defaultdict(list)
-        for camera in cameras or []:
-            workspace_id_str = str(camera["workspace_id"])
-            camera_id_str = str(camera["stream_id"])
-            workspace_mapping[workspace_id_str].append(camera_id_str)
-        
-        return dict(workspace_mapping)
 
     async def _delete_user_from_database(self, user_id: UUID, username: str) -> Dict:
         """
@@ -648,40 +569,7 @@ class UserManager:
 
         await self._log_security_event(user_id=None, event_type="all_users_deleted", severity="critical", event_data={"count": rows_deleted})
         return rows_deleted
-    
-    async def update_user_status(self, username: str, is_active: bool) -> bool:
-        user_info = await self.get_user_by_username(username)
-        if not user_info: return False
-        user_id = user_info["user_id"] 
 
-        query = "UPDATE users SET is_active = $1 WHERE user_id = $2"
-        rows_affected = await self.db_manager.execute_query(query, (is_active, user_id), return_rowcount=True)
-
-        if rows_affected > 0:
-            status_str = "activated" if is_active else "deactivated"
-            await self._log_security_event(user_id=user_id, event_type=f"user_{status_str}", severity="medium", event_data={"username": username})
-        return rows_affected > 0
-    
-    async def update_user_subscription(self, username: str, is_subscribed: bool, months: int = 3) -> bool:
-        user_info = await self.get_user_by_username(username)
-        if not user_info: return False
-        user_id = user_info["user_id"] 
-        
-        rows_affected = 0
-        subscription_date_val: Optional[datetime] = None 
-        if is_subscribed:
-            subscription_date_val = datetime.now(ZoneInfo("Africa/Cairo")) + timedelta(days=30*months)
-            query = "UPDATE users SET is_subscribed = $1, subscription_date = $2 WHERE user_id = $3"
-            rows_affected = await self.db_manager.execute_query(query, (is_subscribed, subscription_date_val, user_id), return_rowcount=True)
-        else: 
-            query = "UPDATE users SET is_subscribed = $1 WHERE user_id = $2"
-            rows_affected = await self.db_manager.execute_query(query, (is_subscribed, user_id), return_rowcount=True)
-        
-        if rows_affected > 0:
-            status_str = "subscribed" if is_subscribed else "unsubscribed"
-            await self._log_security_event(user_id=user_id, event_type=f"user_{status_str}", severity="low", event_data={"username": username, "subscription_date": subscription_date_val.isoformat() if subscription_date_val else None})
-        return bool(rows_affected is not None and rows_affected > 0)
-    
     async def update_user_role(self, username: str, role: str) -> bool:
         valid_roles = ['user', 'admin'] 
         if role not in valid_roles:
@@ -698,80 +586,12 @@ class UserManager:
         if rows_affected > 0:
             await self._log_security_event(user_id=user_id, event_type="user_role_changed", severity="high", event_data={"username": username, "new_role": role})
         return bool(rows_affected is not None and rows_affected > 0)
-    
-    async def update_last_login(self, user_id: Union[str, UUID]) -> bool:
-        """Update user's last login timestamp"""
-        query = "UPDATE users SET last_login = $1 WHERE user_id = $2"
-        user_id_obj = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
-        
-        rows_affected = await self.db_manager.execute_query(
-            query, 
-            (datetime.now(ZoneInfo("Africa/Cairo")), user_id_obj), 
-            return_rowcount=True
-        )
-        return rows_affected > 0
-        
-    async def update_camera_count(self, username: str, count: int) -> bool:
-        if count < 0:
-            logger.warning(f"Invalid camera count attempted: {count}")
-            return False
-            
-        user_info = await self.get_user_by_username(username)
-        if not user_info: return False
-        user_id = user_info["user_id"] 
-        
-        query = "UPDATE users SET count_of_camera = $1 WHERE user_id = $2"
-        rows_affected = await self.db_manager.execute_query(query, (count, user_id), return_rowcount=True)
-        
-        if rows_affected > 0:
-            await self._log_security_event(user_id=user_id, event_type="camera_count_updated", severity="low", event_data={"username": username, "new_count": count})
-        return bool(rows_affected is not None and rows_affected > 0)
-    
+
     async def get_all_users(self) -> List[Dict]:
         query = """
             SELECT user_id, username, email, created_at, is_active, last_login, role, 
                 is_subscribed, subscription_date, count_of_camera
             FROM users
-        """
-        users_data = await self.db_manager.execute_query(query, fetch_all=True)
-        return [dict(user) for user in users_data] if users_data else [] 
-
-
-    async def get_all_users_with_conditions(
-        self, 
-        include_inactive: bool = True,
-        role_filter: Optional[str] = None
-    ) -> List[Dict]:
-        """Get all users with optional filters"""
-        conditions = []
-        params = []
-        
-        if not include_inactive:
-            conditions.append("is_active = TRUE")
-        
-        if role_filter:
-            conditions.append(f"role = ${len(params) + 1}")
-            params.append(role_filter)
-        
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        
-        query = f"""
-            SELECT user_id, username, email, created_at, is_active, last_login, role, 
-                   is_subscribed, subscription_date, count_of_camera, is_search, is_prediction
-            FROM users
-            {where_clause}
-            ORDER BY created_at DESC
-        """
-        
-        users = await self.db_manager.execute_query(query, tuple(params), fetch_all=True)
-        return [dict(user) for user in users] if users else []
-
-    async def get_subscribed_users(self) -> List[Dict]:
-        query = """
-            SELECT user_id, username, email, created_at, is_active, last_login, 
-                role, subscription_date, count_of_camera  
-            FROM users
-            WHERE is_subscribed = TRUE
         """
         users_data = await self.db_manager.execute_query(query, fetch_all=True)
         return [dict(user) for user in users_data] if users_data else [] 
@@ -797,37 +617,6 @@ class UserManager:
             await self._log_security_event(user_id=user_id, event_type="password_changed", severity="medium", event_data={"username": username})
             return True
         return False
-
-    async def get_search_status(self, user_id: Union[str, UUID]) -> Optional[bool]:
-        query = "SELECT is_search FROM users WHERE user_id = $1"
-        db_user_id = UUID(str(user_id)) if not isinstance(user_id, UUID) else user_id
-        result = await self.db_manager.execute_query(query, (db_user_id,), fetch_one=True)
-        return result["is_search"] if result else None
-
-    async def get_prediction_status(self, user_id: Union[str, UUID]) -> Optional[bool]:
-        query = "SELECT is_prediction FROM users WHERE user_id = $1"
-        db_user_id = UUID(str(user_id)) if not isinstance(user_id, UUID) else user_id
-        result = await self.db_manager.execute_query(query, (db_user_id,), fetch_one=True)
-        return result["is_prediction"] if result else None
-    
-    async def update_search_status(self, user_id: Union[str, UUID], is_search: bool) -> bool:
-        query = "UPDATE users SET is_search = $1 WHERE user_id = $2"
-        db_user_id = UUID(str(user_id)) if not isinstance(user_id, UUID) else user_id
-        rows_updated = await self.db_manager.execute_query(query, (is_search, db_user_id), return_rowcount=True)
-        return bool(rows_updated is not None and rows_updated > 0)
-    
-    async def update_prediction_status(self, user_id: Union[str, UUID], is_prediction: bool) -> bool:
-        query = "UPDATE users SET is_prediction = $1 WHERE user_id = $2"
-        db_user_id = UUID(str(user_id)) if not isinstance(user_id, UUID) else user_id
-        rows_updated = await self.db_manager.execute_query(query, (is_prediction, db_user_id), return_rowcount=True)
-        return bool(rows_updated is not None and rows_updated > 0)
-
-    def generate_totp_secret(self) -> str:
-        return pyotp.random_base32()
-
-    def verify_totp_code(self, secret: str, code: str) -> bool:
-        totp = pyotp.TOTP(secret)
-        return totp.verify(code) 
 
     async def create_user_with_workspace(
         self, username: str, email: str, password: str, role: str = 'user', count_of_camera: int = 5
@@ -952,84 +741,4 @@ class UserManager:
                 detail="Failed to create user and workspace."
             )
 
-    async def get_user_statistics(
-        self,
-        user_id: Union[str, UUID]
-    ) -> Dict[str, Any]:
-        """Get comprehensive statistics for a user"""
-        user_id_obj = user_id if isinstance(user_id, UUID) else UUID(str(user_id))
-        
-        stats = {
-            'user_id': str(user_id_obj),
-            'workspaces': {'total': 0, 'by_role': {}},
-            'streams': {'total': 0, 'active': 0, 'streaming': 0},
-            'notifications': {'total': 0, 'unread': 0},
-            'sessions': {'active': 0}
-        }
-        
-        # Workspace counts
-        ws_query = """
-            SELECT COUNT(*) as total,
-                   COUNT(*) FILTER (WHERE role = 'owner') as owner,
-                   COUNT(*) FILTER (WHERE role = 'admin') as admin,
-                   COUNT(*) FILTER (WHERE role = 'member') as member
-            FROM workspace_members
-            WHERE user_id = $1
-        """
-        ws_stats = await self.db_manager.execute_query(
-            ws_query, (user_id_obj,), fetch_one=True
-        )
-        
-        if ws_stats:
-            stats['workspaces']['total'] = ws_stats['total']
-            stats['workspaces']['by_role'] = {
-                'owner': ws_stats['owner'],
-                'admin': ws_stats['admin'],
-                'member': ws_stats['member']
-            }
-        
-        # Stream counts
-        stream_query = """
-            SELECT COUNT(*) as total,
-                   COUNT(*) FILTER (WHERE status = 'active') as active,
-                   COUNT(*) FILTER (WHERE is_streaming = TRUE) as streaming
-            FROM video_stream
-            WHERE user_id = $1
-        """
-        stream_stats = await self.db_manager.execute_query(
-            stream_query, (user_id_obj,), fetch_one=True
-        )
-        
-        if stream_stats:
-            stats['streams'] = dict(stream_stats)
-        
-        # Notification counts
-        notif_query = """
-            SELECT COUNT(*) as total,
-                   COUNT(*) FILTER (WHERE is_read = FALSE) as unread
-            FROM notifications
-            WHERE user_id = $1
-        """
-        notif_stats = await self.db_manager.execute_query(
-            notif_query, (user_id_obj,), fetch_one=True
-        )
-        
-        if notif_stats:
-            stats['notifications'] = dict(notif_stats)
-        
-        # Active sessions
-        session_query = """
-            SELECT COUNT(*) as active
-            FROM sessions
-            WHERE user_id = $1 AND expires_at > $2
-        """
-        session_stats = await self.db_manager.execute_query(
-            session_query, (user_id_obj, datetime.now(ZoneInfo("Africa/Cairo"))), fetch_one=True
-        )
-        
-        if session_stats:
-            stats['sessions']['active'] = session_stats['active']
-        
-        return stats
-        
 user_manager = UserManager()

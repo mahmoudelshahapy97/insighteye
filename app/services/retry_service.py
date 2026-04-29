@@ -324,45 +324,6 @@ class CameraRetryService:
             )
             # Don't raise - cancellation failure shouldn't block the stop
 
-    async def get_retry_statistics(
-        self,
-        workspace_id: Optional[UUID] = None
-    ) -> Dict[str, Any]:
-        """Get retry statistics for monitoring"""
-        base_query = """
-            SELECT 
-                COUNT(*) as total_retrying,
-                AVG(retry_count) as avg_retry_count,
-                MAX(retry_count) as max_retry_count,
-                COUNT(CASE WHEN retry_count >= 10 THEN 1 END) as excessive_retries,
-                COUNT(CASE WHEN stop_reason = 'connection_error' THEN 1 END) as connection_errors,
-                COUNT(CASE WHEN stop_reason = 'timeout' THEN 1 END) as timeouts,
-                COUNT(CASE WHEN stop_reason = 'system_error' THEN 1 END) as system_errors
-            FROM video_stream
-            WHERE is_streaming = TRUE
-              AND status = 'error'
-              AND stop_reason IS NOT NULL
-              AND stop_reason != 'user_action'
-        """
-        
-        if workspace_id:
-            base_query += f" AND workspace_id = '{workspace_id}'"
-        
-        result = await self.db_manager.execute_query(base_query, fetch_one=True)
-        
-        return {
-            'total_retrying': result['total_retrying'] or 0,
-            'avg_retry_count': float(result['avg_retry_count'] or 0),
-            'max_retry_count': result['max_retry_count'] or 0,
-            'excessive_retries': result['excessive_retries'] or 0,
-            'by_reason': {
-                'connection_error': result['connection_errors'] or 0,
-                'timeout': result['timeouts'] or 0,
-                'system_error': result['system_errors'] or 0
-            },
-            'in_memory_tracking': len(self._active_retries)
-        }
-    
     async def _alert_excessive_failures(
         self,
         stream_id: UUID,
@@ -422,22 +383,6 @@ class CameraRetryService:
             await self.db_manager.execute_query(query, (stream_id, retry_count))
         except Exception as e:
             logger.error(f"Error logging retry success: {e}")
-    
-    async def cleanup_old_retry_history(self, days: int = 7):
-        """Clean up old successful retry history"""
-        query = """
-            DELETE FROM logs
-            WHERE action_type = 'camera_retry_success'
-              AND created_at < NOW() - INTERVAL '%s days'
-        """ % days
-        
-        try:
-            rows = await self.db_manager.execute_query(query, return_rowcount=True)
-            if rows > 0:
-                logger.info(f"🧹 Cleaned up {rows} old retry history records")
-        except Exception as e:
-            logger.error(f"Error cleaning retry history: {e}")
-
 
 # Global instance
 retry_service = CameraRetryService()

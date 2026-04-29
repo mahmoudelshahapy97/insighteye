@@ -85,21 +85,6 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Error blacklisting token for user {user_id}: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not blacklist token.")
-
-    async def add_token_to_blacklist(
-        self, user_id: UUID, token: str, expires_at: datetime, reason: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Add a token to the blacklist."""
-        query = """
-            INSERT INTO token_blacklist (user_id, token, expires_at, reason)
-            VALUES ($1, $2, $3, $4)
-            RETURNING *
-        """
-        result = await self.db_manager.execute_query(
-            query, (user_id, token, expires_at, reason), fetch_one=True
-        )
-        logger.debug(f"Token blacklisted for user {user_id}")
-        return result
     
     def create_token(self, data: dict, token_type: str) -> str: 
         """Create a JWT token with specified expiration."""
@@ -128,56 +113,6 @@ class SessionManager:
         if isinstance(encoded_jwt, bytes): # Ensure string output like original sync version
             return encoded_jwt.decode('utf-8')
         return encoded_jwt
-
-    async def create_user_token(
-        self,
-        user_id: UUID,
-        access_token: str,
-        refresh_token: str,
-        access_expires_at: datetime,
-        refresh_expires_at: datetime,
-        workspace_id: Optional[UUID] = None,
-    ) -> Dict[str, Any]:
-        """Create user tokens."""
-        query = """
-            INSERT INTO user_tokens 
-            (user_id, workspace_id, access_token, refresh_token, access_expires_at, refresh_expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *
-        """
-        result = await self.db_manager.execute_query(
-            query,
-            (user_id, workspace_id, access_token, refresh_token, access_expires_at, refresh_expires_at),
-            fetch_one=True,
-        )
-        logger.debug(f"Tokens created for user {user_id}")
-        return result
-
-    # Added from original sync version, remains sync
-    def create_token_with_context(self, user_id: str, client_ip: str) -> TokenPair:
-        """Create tokens bound to specific IP address."""
-        ip_fingerprint = hashlib.sha256(f"{user_id}:{client_ip}".encode()).hexdigest()[:16]
-        
-        access_token = self.create_token({
-            "user_id": user_id,
-            "context": ip_fingerprint
-        }, "access") # create_token now returns str
-        
-        refresh_token = self.create_token({
-            "user_id": user_id,
-            "context": ip_fingerprint
-        }, "refresh") # create_token now returns str
-        
-        access_token_payload = jwt.decode(access_token, self.SECRET_KEY, algorithms=[self.ALGORITHM], options={"verify_exp": False})
-        expires_at_timestamp = access_token_payload["exp"]
-        expires_at_dt = datetime.fromtimestamp(expires_at_timestamp, tz=ZoneInfo("Africa/Cairo"))
-
-        return TokenPair(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            token_type="bearer",
-            expires_at=expires_at_dt.isoformat()
-        )
 
     def create_token_pair(self, user_id: Union[str, UUID], workspace_id: Optional[Union[str, UUID]] = None) -> TokenPair: # Sync
         """Create both access and refresh tokens for a user."""
@@ -343,22 +278,6 @@ class SessionManager:
             expires_at=access_expires_dt.isoformat()
         )
     
-    # Added from original sync version, made async
-    async def _update_access_token(self, user_id: str, refresh_token: str, new_access_token: str):
-        """Helper to update access token in DB. Typically used by refresh_access_token."""
-        access_token_payload = jwt.decode(new_access_token, self.SECRET_KEY, algorithms=[self.ALGORITHM], options={"verify_exp": False})
-        access_expires_at_timestamp = access_token_payload["exp"]
-        access_expires_dt = datetime.fromtimestamp(access_expires_at_timestamp, tz=ZoneInfo("Africa/Cairo"))
-            
-        await self.db_manager.execute_query(
-            """
-            UPDATE user_tokens 
-            SET access_token = $1, access_expires_at = $2, updated_at = $3
-            WHERE user_id = $4 AND refresh_token = $5 AND is_active = TRUE
-            """,
-            (new_access_token, access_expires_dt, datetime.now(ZoneInfo("Africa/Cairo")), UUID(str(user_id)), refresh_token)
-        )
-
     async def revoke_token(self, token: str, reason: Optional[str] = None) -> bool:
         """Revoke a token by adding it to the blacklist."""
         try:
@@ -416,132 +335,7 @@ class SessionManager:
             access_expires, refresh_expires, now, now, True
         ))
         return str(token_id)
-  
-    async def get_tokens_by_user_id_fixed(self, user_id_str: str) -> List[Dict]: # Name kept from async template
-        """
-        Get all active tokens for a user by user_id (string).
-        Corresponds to original's get_tokens_by_user_id_fixed.
-        """
-        now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
-        user_id_uuid = UUID(user_id_str)
-        
-        results = await self.db_manager.execute_query(
-            """
-            SELECT token_id, access_token, refresh_token, access_expires_at, refresh_expires_at, created_at, workspace_id
-            FROM user_tokens
-            WHERE user_id = $1 AND refresh_expires_at > $2 AND is_active = TRUE
-            ORDER BY created_at DESC
-            """,
-            (user_id_uuid, now_utc),
-            fetch_all=True
-        )
-        
-        tokens = []
-        for row in results or []: # Handle case where results might be None
-            tokens.append({
-                "token_id": str(row["token_id"]),
-                "access_token": row["access_token"],
-                "refresh_token": row["refresh_token"],
-                "access_expires_at": row["access_expires_at"].isoformat(),
-                "refresh_expires_at": row["refresh_expires_at"].isoformat(),
-                "created_at": row["created_at"].isoformat(),
-                "workspace_id": str(row["workspace_id"]) if row["workspace_id"] else None
-            })
-        return tokens
 
-    async def get_tokens_by_username(self, username: str) -> List[Dict]:
-        """
-        Get all active tokens for a user by username.
-        """
-        user = await self.user_manager.get_user_by_username(username)
-        if not user or not user.get("user_id"):
-            logger.warning(f"User not found for username: {username} in get_tokens_by_username")
-            return []
-        
-        user_id_str = str(user["user_id"])
-        return await self.get_tokens_by_user_id_fixed(user_id_str)
-
-    async def get_token_by_refresh_token(self, refresh_token: str) -> Optional[Dict[str, Any]]:
-        """Retrieve token by refresh token."""
-        query = """
-            SELECT * FROM user_tokens 
-            WHERE refresh_token = $1 AND is_active = TRUE 
-            AND refresh_expires_at > CURRENT_TIMESTAMP
-        """
-        return await self.db_manager.execute_query(query, (refresh_token,), fetch_one=True)
-
-    async def invalidate_token(self, access_token: str) -> bool:
-        """Invalidate a token pair by setting is_active=FALSE and blacklisting both."""
-        token_data = await self.verify_token(access_token, "access")
-        if not token_data:
-            logger.warning(f"Invalidate_token: Access token is invalid or expired. Cannot proceed. Token: {access_token[:20]}...")
-            return False # If token is already invalid, no further action can be based on its content.
-        
-        user_id_str = token_data.user_id
-        user_id_uuid = UUID(user_id_str)
-        access_exp_dt = datetime.fromtimestamp(token_data.exp, tz=ZoneInfo("Africa/Cairo"))
-
-        # Find the corresponding refresh token from the database
-        token_pair_info = await self.db_manager.execute_query(
-            "SELECT refresh_token FROM user_tokens WHERE access_token = $1 AND user_id = $2 AND is_active = TRUE",
-            (access_token, user_id_uuid),
-            fetch_one=True
-        )
-        
-        # Mark the token pair as inactive in the database
-        updated_rows = await self.db_manager.execute_query(
-            "UPDATE user_tokens SET is_active = FALSE, updated_at = $1 WHERE access_token = $2 AND user_id = $3",
-            (datetime.now(ZoneInfo("Africa/Cairo")), access_token, user_id_uuid),
-            return_rowcount=True
-        )
-
-        # Blacklist the access token
-        # This happens regardless of DB update success, as long as original token was verifiable
-        await self.blacklist_token(access_token, user_id_str, access_exp_dt, "manual_invalidation")
-
-        if updated_rows is None or updated_rows == 0:
-            logger.warning(f"Invalidate_token: No active token pair found in DB for access_token {access_token[:20]}... (user: {user_id_str}). Access token blacklisted. Paired refresh token cannot be processed.")
-            return False # Indicate that DB update for pair failed or was not needed.
-
-        # If refresh token was found, verify and blacklist it too
-        if token_pair_info and token_pair_info.get("refresh_token"):
-            refresh_token = token_pair_info["refresh_token"]
-            refresh_token_data = await self.verify_token(refresh_token, "refresh")
-            if refresh_token_data:
-                refresh_exp_dt = datetime.fromtimestamp(refresh_token_data.exp, tz=ZoneInfo("Africa/Cairo"))
-                await self.blacklist_token(refresh_token, user_id_str, refresh_exp_dt, "manual_invalidation_paired_refresh")
-            else:
-                logger.warning(f"Invalidate_token: Paired refresh token for access token {access_token[:20]}... was invalid or expired. Attempting to blacklist based on decoded data.")
-                try:
-                    rt_payload = self.decode_token_without_verification(refresh_token) # Sync call
-                    if rt_payload and rt_payload.get("exp") and rt_payload.get("user_id"):
-                        exp_val_rt = rt_payload["exp"]
-                        if not isinstance(exp_val_rt, (int, float)):
-                             logger.warning(f"Invalidate_token: Decoded 'exp' for RT is not a timestamp: {exp_val_rt}.")
-                        else:
-                            rt_exp_dt = datetime.fromtimestamp(exp_val_rt, tz=ZoneInfo("Africa/Cairo"))
-                            await self.blacklist_token(refresh_token, rt_payload["user_id"], rt_exp_dt, "manual_invalidation_paired_refresh_after_fail")
-                except Exception as e_rt_decode:
-                     logger.error(f"Invalidate_token: Error blacklisting paired RT after fail: {e_rt_decode}", exc_info=True)
-        else:
-            logger.warning(f"Invalidate_token: No paired refresh token found in DB for access token {access_token[:20]}... while invalidating.")
-
-        return True # Successfully invalidated the token row and blacklisted access token
-    
-    async def invalidate_token_using_token_id(self, token_id: UUID) -> bool:
-        """Invalidate a token."""
-        query = "UPDATE user_tokens SET is_active = FALSE WHERE token_id = $1"
-        rows = await self.db_manager.execute_query(query, (token_id,), return_rowcount=True)
-        return rows > 0
-    
-    async def invalidate_user_tokens(self, user_id: UUID) -> int:
-        """Invalidate all tokens for a user."""
-        query = "UPDATE user_tokens SET is_active = FALSE WHERE user_id = $1"
-        rows = await self.db_manager.execute_query(query, (user_id,), return_rowcount=True)
-        if rows > 0:
-            logger.info(f"Invalidated {rows} tokens for user {user_id}")
-        return rows
-    
     async def get_all_tokens(self) -> List[Dict]:
         """
         Get all active tokens in the database.
@@ -573,7 +367,7 @@ class SessionManager:
             })
         return tokens
     
-    async def get_all_tokens_for_user_async(self, user_id_str: str) -> List[Dict]: # Corresponds to original's get_all_tokens_for_user_async
+    async def get_all_tokens_for_user_async(self, user_id_str: str) -> List[Dict]:
         """ Get all active tokens for a specific user. """
         user_id_uuid = UUID(user_id_str)
         now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
@@ -597,7 +391,7 @@ class SessionManager:
             })
         return tokens
     
-    async def invalidate_all_user_tokens(self, user_id_str: str): # Parameter name matches original's intent
+    async def invalidate_all_user_tokens(self, user_id_str: str): 
         """Completely invalidate all tokens for a user."""
         user_id_uuid = UUID(user_id_str)
         try:
@@ -629,24 +423,6 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Failed to invalidate tokens for user {user_id_str}: {e}", exc_info=True)
 
-    async def get_user_id_by_token(self, access_token: str) -> Optional[str]:
-        """Get user_id associated with a given ACTIVE access token from DB."""
-        query = """
-            SELECT user_id FROM user_tokens 
-            WHERE access_token = $1 AND is_active = TRUE AND access_expires_at > $2
-        """
-        result = await self.db_manager.execute_query(query, (access_token, datetime.now(ZoneInfo("Africa/Cairo"))), fetch_one=True)
-        return str(result["user_id"]) if result and result.get("user_id") else None
-
-    async def get_user_id_by_refresh_token(self, refresh_token: str) -> Optional[str]:
-        """Get user_id associated with a given ACTIVE refresh token from DB."""
-        query = """
-            SELECT user_id FROM user_tokens 
-            WHERE refresh_token = $1 AND is_active = TRUE AND refresh_expires_at > $2
-        """
-        result = await self.db_manager.execute_query(query, (refresh_token, datetime.now(ZoneInfo("Africa/Cairo"))), fetch_one=True)
-        return str(result["user_id"]) if result and result.get("user_id") else None
-
     async def get_token_from_websocket(self, websocket: WebSocket) -> Optional[str]: # No DB access, logic is sync
         token = websocket.query_params.get("token")
         if not token:
@@ -654,12 +430,6 @@ class SessionManager:
             if auth_header and auth_header.lower().startswith("bearer "):
                 token = auth_header.split(" ", 1)[1] # Safer split
         return token
-
-    async def get_token_from_websocket_header(self, websocket: WebSocket) -> Optional[str]: # From async template
-        auth_header = websocket.headers.get("authorization")
-        if auth_header and auth_header.lower().startswith("bearer "):
-            return auth_header.split(" ", 1)[1] # Safer split
-        return None
 
     async def get_current_user(self, credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
         """Gets username of current user. For full data, use get_current_user_full_data_dependency."""
@@ -730,29 +500,6 @@ class SessionManager:
             "is_active": db_user_data.get("is_active")
         }
     
-    async def clean_expired_tokens(self) -> int:
-        """Clean expired tokens from user_tokens table."""
-        now = datetime.now(ZoneInfo("Africa/Cairo"))
-        deleted_user_tokens = await self.db_manager.execute_query(
-            "DELETE FROM user_tokens WHERE refresh_expires_at < $1", (now,), return_rowcount=True
-        )
-        deleted_user_tokens = deleted_user_tokens or 0 # Handle None from DB manager
-        
-        if deleted_user_tokens > 0:
-            logger.info(f"Cleaned {deleted_user_tokens} user tokens.")
-        return deleted_user_tokens
-    
-    async def clean_expired_blacklist(self) -> int:
-        """Remove expired tokens from the blacklist."""
-        now = datetime.now(ZoneInfo("Africa/Cairo"))
-        deleted_count = await self.db_manager.execute_query(
-            "DELETE FROM token_blacklist WHERE expires_at < $1", (now,), return_rowcount=True
-        )
-        deleted_count = deleted_count or 0 # Handle None from DB manager
-        if deleted_count > 0:
-            logger.info(f"Cleaned {deleted_count} expired blacklisted tokens.")
-        return deleted_count
-
     async def log_action(self, content: str, user_id: Optional[Union[str, UUID]] = None, workspace_id: Optional[Union[str, UUID]] = None, 
                    action_type: Optional[str] = None, ip_address: Optional[str] = None, 
                    user_agent: Optional[str] = None, status: str ="success"):
@@ -850,17 +597,6 @@ class SessionManager:
             })
         return logs_list
 
-    async def run_cleanup_maintenance(self) -> bool:
-        """Run database maintenance tasks to clean up expired data."""
-        try:
-            # Assumes cleanup_expired_data() is a SQL function/procedure in your DB
-            await self.db_manager.execute_query("SELECT cleanup_expired_data()") # Adjust if it's a procedure call
-            logger.info("Database maintenance cleanup function (cleanup_expired_data) executed successfully.")
-            return True
-        except Exception as e:
-            logger.error(f"Database maintenance cleanup failed: {e}", exc_info=True)
-            return False
-    
     def decode_token_without_verification(self, token: str) -> Optional[Dict]: # Stays sync
         """Decode token payload without verifying signature or expiration."""
         try:
@@ -875,48 +611,5 @@ class SessionManager:
         except Exception as e: # Catch any other error
             logging.error(f"Generic error decoding token without verification: {e}", exc_info=True) # Add exc_info
             return None
-
-
-    async def create_session(
-        self,
-        user_id: UUID,
-        expires_at: datetime,
-        workspace_id: Optional[UUID] = None,
-        ip_address: Optional[str] = None,
-        user_agent: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Create a new session."""
-        query = """
-            INSERT INTO sessions (user_id, workspace_id, expires_at, ip_address, user_agent)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING *
-        """
-        result = await self.db_manager.execute_query(
-            query,
-            (user_id, workspace_id, expires_at, ip_address, user_agent),
-            fetch_one=True,
-        )
-        logger.debug(f"Session created for user {user_id}")
-        return result
-
-    async def get_session_by_id(self, session_id: UUID) -> Optional[Dict[str, Any]]:
-        """Retrieve session by ID."""
-        query = "SELECT * FROM sessions WHERE session_id = $1 AND expires_at > CURRENT_TIMESTAMP"
-        return await self.db_manager.execute_query(query, (session_id,), fetch_one=True)
-
-    async def delete_session(self, session_id: UUID) -> bool:
-        """Delete a session."""
-        query = "DELETE FROM sessions WHERE session_id = $1"
-        rows = await self.db_manager.execute_query(query, (session_id,), return_rowcount=True)
-        return rows > 0
-
-    async def delete_user_sessions(self, user_id: UUID) -> int:
-        """Delete all sessions for a user."""
-        query = "DELETE FROM sessions WHERE user_id = $1"
-        rows = await self.db_manager.execute_query(query, (user_id,), return_rowcount=True)
-        if rows > 0:
-            logger.info(f"Deleted {rows} sessions for user {user_id}")
-        return rows
-
 
 session_manager = SessionManager()

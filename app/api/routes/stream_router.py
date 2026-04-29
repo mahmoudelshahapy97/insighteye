@@ -385,40 +385,60 @@ async def get_latest_frame_image(
         user_workspace_role = membership.get("role")
         user_system_role = current_user_data.get("role", "user")
         
-        # Use detection_data_service to get latest frame
-        from app.services.detection_data_service import detection_data_service
-        
-        result = await detection_data_service.retrieve_detection_data(
-            workspace_id=workspace_id_obj,
-            user_system_role=user_system_role,
-            user_workspace_role=user_workspace_role,
-            requesting_username=username,
-            camera_id=[stream_id],
-            page=1,
-            per_page=1,
-            include_frame=True
-        )
-        
-        # Validate result
-        if not result or not result.get("data") or len(result["data"]) == 0:
-            raise HTTPException(status_code=404, detail="No frames found for this stream")
-        
-        # Extract frame from first result
-        detection = result["data"][0]
-        frame_base64 = detection.get("frame")
-        
-        if not frame_base64:
-            raise HTTPException(status_code=404, detail="Frame data not available")
-        
-        # Decode base64 to image
-        try:
+        # ── Strategy 1: live in-memory frame from the running stream ──────────
+        img_data = None
+        live_frame_used = False
+        detection = {}
+
+        async with stream_manager._lock:
+            active_info = stream_manager.active_streams.get(str(stream_id))
+
+        if active_info is not None:
+            live_np = active_info.get("latest_frame")
+            if live_np is not None:
+                try:
+                    import cv2 as _cv2
+                    success, buf = _cv2.imencode(".jpg", live_np, [_cv2.IMWRITE_JPEG_QUALITY, quality])
+                    if success:
+                        img_data = bytes(buf)
+                        live_frame_used = True
+                        logger.debug(f"Serving live frame for stream {stream_id}")
+                except Exception as live_err:
+                    logger.warning(f"Could not encode live frame for {stream_id}: {live_err}")
+
+        # ── Strategy 2: DB / S3 fallback ────────────────────────────────────
+        if not live_frame_used:
+            from app.services.detection_data_service import detection_data_service
+
+            result = await detection_data_service.retrieve_detection_data(
+                workspace_id=workspace_id_obj,
+                user_system_role=user_system_role,
+                user_workspace_role=user_workspace_role,
+                requesting_username=username,
+                camera_id=[stream_id],
+                page=1,
+                per_page=1,
+                include_frame=True
+            )
+
+            if not result or not result.get("data") or len(result["data"]) == 0:
+                raise HTTPException(status_code=404, detail="No frames found for this stream")
+
+            detection = result["data"][0]
+            frame_base64 = detection.get("frame")
+
+            if not frame_base64:
+                raise HTTPException(status_code=404, detail="Frame data not available")
+
             if frame_base64.startswith("s3://"):
                 img_data = await s3_service.get_image_data(frame_base64)
                 if not img_data:
                     raise HTTPException(status_code=404, detail="Image not found in S3")
             else:
                 img_data = base64.b64decode(frame_base64)
-                
+
+        # ── Open with PIL ────────────────────────────────────────────────────
+        try:
             img = Image.open(io.BytesIO(img_data))
         except Exception as decode_error:
             logger.error(f"Failed to decode frame image: {decode_error}")

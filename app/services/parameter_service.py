@@ -129,46 +129,6 @@ class ParameterService:
                 detail="Database error occurred."
             )
 
-    async def get_params_by_id(self, param_id: UUID) -> Optional[Dict]:
-        """Get parameters by param_id."""
-        try:
-            query = """
-                SELECT 
-                    ps.param_id, ps.workspace_id, ps.user_id,
-                    u.username as last_modifier_username,
-                    w.name as workspace_name,
-                    ps.frame_delay, ps.frame_skip, ps.conf,
-                    ps.created_at, ps.updated_at
-                FROM param_stream ps
-                JOIN users u ON ps.user_id = u.user_id
-                JOIN workspaces w ON ps.workspace_id = w.workspace_id
-                WHERE ps.param_id = $1
-            """
-            result = await self.db_manager.execute_query(query, params=(param_id,), fetch_one=True)
-            
-            if not result:
-                return None
-            
-            return {
-                "param_id": str(result["param_id"]),
-                "workspace_id": str(result["workspace_id"]),
-                "workspace_name": result["workspace_name"],
-                "last_modifier_id": str(result["user_id"]),
-                "last_modifier_username": result["last_modifier_username"],
-                "frame_delay": result["frame_delay"],
-                "frame_skip": result["frame_skip"],
-                "conf": result["conf"],
-                "created_at": result["created_at"].isoformat() if result["created_at"] else None,
-                "updated_at": result["updated_at"].isoformat() if result["updated_at"] else None
-            }
-            
-        except asyncpg.PostgresError as db_err:
-            logger.error(f"Database error retrieving params by id: {db_err}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database error occurred."
-            )
-
     async def delete_workspace_params(
         self,
         workspace_id: UUID
@@ -326,24 +286,6 @@ class ParameterService:
         
         return updated_ids, failed_ids
 
-    async def delete_all_workspace_params(self, workspace_id) -> int:
-        """Delete all workspace parameters (admin only). Returns rows affected."""
-        try:
-            query = "DELETE FROM param_stream WHERE workspace_id = $1"
-            rows_affected = await self.db_manager.execute_query(query, params=(workspace_id,), return_rowcount=True)
-            
-            if rows_affected and rows_affected > 0:
-                logger.warning(f"Deleted ALL workspace parameters ({rows_affected} rows)")
-            
-            return rows_affected if rows_affected is not None else 0
-            
-        except asyncpg.PostgresError as db_err:
-            logger.error(f"Database error deleting all workspace params: {db_err}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                detail="Database error occurred."
-            )
-
     async def delete_all_workspaces_params(self) -> int:
         """Delete all workspace parameters (admin only). Returns rows affected."""
         try:
@@ -443,20 +385,5 @@ class ParameterService:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
                 detail="Database error occurred."
             )
-
-    async def get_parameter_history(
-        self,
-        workspace_id: UUID,
-        limit: int = 10
-    ) -> List[Dict]:
-        """Get parameter change history for a workspace (requires audit table)."""
-        try:
-            current_params = await self.get_workspace_params(workspace_id)
-            if current_params and current_params.get("param_id"):
-                return [current_params]
-            return []
-        except Exception as e:
-            logger.error(f"Error retrieving parameter history: {e}", exc_info=True)
-            return []
 
 parameter_service = ParameterService()

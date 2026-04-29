@@ -1,7 +1,7 @@
 services:
   redis:
     image: redis:7-alpine
-    container_name: insighteye_redis1
+    container_name: insighteye_redis
     restart: always
     ports:
       - "6378:6379"
@@ -18,8 +18,8 @@ services:
 
   app:
     build: .
-    image: insighteye_app1:latest
-    container_name: insighteye_app1
+    image: insighteye_app:latest
+    container_name: insighteye_app
     restart: always
     env_file:
       - .env
@@ -30,7 +30,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     ports:
-      - "${APP_PORT:-8001}:8001"
+      - "${APP_PORT:-8000}:8000"
     volumes:
       - .:/app
     depends_on:
@@ -39,7 +39,7 @@ services:
     command: >
       uvicorn app.main:app
       --host 0.0.0.0
-      --port 8001
+      --port 8000
     runtime: nvidia
     deploy:
       resources:
@@ -52,8 +52,8 @@ services:
       - insighteye_network
 
   celery_worker:
-    image: insighteye_app1:latest
-    container_name: insighteye_celery_worker1
+    image: insighteye_app:latest
+    container_name: insighteye_celery_worker
     restart: always
     env_file:
       - .env

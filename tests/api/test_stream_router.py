@@ -152,44 +152,6 @@ class TestStreamRouterStatus:
         
         assert response.status_code == 404
 
-
-class TestStreamRouterActiveStreams:
-    """Test active streams listing endpoint"""
-    
-    @pytest.mark.asyncio
-    async def test_get_active_streams(self, async_client, auth_headers):
-        """Test getting list of active streams"""
-        response = await async_client.get(
-            "/api/active",
-            headers=auth_headers
-        )
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert isinstance(data, list) or isinstance(data, dict)
-    
-    @pytest.mark.asyncio
-    async def test_get_active_streams_unauthorized(self, async_client):
-        """Test getting active streams without authentication"""
-        response = await async_client.get(
-            "/api/active"
-        )
-        
-        assert response.status_code == 404
-    
-    @pytest.mark.asyncio
-    async def test_get_active_streams_by_workspace(self, async_client, auth_headers):
-        """Test getting active streams filtered by workspace"""
-        workspace_id = str(uuid4())
-        
-        response = await async_client.get(
-            f"/api/active?workspace_id={workspace_id}",
-            headers=auth_headers
-        )
-        
-        assert response.status_code in [200, 404]
-
-
 class TestStreamRouterWebSocket:
     """Test WebSocket stream endpoint"""
     

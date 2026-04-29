@@ -48,66 +48,6 @@ class WorkspaceService:
             "is_active": workspace_row["is_active"]
         }
 
-    async def get_workspaces_by_user_id(
-        self,
-        user_id: UUID,
-        include_inactive: bool = False
-    ) -> List[dict]:
-        """
-        Get all workspaces for a specific user by their user_id.
-        
-        Args:
-            user_id: The UUID of the user
-            include_inactive: Whether to include inactive workspaces
-            
-        Returns:
-            List of workspace dictionaries with membership information
-        """
-        query = """
-            SELECT w.workspace_id, w.name, w.description, w.created_at, w.updated_at, 
-                w.is_active, wm.role as member_role, wm.created_at as joined_at
-            FROM workspaces w
-            JOIN workspace_members wm ON w.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1
-        """
-        params_list = [user_id]
-        
-        if not include_inactive:
-            query += " AND w.is_active = TRUE"
-        
-        query += " ORDER BY w.created_at DESC"
-        
-        try:
-            workspaces_rows = await self.db_manager.execute_query(
-                query, 
-                tuple(params_list), 
-                fetch_all=True
-            )
-            
-            return [
-                {
-                    "workspace_id": str(w_row["workspace_id"]),
-                    "name": w_row["name"],
-                    "description": w_row["description"],
-                    "created_at": w_row["created_at"].isoformat() if w_row["created_at"] else None,
-                    "updated_at": w_row["updated_at"].isoformat() if w_row["updated_at"] else None,
-                    "is_active": w_row["is_active"],
-                    "member_role": w_row["member_role"]
-                } for w_row in workspaces_rows
-            ] if workspaces_rows else []
-            
-        except Exception as e:
-            logger.error(f"Error retrieving workspaces for user_id {user_id}: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve workspaces for user."
-            )
-
-    async def get_workspace_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Retrieve workspace by name."""
-        query = "SELECT * FROM workspaces WHERE name = $1 AND is_active = TRUE"
-        return await self.db_manager.execute_query(query, (name,), fetch_one=True)
-    
     async def check_workspace_membership_and_get_role(
         self, 
         user_id: UUID, 
@@ -266,75 +206,6 @@ class WorkspaceService:
         
         logger.warning(f"No active workspace found for user {user_id_obj}")
         return None
-
-    async def set_active_workspace(
-        self, 
-        user_id: Union[str, UUID], 
-        workspace_id: Union[str, UUID]
-    ) -> Tuple[bool, str]:
-        """Set the active workspace for a user."""
-        user_id_obj = UUID(str(user_id)) if not isinstance(user_id, UUID) else user_id
-        workspace_id_obj = UUID(str(workspace_id)) if not isinstance(workspace_id, UUID) else workspace_id
-
-        async with self.db_manager.transaction() as conn:
-            # Check membership
-            member_query = "SELECT membership_id FROM workspace_members WHERE user_id = $1 AND workspace_id = $2"
-            membership = await self.db_manager.execute_query(
-                member_query, (user_id_obj, workspace_id_obj), fetch_one=True, connection=conn
-            )
-            if not membership:
-                return False, "You are not a member of this workspace or workspace does not exist."
-                
-            # Check workspace is active
-            ws_query = "SELECT is_active FROM workspaces WHERE workspace_id = $1"
-            workspace = await self.db_manager.execute_query(
-                ws_query, (workspace_id_obj,), fetch_one=True, connection=conn
-            )
-            if not workspace or not workspace.get("is_active"):
-                return False, "Workspace is not active or not found."
-                
-            # Update user tokens
-            now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
-            token_update_q = "UPDATE user_tokens SET workspace_id = $1, updated_at = $2 WHERE user_id = $3 AND is_active = TRUE"
-            await self.db_manager.execute_query(
-                token_update_q, (workspace_id_obj, now_utc, user_id_obj), connection=conn
-            )
-        
-        return True, "Active workspace updated for all current sessions/tokens."
-
-    async def get_user_with_active_workspace(
-        self, username: str
-    ) -> tuple[Optional[Dict], Optional[UUID]]:
-        """
-        Get user details and their active workspace in one call.
-        
-        Returns:
-            Tuple of (user_dict, workspace_id)
-        """
-        # Get user details
-        query = """
-            SELECT user_id, username, email, created_at, is_active, last_login, role, 
-                is_subscribed, subscription_date, count_of_camera, is_search, is_prediction 
-            FROM users 
-            WHERE username = $1
-        """
-        user = await self.db_manager.execute_query(query, (username,), fetch_one=True)
-        user_details = dict(user) if user else None
-        
-        if not user_details:
-            return None, None
-        
-        user_id = user_details.get("user_id")
-        if not user_id:
-            return user_details, None
-        
-        workspace_info = await self.get_active_workspace(user_id)
-        
-        workspace_id = None
-        if workspace_info and isinstance(workspace_info.get("workspace_id"), UUID):
-            workspace_id = workspace_info["workspace_id"]
-        
-        return user_details, workspace_id
 
     async def create_workspace(
         self,
@@ -934,17 +805,6 @@ class WorkspaceService:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to activate workspace."
-            )
-
-    async def migrate_to_workspace_model(self) -> None:
-        """Execute migration to workspace model."""
-        try:
-            await self.db_manager.execute_query("SELECT migrate_data_to_workspace_model()")
-        except Exception as e:
-            logger.error(f"Error in migration: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to migrate to workspace model"
             )
 
     async def get_all_workspaces(self, include_inactive: bool = False) -> List[dict]:

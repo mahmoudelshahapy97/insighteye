@@ -52,7 +52,8 @@ class PostgresService:
         frame: Optional[np.ndarray] = None,
         location_info: Optional[Dict[str, Any]] = None,
         save_frame: bool = True,
-        result_id: Optional[UUID] = None
+        result_id: Optional[UUID] = None,
+        s3_path: Optional[str] = None
     ) -> bool:
         """Insert detection data into PostgreSQL (stream_results and optionally stream_frames)."""
         try:
@@ -126,15 +127,21 @@ class PostgresService:
                 )
                 
                 # Insert frame data if provided
-                if frame is not None and save_frame:
+                if (frame is not None or s3_path is not None) and save_frame:
                     try:
-                        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                        
-                        s3_path = await s3_service.upload_image_base64_to_s3(frame_base64)
-                        frame_size = len(buffer)
-                        
-                        image_path_or_base64 = s3_path if s3_path else frame_base64
+                        image_path_or_base64 = None
+                        frame_size = 0
+                        if s3_path:
+                            image_path_or_base64 = s3_path
+                            frame_size = 0 # Dummy size if not tracking
+                        elif frame is not None:
+                            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                            
+                            uploaded_s3_path = await s3_service.upload_image_base64_to_s3(frame_base64)
+                            frame_size = len(buffer)
+                            
+                            image_path_or_base64 = uploaded_s3_path if uploaded_s3_path else frame_base64
                         
                         frame_query = """
                             INSERT INTO stream_frames (
@@ -237,10 +244,27 @@ class PostgresService:
                     )
                     
                     # Insert frame if available
-                    if frame_base64 and detection.get('save_frame', True):
-                        s3_path = await s3_service.upload_image_base64_to_s3(frame_base64)
-                        image_path_or_base64 = s3_path if s3_path else frame_base64
-                        frame_size = int(len(frame_base64) * 0.75) if s3_path else len(frame_base64)
+                    s3_path = detection.get('s3_path')
+                    if s3_path and detection.get('save_frame', True):
+                        frame_size = 0
+                        image_path_or_base64 = s3_path
+                        
+                        frame_query = """
+                            INSERT INTO stream_frames (
+                                frame_id, result_id, stream_id,
+                                frame_base64, frame_size_bytes, created_at
+                            ) VALUES ($1, $2, $3, $4, $5, $6)
+                        """
+                        await self.db_manager.execute_query(
+                            frame_query,
+                            (uuid4(), result_id, UUID(detection['camera_id']), 
+                             image_path_or_base64, frame_size, datetime.now(ZoneInfo("Africa/Cairo"))),
+                            connection=conn
+                        )
+                    elif frame_base64 and detection.get('save_frame', True):
+                        uploaded_s3_path = await s3_service.upload_image_base64_to_s3(frame_base64)
+                        image_path_or_base64 = uploaded_s3_path if uploaded_s3_path else frame_base64
+                        frame_size = int(len(frame_base64) * 0.75) if uploaded_s3_path else len(frame_base64)
 
                         frame_query = """
                             INSERT INTO stream_frames (
@@ -388,100 +412,6 @@ class PostgresService:
             logger.error(f"Error searching workspace data: {e}", exc_info=True)
             raise
 
-    async def search_ordered_data(
-        self,
-        workspace_id: UUID,
-        search_query: SearchQuery,
-        user_system_role: str,
-        user_workspace_role: Optional[str],
-        requesting_username: str,
-        page: int = 1,
-        per_page: int = 10
-    ) -> Dict[str, Any]:
-        """Search with timestamp ordering"""
-        try:
-            conditions = ["sr.workspace_id = $1"]
-            params = [workspace_id]
-            param_count = 1
-            
-            # Build filters (same as search_workspace_data)
-            if search_query.camera_id:
-                param_count += 1
-                camera_ids = [str(c) for c in search_query.camera_id]
-                conditions.append(f"sr.camera_id = ANY(${param_count})")
-                params.append(camera_ids)
-            
-            # Date/time filters
-            if search_query.start_date:
-                start_date = parse_date_format(search_query.start_date)
-                start_time = parse_time_string(
-                    getattr(search_query, 'start_time', None), dt_time.min
-                )
-                start_datetime = datetime.combine(start_date, start_time).replace(tzinfo=ZoneInfo("Africa/Cairo"))
-                param_count += 1
-                conditions.append(f"sr.timestamp >= ${param_count}")
-                params.append(start_datetime)
-            
-            if search_query.end_date:
-                end_date = parse_date_format(search_query.end_date)
-                end_time = parse_time_string(
-                    getattr(search_query, 'end_time', None),
-                    dt_time.max.replace(microsecond=0)
-                )
-                end_datetime = datetime.combine(end_date, end_time).replace(tzinfo=ZoneInfo("Africa/Cairo"))
-                param_count += 1
-                conditions.append(f"sr.timestamp <= ${param_count}")
-                params.append(end_datetime)
-            
-            # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
-                param_count += 1
-                conditions.append(f"sr.username = ${param_count}")
-                params.append(requesting_username)
-            
-            where_clause = " AND ".join(conditions)
-            
-            # Get total count
-            count_query = f"SELECT COUNT(*) FROM stream_results sr WHERE {where_clause}"
-            count_result = await self.db_manager.execute_query(
-                count_query, tuple(params), fetch_one=True
-            )
-            total_count = count_result['count']
-            
-            num_pages = (total_count + per_page - 1) // per_page if total_count > 0 else 0
-            offset = (page - 1) * per_page
-            
-            # Get paginated data with ordering
-            data_query = f"""
-                SELECT sr.*, u.username as owner_username
-                FROM stream_results sr
-                JOIN users u ON sr.user_id = u.user_id
-                WHERE {where_clause}
-                ORDER BY sr.timestamp DESC
-                LIMIT {per_page} OFFSET {offset}
-            """
-            
-            results = await self.db_manager.execute_query(
-                data_query, tuple(params), fetch_all=True
-            )
-            
-            paginated_data = []
-            if results:
-                for row in results:
-                    paginated_data.append(self._format_result_data(row, include_frame=False))
-            
-            return {
-                "data": paginated_data,
-                "current_page": page,
-                "num_of_pages": num_pages,
-                "total_count": total_count,
-                "per_page": per_page
-            }
-            
-        except Exception as e:
-            logger.error(f"Error searching ordered data: {e}", exc_info=True)
-            raise
-
     async def search_cameras_by_location(
         self,
         workspace_id: UUID,
@@ -556,82 +486,6 @@ class PostgresService:
                 
         except Exception as e:
             logger.error(f"Error searching cameras by location: {e}", exc_info=True)
-            raise
-
-    async def get_workspace_cameras(
-        self,
-        workspace_id: UUID,
-        location_filters: Dict[str, Optional[str]],
-        status: Optional[str],
-        search_term: Optional[str],
-        group_by: Optional[str],
-        include_inactive: bool,
-        user_id: UUID,
-        user_role: str
-    ) -> Dict[str, Any]:
-        """Get cameras in workspace with optional filtering and grouping"""
-        try:
-            conditions = ["vs.workspace_id = $1"]
-            params = [workspace_id]
-            param_count = 1
-            
-            # Add location filters
-            for field, value in location_filters.items():
-                if value:
-                    param_count += 1
-                    conditions.append(f"vs.{field} ILIKE ${param_count}")
-                    params.append(f"%{value}%")
-            
-            # Status filter
-            if status:
-                param_count += 1
-                conditions.append(f"vs.status = ${param_count}")
-                params.append(status)
-            elif not include_inactive:
-                conditions.append("vs.status != 'inactive'")
-            
-            # Search term
-            if search_term:
-                param_count += 1
-                conditions.append(f"vs.name ILIKE ${param_count}")
-                params.append(f"%{search_term}%")
-            
-            # Permission filter
-            if user_role != "admin":
-                param_count += 1
-                conditions.append(f"vs.user_id = ${param_count}")
-                params.append(user_id)
-            
-            where_clause = " AND ".join(conditions)
-            
-            if not group_by or group_by == "none":
-                # Return flat list
-                query = f"""
-                    SELECT vs.stream_id, vs.name, vs.path, vs.type, vs.status, vs.is_streaming,
-                        vs.location, vs.area, vs.building, vs.floor_level, vs.zone,
-                        vs.latitude, vs.longitude, vs.created_at, vs.updated_at,
-                        u.username as owner_username
-                    FROM video_stream vs
-                    JOIN users u ON vs.user_id = u.user_id
-                    WHERE {where_clause}
-                    ORDER BY vs.building, vs.floor_level, vs.zone, vs.area, vs.location, vs.name
-                """
-                
-                cameras = await self.db_manager.execute_query(query, tuple(params), fetch_all=True)
-                camera_list = [self._format_camera_data(cam) for cam in cameras] if cameras else []
-                
-                return {
-                    "cameras": camera_list,
-                    "groups": [],
-                    "total_count": len(camera_list),
-                    "group_type": "none"
-                }
-            else:
-                # Return grouped results
-                return await self._get_grouped_cameras(where_clause, params, group_by)
-                
-        except Exception as e:
-            logger.error(f"Error getting workspace cameras: {e}", exc_info=True)
             raise
 
     # ========== Prediction Operations ==========
@@ -823,113 +677,6 @@ class PostgresService:
             return {"workspace_id": str(workspace_id), "error": str(e), "statistics": {}}
 
     # ========== Location Analytics ==========
-
-    async def get_location_analytics(
-        self,
-        workspace_id: UUID,
-        search_query: SearchQuery,
-        group_by: str,
-        user_system_role: str,
-        user_workspace_role: Optional[str],
-        requesting_username: str
-    ) -> Dict[str, Any]:
-        """Get analytics data grouped by location hierarchy"""
-        try:
-            conditions = ["workspace_id = $1"]
-            params = [workspace_id]
-            param_count = 1
-            
-            # Build filters from search query
-            if search_query.camera_id:
-                param_count += 1
-                camera_ids = [str(c) for c in search_query.camera_id]
-                conditions.append(f"camera_id = ANY(${param_count})")
-                params.append(camera_ids)
-            
-            # Date/time filters
-            if search_query.start_date:
-                start_date = parse_date_format(search_query.start_date)
-                start_time = parse_time_string(
-                    getattr(search_query, 'start_time', None), dt_time.min
-                )
-                start_datetime = datetime.combine(start_date, start_time).replace(tzinfo=ZoneInfo("Africa/Cairo"))
-                param_count += 1
-                conditions.append(f"timestamp >= ${param_count}")
-                params.append(start_datetime)
-            
-            if search_query.end_date:
-                end_date = parse_date_format(search_query.end_date)
-                end_time = parse_time_string(
-                    getattr(search_query, 'end_time', None),
-                    dt_time.max.replace(microsecond=0)
-                )
-                end_datetime = datetime.combine(end_date, end_time).replace(tzinfo=ZoneInfo("Africa/Cairo"))
-                param_count += 1
-                conditions.append(f"timestamp <= ${param_count}")
-                params.append(end_datetime)
-            
-            # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
-                param_count += 1
-                conditions.append(f"username = ${param_count}")
-                params.append(requesting_username)
-            
-            where_clause = " AND ".join(conditions)
-            
-            # Valid group_by fields
-            valid_fields = ["location", "area", "building", "floor_level", "zone"]
-            if group_by not in valid_fields:
-                raise ValueError(f"Invalid group_by field: {group_by}")
-            
-            # Aggregation query
-            query = f"""
-                SELECT 
-                    {group_by} as group_name,
-                    COUNT(*) as data_points,
-                    SUM(person_count) as total_person_count,
-                    AVG(person_count) as average_person_count,
-                    COUNT(DISTINCT camera_id) as unique_cameras,
-                    ARRAY_AGG(DISTINCT camera_id) as camera_ids,
-                    MIN(timestamp) as earliest,
-                    MAX(timestamp) as latest
-                FROM stream_results
-                WHERE {where_clause} AND {group_by} IS NOT NULL
-                GROUP BY {group_by}
-                ORDER BY total_person_count DESC
-            """
-            
-            results = await self.db_manager.execute_query(
-                query, tuple(params), fetch_all=True
-            )
-            
-            analytics = []
-            if results:
-                for row in results:
-                    analytics.append({
-                        group_by: row['group_name'],
-                        'data_points': row['data_points'],
-                        'total_person_count': row['total_person_count'] or 0,
-                        'average_person_count': round(float(row['average_person_count']), 2) if row['average_person_count'] else 0,
-                        'unique_cameras': row['unique_cameras'],
-                        'camera_ids': row['camera_ids'] or [],
-                        'time_range': {
-                            'earliest': row['earliest'].isoformat() if row['earliest'] else None,
-                            'latest': row['latest'].isoformat() if row['latest'] else None
-                        }
-                    })
-            
-            return {
-                "analytics": analytics,
-                "total_groups": len(analytics),
-                "group_by": group_by,
-                "filters_applied": search_query.model_dump(exclude_none=True),
-                "workspace_id": str(workspace_id),
-                "database": "postgresql"
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting location analytics: {e}", exc_info=True)
-            raise
 
     async def get_location_summary(
         self,
@@ -1717,36 +1464,6 @@ class PostgresService:
             logger.error(f"Error deleting data: {e}", exc_info=True)
             raise
 
-    async def delete_camera_data(
-        self,
-        camera_ids: List[str],
-        workspace_id: UUID
-    ) -> Dict[str, Any]:
-        """Delete all data for specific cameras."""
-        try:
-            query = """
-                DELETE FROM stream_results 
-                WHERE workspace_id = $1 AND camera_id = ANY($2)
-            """
-            
-            result = await self.db_manager.execute_query(
-                query, (workspace_id, camera_ids)
-            )
-            
-            return {
-                "success": True,
-                "deleted_cameras": camera_ids,
-                "workspace_id": str(workspace_id)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error deleting camera data: {e}", exc_info=True)
-            return {
-                "success": False,
-                "error": str(e),
-                "deleted_cameras": []
-            }
-
     async def delete_all_workspace_data(
         self,
         workspace_id: UUID,
@@ -1800,137 +1517,6 @@ class PostgresService:
                 "deleted_count": 0,
                 "workspace_id": str(workspace_id)
             }
-
-    async def delete_camera_data_from_workspaces(
-        self, 
-        workspace_camera_mapping: Dict[str, List[str]]
-    ) -> List[str]:
-        """
-        Delete camera data from PostgreSQL across multiple workspaces.
-        Deletes all stream_results and stream_frames for specified cameras.
-        
-        Args:
-            workspace_camera_mapping: Dict mapping workspace_id to list of camera_ids
-            
-        Returns:
-            List of camera_ids that failed to delete
-        """
-        failures = []
-        
-        if not workspace_camera_mapping:
-            logger.info("No camera data to delete from PostgreSQL")
-            return failures
-        
-        try:
-            for workspace_id_str, camera_ids in workspace_camera_mapping.items():
-                try:
-                    workspace_id = UUID(workspace_id_str)
-                    
-                    for camera_id in camera_ids:
-                        try:
-                            # Delete from stream_results (stream_frames will cascade)
-                            delete_query = """
-                                DELETE FROM stream_results 
-                                WHERE workspace_id = $1 AND camera_id = $2
-                            """
-                            
-                            result = await self.db_manager.execute_query(
-                                delete_query,
-                                (workspace_id, camera_id)
-                            )
-                            
-                            logger.info(f"Deleted PostgreSQL data for camera {camera_id} in workspace {workspace_id}")
-                            
-                        except Exception as camera_err:
-                            logger.error(f"Failed to delete PostgreSQL data for camera {camera_id}: {camera_err}", exc_info=True)
-                            failures.append(camera_id)
-                            
-                except ValueError as ve:
-                    logger.error(f"Invalid workspace UUID {workspace_id_str}: {ve}")
-                    failures.extend(camera_ids)
-                except Exception as ws_err:
-                    logger.error(f"Failed to process workspace {workspace_id_str} in PostgreSQL: {ws_err}", exc_info=True)
-                    failures.extend(camera_ids)
-            
-            # Remove duplicates
-            return list(set(failures))
-            
-        except Exception as e:
-            logger.error(f"Error during PostgreSQL camera deletion: {e}", exc_info=True)
-            # Return all cameras as failures
-            all_cameras = [cam_id for cam_list in workspace_camera_mapping.values() for cam_id in cam_list]
-            return list(set(all_cameras))
-
-    async def delete_user_camera_data(
-        self, 
-        workspace_camera_mapping: Dict[str, List[str]]
-    ) -> Dict:
-        """
-        Delete all user's camera data from PostgreSQL database.
-        Deletes all stream_results and stream_frames for specified cameras.
-        
-        Args:
-            workspace_camera_mapping: Dict mapping workspace_id to list of camera_ids
-            
-        Returns:
-            Dictionary with deletion results
-        """
-        result = {
-            "success": True,
-            "deleted_cameras": [],
-            "failed_cameras": [],
-            "workspaces_affected": []
-        }
-        
-        if not workspace_camera_mapping:
-            logger.info("No camera data to delete from PostgreSQL")
-            return result
-        
-        try:
-            for workspace_id_str, camera_ids in workspace_camera_mapping.items():
-                try:
-                    workspace_id = UUID(workspace_id_str)
-                    result["workspaces_affected"].append(workspace_id_str)
-                    
-                    # Delete data for each camera in this workspace
-                    for camera_id in camera_ids:
-                        try:
-                            # Delete from stream_results (stream_frames will cascade due to FK)
-                            delete_query = """
-                                DELETE FROM stream_results 
-                                WHERE workspace_id = $1 AND camera_id = $2
-                            """
-                            
-                            await self.db_manager.execute_query(
-                                delete_query,
-                                (workspace_id, camera_id)
-                            )
-                            
-                            result["deleted_cameras"].append(camera_id)
-                            logger.info(f"Deleted PostgreSQL data for camera {camera_id} in workspace {workspace_id}")
-                        
-                        except Exception as camera_err:
-                            logger.error(f"Failed to delete PostgreSQL data for camera {camera_id}: {camera_err}")
-                            result["failed_cameras"].append(camera_id)
-                
-                except ValueError as ve:
-                    logger.error(f"Invalid workspace UUID {workspace_id_str}: {ve}")
-                    result["failed_cameras"].extend(camera_ids)
-                except Exception as ws_err:
-                    logger.error(f"Failed to process workspace {workspace_id_str} in PostgreSQL: {ws_err}")
-                    result["failed_cameras"].extend(camera_ids)
-            
-            # Mark as failed if any cameras failed
-            if result["failed_cameras"]:
-                result["success"] = False
-                logger.warning(f"Some cameras failed PostgreSQL deletion: {result['failed_cameras']}")
-        
-        except Exception as e:
-            logger.error(f"Error during PostgreSQL deletion: {e}", exc_info=True)
-            result["success"] = False
-            result["error"] = str(e)
-        
-        return result
 
     # ========== Metadata Update Operations ==========
     
@@ -2428,78 +2014,6 @@ class PostgresService:
             logger.error(f"Error searching location data: {e}", exc_info=True)
             raise
 
-    async def get_user_workspace_info(self, username: str) -> Tuple[Optional[UUID], Optional[UUID]]:
-        """Retrieve user ID and their active workspace."""
-        try:
-            if not username:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST, 
-                    detail="Username is required"
-                )
-
-            # Get user ID
-            query_user = "SELECT user_id FROM users WHERE username = $1"
-            user_result = await self.db_manager.execute_query(
-                query_user, (username,), fetch_one=True
-            )
-
-            if not user_result or not user_result.get("user_id"):
-                logger.warning(f"User ID lookup failed for username: {username}")
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND, 
-                    detail="User not found"
-                )
-
-            user_id = UUID(str(user_result["user_id"]))
-
-            # Simplified workspace lookup with single query using COALESCE
-            workspace_query = """
-                WITH session_workspace AS (
-                    SELECT ut.workspace_id, ut.updated_at as last_used
-                    FROM user_tokens ut
-                    WHERE ut.user_id = $1 AND ut.is_active = TRUE
-                    ORDER BY ut.updated_at DESC
-                    LIMIT 1
-                ),
-                member_workspaces AS (
-                    SELECT wm.workspace_id, wm.created_at as joined_at
-                    FROM workspace_members wm
-                    JOIN workspaces w ON wm.workspace_id = w.workspace_id
-                    WHERE wm.user_id = $1 AND w.is_active = TRUE
-                    ORDER BY wm.created_at ASC
-                    LIMIT 1
-                )
-                SELECT COALESCE(
-                    (SELECT workspace_id FROM session_workspace),
-                    (SELECT workspace_id FROM member_workspaces)
-                ) as workspace_id
-            """
-            
-            ws_result = await self.db_manager.execute_query(
-                workspace_query, (user_id,), fetch_one=True
-            )
-
-            workspace_id: Optional[UUID] = None
-            if ws_result and ws_result.get("workspace_id"):
-                workspace_id = UUID(str(ws_result["workspace_id"]))
-            else:
-                logger.warning(f"User {username} (ID: {user_id}) has no active workspace available.")
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="No active or available workspace found for user."
-                )
-            
-            return user_id, workspace_id
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error retrieving user_id and workspace for username '{username}': {str(e)}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve user and workspace information."
-            )
-    
     async def check_workspace_membership(
         self, user_id: UUID, workspace_id: UUID, required_role: Optional[str] = None
     ) -> Dict[str, str]:
@@ -2533,66 +2047,6 @@ class PostgresService:
                 )
         
         return {"role": user_workspace_role}
-
-    async def get_stream_camera_info(self, stream_id: UUID) -> Optional[Dict[str, Any]]:
-        """Get camera information including location data for a stream"""
-        try:
-            query = """
-                SELECT vs.stream_id, vs.name, vs.path, vs.type, vs.status,
-                    vs.location, vs.area, vs.building, vs.zone, vs.floor_level,
-                    vs.latitude, vs.longitude, vs.workspace_id,
-                    vs.user_id, u.username as owner_username
-                FROM video_stream vs
-                JOIN users u ON vs.user_id = u.user_id
-                WHERE vs.stream_id = $1
-            """
-            result = await self.db_manager.execute_query(query, (stream_id,), fetch_one=True)
-            
-            if result:
-                return {
-                    'stream_id': str(result['stream_id']),
-                    'name': result['name'],
-                    'path': result['path'],
-                    'type': result['type'],
-                    'status': result['status'],
-                    'workspace_id': str(result['workspace_id']),
-                    'user_id': str(result['user_id']),
-                    'owner_username': result['owner_username'],
-                    'location_info': {
-                        'location': result['location'],
-                        'area': result['area'],
-                        'building': result['building'],
-                        'zone': result['zone'],
-                        'floor_level': result['floor_level'],
-                        'latitude': float(result['latitude']) if result['latitude'] else None,
-                        'longitude': float(result['longitude']) if result['longitude'] else None
-                    }
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Error getting stream camera info for {stream_id}: {e}")
-            return None
-
-    async def ensure_fire_detection_state_table(self):
-        """Ensure fire_detection_state table exists"""
-        try:
-            create_table_query = """
-                CREATE TABLE IF NOT EXISTS fire_detection_state (
-                    stream_id UUID PRIMARY KEY REFERENCES video_stream(stream_id) ON DELETE CASCADE,
-                    fire_status VARCHAR(50) NOT NULL DEFAULT 'no detection',
-                    last_detection_time TIMESTAMPTZ,
-                    last_notification_time TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                );
-                
-                CREATE INDEX IF NOT EXISTS idx_fire_state_stream ON fire_detection_state(stream_id);
-                CREATE INDEX IF NOT EXISTS idx_fire_state_notification_time ON fire_detection_state(last_notification_time);
-            """
-            await self.db_manager.execute_query(create_table_query)
-            logger.info("Fire detection state table ensured")
-        except Exception as e:
-            logger.error(f"Error ensuring fire_detection_state table: {e}")
 
     # ========== Helper Methods ==========
     

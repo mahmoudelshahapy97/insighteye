@@ -128,15 +128,6 @@ class StreamProcessingService:
             self.fire_model = None
             self.shoplifting_engine = None
 
-    def get_model_status(self) -> Dict[str, bool]:
-        """Get status of all models for health checks."""
-        return {
-            "people_model": self.people_model is not None and self.people_model.is_loaded,
-            "gender_model": self.gender_model is not None and self.gender_model.is_loaded,
-            "fire_model": self.fire_model is not None and self.fire_model.is_loaded,
-            "shoplifting_model": self.shoplifting_engine is not None and self.shoplifting_engine.get_status()
-        }
-
     def detect_objects_with_threshold(
         self,
         frame: np.ndarray,
@@ -576,7 +567,6 @@ class StreamProcessingService:
         except Exception as e:
             logger.error(f"Error saving detection data for stream {stream_id_str}: {e}", exc_info=True)
             return False
-
 
     async def _handle_people_count_alert(
         self,
@@ -1426,35 +1416,6 @@ class StreamProcessingService:
                 logger.error(f"Error cleaning stream manager: {cleanup_err}")
 
             logger.info(f"Stream processing completed for {stream_id_str}")
-
-    async def process_single_frame(
-        self,
-        frame: np.ndarray,
-        conf_threshold: float = 0.5
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Process a single frame and return annotated frame with detection data."""
-        loop = asyncio.get_event_loop()
-        
-        annotated_frame, person_count, _, male_count, female_count, fire_status, is_shoplifting, shoplifting_conf, _ = \
-            await loop.run_in_executor(
-                thread_pool,
-                self.detect_objects_with_threshold,
-                frame,
-                conf_threshold,
-                None,
-                None
-            )
-        
-        detection_data = {
-            "person_count": person_count,
-            "male_count": male_count,
-            "female_count": female_count,
-            "fire_status": fire_status,
-            "is_shoplifting": is_shoplifting,
-            "shoplifting_confidence": shoplifting_conf
-        }
-        
-        return annotated_frame, detection_data
 
     async def update_stream_to_active(self, stream_id_str: str):
         """Update stream status to 'active' when processing successfully starts."""

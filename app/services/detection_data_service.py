@@ -4,7 +4,10 @@ from typing import Dict, Any, Optional, List, Union
 from uuid import UUID, uuid4
 import logging
 import numpy as np
+import cv2
+import base64
 from app.services.postgres_service import postgres_service
+from app.services.s3_service import s3_service
 from app.schemas import LocationSearchQuery
 
 logger = logging.getLogger(__name__)
@@ -33,7 +36,7 @@ class DetectionDataService:
         fire_status: str,
         frame: Optional[np.ndarray] = None,
         location_info: Optional[Dict[str, Any]] = None,
-        save_frame_in_postgres: bool = False
+        save_frame_in_postgres: bool = True
     ) -> bool:
         """
         Insert detection data into PostgreSQL with synchronized IDs.
@@ -53,6 +56,16 @@ class DetectionDataService:
         result_id = uuid4()
         
         try:
+            # Upload frame to S3 immediately to avoid huge Redis memory usage
+            s3_path = None
+            if frame is not None and save_frame_in_postgres:
+                try:
+                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    s3_path = await s3_service.upload_image_base64_to_s3(frame_base64)
+                except Exception as frame_error:
+                    logger.warning(f"Failed to upload frame to S3: {frame_error}")
+
             # 1. Push metadata to Redis batch buffer (flushes → PG every 5 min)
             redis_svc = _get_redis_batch_service()
             redis_ok = await redis_svc.push_detection(
@@ -67,6 +80,7 @@ class DetectionDataService:
                 fire_status=fire_status,
                 location_info=location_info,
                 result_id=str(result_id),
+                s3_path=s3_path,
             )
 
             if not redis_ok:
@@ -85,7 +99,8 @@ class DetectionDataService:
                     male_count=male_count,
                     female_count=female_count,
                     fire_status=fire_status,
-                    frame=frame if save_frame_in_postgres else None,
+                    frame=frame if save_frame_in_postgres and not s3_path else None,
+                    s3_path=s3_path,
                     location_info=location_info,
                     save_frame=save_frame_in_postgres,
                     result_id=result_id,
@@ -179,7 +194,7 @@ class DetectionDataService:
                 requesting_username=requesting_username,
                 page=page,
                 per_page=per_page,
-                include_frame=False  # Don't get frames from PostgreSQL
+                include_frame=include_frame
             )
             
             if not pg_results or not pg_results.get("data"):
@@ -195,7 +210,7 @@ class DetectionDataService:
             
             # Add source information
             pg_results["source"] = "PostgreSQL"
-            pg_results["frames_included"] = False
+            pg_results["frames_included"] = include_frame
             pg_results["filters_applied"] = {
                 "camera_id": camera_id,
                 "date_range": {
@@ -238,12 +253,21 @@ class DetectionDataService:
         """
         try:
             # Get metadata from PostgreSQL
-            metadata_query = """
-                SELECT sr.*, u.username as owner_username
-                FROM stream_results sr
-                JOIN users u ON sr.user_id = u.user_id
-                WHERE sr.result_id = $1 AND sr.workspace_id = $2
-            """
+            if include_frame:
+                metadata_query = """
+                    SELECT sr.*, u.username as owner_username, sf.frame_base64
+                    FROM stream_results sr
+                    JOIN users u ON sr.user_id = u.user_id
+                    LEFT JOIN stream_frames sf ON sr.result_id = sf.result_id
+                    WHERE sr.result_id = $1 AND sr.workspace_id = $2
+                """
+            else:
+                metadata_query = """
+                    SELECT sr.*, u.username as owner_username
+                    FROM stream_results sr
+                    JOIN users u ON sr.user_id = u.user_id
+                    WHERE sr.result_id = $1 AND sr.workspace_id = $2
+                """
             
             metadata = await self.postgres_service.db_manager.execute_query(
                 metadata_query, (result_id, workspace_id), fetch_one=True
@@ -280,6 +304,9 @@ class DetectionDataService:
                 "created_at": metadata['created_at'].isoformat() if metadata['created_at'] else None,
                 "source": "PostgreSQL"
             }
+            
+            if include_frame and 'frame_base64' in metadata:
+                result['frame'] = metadata['frame_base64']
             
             return result
             

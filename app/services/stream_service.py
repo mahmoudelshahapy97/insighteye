@@ -543,88 +543,6 @@ class StreamManager:
         
         return streams_info
 
-    async def get_workspace_stream_analytics(
-        self,
-        workspace_id: UUID
-    ) -> Dict[str, Any]:
-        """
-        Get comprehensive analytics for workspace streams.
-        ENHANCED: Added error rates and performance metrics.
-        """
-        # Get workspace info
-        workspace_info = await self.workspace_service.get_workspace_by_id(workspace_id)
-        
-        # Get stream limits
-        limits = await self.get_workspace_stream_limits(workspace_id)
-        
-        # Get all streams (active and inactive)
-        all_streams = await self.video_stream_service.get_workspace_streams(workspace_id)
-        
-        # Get active streams from memory
-        active_streams = await self.get_workspace_active_streams(workspace_id)
-        
-        # Calculate statistics
-        total_streams = len(all_streams)
-        streaming_now = len(active_streams)
-        
-        # Stream types
-        stream_types = defaultdict(int)
-        for stream in all_streams:
-            stream_types[stream.get('type', 'unknown')] += 1
-        
-        # Alert status
-        alerts_enabled = sum(1 for s in all_streams if s.get('alert_enabled'))
-        
-        # Location distribution
-        locations = defaultdict(int)
-        for stream in all_streams:
-            location = stream.get('location') or 'Unknown'
-            locations[location] += 1
-        
-        # Processing performance
-        total_frames = 0
-        total_detections = 0
-        total_errors = 0
-        
-        for stream in active_streams:
-            stats = stream.get('stats', {})
-            total_frames += stats.get('frames_processed', 0)
-            total_detections += stats.get('detection_count', 0)
-            total_errors += stats.get('errors', 0)
-        
-        # Error rates
-        workspace_id_str = str(workspace_id)
-        workspace_stream_ids = self.workspace_streams.get(workspace_id_str, set())
-        error_count = sum(
-            len(self.stream_errors.get(sid, []))
-            for sid in workspace_stream_ids
-        )
-        
-        return {
-            'workspace': {
-                'id': str(workspace_id),
-                'name': workspace_info['name'],
-                'is_active': workspace_info['is_active']
-            },
-            'limits': limits,
-            'streams': {
-                'total': total_streams,
-                'streaming_now': streaming_now,
-                'alerts_enabled': alerts_enabled,
-                'types': dict(stream_types),
-                'locations': dict(locations)
-            },
-            'performance': {
-                'total_frames_processed': total_frames,
-                'total_detections': total_detections,
-                'total_errors': total_errors,
-                'error_rate': (total_errors / total_frames * 100) if total_frames > 0 else 0,
-                'avg_detections_per_stream': total_detections / streaming_now if streaming_now > 0 else 0,
-                'recent_errors': error_count
-            },
-            'timestamp': datetime.now(ZoneInfo("Africa/Cairo")).isoformat()
-        }
-
     # ==================== Stream Lifecycle ====================
 
     async def start_stream_background(
@@ -1096,36 +1014,6 @@ class StreamManager:
             
         except Exception as e:
             logger.error(f"Error notifying workspace of stream start: {e}")
-
-    async def _notify_workspace_stream_stopped(
-        self,
-        workspace_id: UUID,
-        camera_name: str,
-        owner_username: str
-    ):
-        """Notify workspace members when a stream stops."""
-        try:
-            members = await self.workspace_service.get_workspace_members(
-                workspace_id=workspace_id,
-                current_user_id=workspace_id,
-                is_admin=True
-            )
-            
-            notification_tasks = [
-                self.notification_service.create_notification(
-                    workspace_id=workspace_id,
-                    user_id=UUID(member['user_id']),
-                    status="info",
-                    message=f"⏹️ Camera '{camera_name}' stopped (owner: {owner_username})",
-                    camera_name=camera_name
-                )
-                for member in members
-            ]
-            
-            await asyncio.gather(*notification_tasks, return_exceptions=True)
-            
-        except Exception as e:
-            logger.error(f"Error notifying workspace of stream stop: {e}")
 
     # ==================== API Methods ====================
 
@@ -1854,28 +1742,6 @@ class StreamManager:
                 await asyncio.sleep(10)
         
         logger.info("Camera retry loop stopped")
-    
-    async def _start_background_tasks_internal(self):
-        """
-        Internal method to start all background tasks.
-        ENHANCED: Added monitoring task.
-        """
-        await self.stop_background_tasks()
-        
-        # Stream management task
-        self.background_task = asyncio.create_task(self.manage_streams_with_deduplication())
-        self.background_task.set_name("manage_streams_loop")
-        self.background_task.add_done_callback(self._handle_task_done)
-        
-        # Cleanup task
-        self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        self.cleanup_task.set_name("periodic_cleanup_loop")
-        self.cleanup_task.add_done_callback(self._handle_task_done)
-        
-        # NEW: Resource monitoring task
-        self.monitor_task = asyncio.create_task(self._resource_monitor())
-        self.monitor_task.set_name("resource_monitor_loop")
-        self.monitor_task.add_done_callback(self._handle_task_done)
 
     async def _resource_monitor(self):
         """
@@ -2771,45 +2637,6 @@ class StreamManager:
             
             self.last_healthcheck = datetime.now(ZoneInfo("Africa/Cairo"))
 
-    # ==================== Frame Updates ====================
-
-    def update_stream_frame(
-        self,
-        stream_id_str: str,
-        frame: Any,
-        person_count: int,
-        male_count: int,
-        female_count: int,
-        fire_status: str
-    ):
-        """Update stream frame and statistics."""
-        if stream_id_str in self.active_streams:
-            self.active_streams[stream_id_str]['latest_frame'] = frame
-            self.active_streams[stream_id_str]['last_frame_time'] = datetime.now(ZoneInfo("Africa/Cairo"))
-            
-            # Update fire detection state - FIXED
-            if stream_id_str not in self.fire_detection_states:
-                self.fire_detection_states[stream_id_str] = {
-                    'status': 'no detection',
-                    'last_detection_time': None,
-                    'last_notification_time': None
-                }
-            
-            # Update fire status
-            current_time = datetime.now(ZoneInfo("Africa/Cairo"))
-            self.fire_detection_states[stream_id_str]['status'] = fire_status
-            
-            if fire_status != 'no detection':
-                self.fire_detection_states[stream_id_str]['last_detection_time'] = current_time
-            
-            # Update processing stats
-            if stream_id_str in self.stream_processing_stats:
-                stats = self.stream_processing_stats[stream_id_str]
-                stats['frames_processed'] += 1
-                if person_count > 0:
-                    stats['detection_count'] += 1
-                stats['last_updated'] = current_time
-
     # ==================== Notification Management ====================
 
     async def subscribe_to_notifications(
@@ -3090,113 +2917,6 @@ class StreamManager:
         for ws in disconnected_sockets:
             self.notification_subscribers[user_id_str].discard(ws)
 
-    async def broadcast_fire_alert_popup(
-        self,
-        workspace_id: UUID,
-        stream_id: UUID,
-        camera_name: str,
-        fire_status: str,
-        location_info: Optional[Dict[str, Any]] = None,
-        broadcast_to_all_members: bool = True
-    ):
-        """
-        Broadcast a critical fire alert popup to workspace members.
-        
-        Args:
-            workspace_id: Workspace UUID
-            stream_id: Camera stream UUID
-            camera_name: Name of the camera
-            fire_status: "fire" or "smoke"
-            location_info: Location details dictionary
-            broadcast_to_all_members: If True, send to all workspace members
-        """
-        try:
-            # Build location text
-            location_text = "Unknown Location"
-            if location_info:
-                location_parts = []
-                if location_info.get('building'):
-                    location_parts.append(location_info['building'])
-                if location_info.get('floor_level'):
-                    location_parts.append(f"Floor {location_info['floor_level']}")
-                if location_info.get('zone'):
-                    location_parts.append(location_info['zone'])
-                if location_info.get('area'):
-                    location_parts.append(location_info['area'])
-                
-                location_text = " - ".join(location_parts) if location_parts else location_info.get('location', 'Unknown Location')
-            
-            alert_type = "FIRE" if fire_status == "fire" else "SMOKE"
-            
-            # Create popup alert payload
-            popup_alert = {
-                "type": "fire_alert_popup",
-                "alert": {
-                    "severity": "critical",
-                    "alert_type": alert_type.lower(),
-                    "status": fire_status,
-                    "camera_name": camera_name,
-                    "camera_id": str(stream_id),
-                    "location": location_text,
-                    "location_details": location_info,
-                    "message": f"🔥 {alert_type} ALERT: {fire_status.upper()} detected in {location_text}",
-                    "timestamp": datetime.now(ZoneInfo("Africa/Cairo")).timestamp(),
-                    "workspace_id": str(workspace_id),
-                    "requires_acknowledgment": True,
-                    "sound_alert": True,
-                    "priority": "high",
-                    "actions": [
-                        {
-                            "label": "View Camera",
-                            "action": "navigate",
-                            "target": f"/dashboard/camera/{str(stream_id)}"
-                        },
-                        {
-                            "label": "Acknowledge",
-                            "action": "acknowledge",
-                            "target": None
-                        }
-                    ]
-                }
-            }
-            
-            # Get target users
-            target_users = []
-            
-            if broadcast_to_all_members:
-                # Get all workspace members
-                members = await self.workspace_service.get_workspace_members(
-                    workspace_id=workspace_id,
-                    current_user_id=workspace_id,  # Using workspace_id for admin check
-                    is_admin=True
-                )
-                target_users = [str(member['user_id']) for member in members]
-            else:
-                # Get only camera owner
-                stream_info = await self.video_stream_service.get_video_stream_by_id(stream_id)
-                if stream_info:
-                    target_users = [str(stream_info['user_id'])]
-            
-            # Broadcast to all targets
-            broadcast_count = 0
-            for user_id_str in target_users:
-                try:
-                    await self.broadcast_notification(user_id_str, popup_alert)
-                    broadcast_count += 1
-                except Exception as e:
-                    logger.error(f"Error broadcasting fire alert to user {user_id_str}: {e}")
-            
-            logger.warning(
-                f"🔥 Fire popup alert broadcasted to {broadcast_count} users "
-                f"for camera '{camera_name}' ({alert_type})"
-            )
-            
-            return broadcast_count
-            
-        except Exception as e:
-            logger.error(f"Error broadcasting fire alert popup: {e}", exc_info=True)
-            return 0
-
     async def detect_and_cleanup_zombie_streams(self):
         """
         Detect and clean up zombie streams - streams in memory but not actually processing.
@@ -3353,67 +3073,6 @@ class StreamManager:
         
         return zombies_found
 
-    async def get_camera_health_report(self) -> Dict[str, Any]:
-        """
-        Generate health report for all cameras.
-        Helps identify problematic cameras.
-        """
-        async with self._lock:
-            active_cameras = list(self.active_streams.items())
-        
-        camera_health = []
-        current_time = datetime.now(ZoneInfo("Africa/Cairo"))
-        
-        for stream_id_str, stream_info in active_cameras:
-            last_frame_time = stream_info.get('last_frame_time')
-            start_time = stream_info.get('start_time')
-            
-            # Calculate health score
-            health_score = 100
-            issues = []
-            
-            # Check frame freshness
-            if last_frame_time:
-                age = (current_time - last_frame_time).total_seconds()
-                if age > 60:
-                    health_score -= 50
-                    issues.append(f"No frames for {age:.0f}s")
-                elif age > 30:
-                    health_score -= 25
-                    issues.append(f"Stale frames ({age:.0f}s)")
-            else:
-                if start_time:
-                    running_time = (current_time - start_time).total_seconds()
-                    if running_time > 30:
-                        health_score = 0
-                        issues.append(f"No frames after {running_time:.0f}s")
-            
-            # Check error rate
-            if stream_id_str in self.stream_errors:
-                error_count = len(self.stream_errors[stream_id_str])
-                if error_count > 10:
-                    health_score -= min(50, error_count * 2)
-                    issues.append(f"{error_count} errors")
-            
-            camera_health.append({
-                'stream_id': stream_id_str,
-                'camera_name': stream_info.get('camera_name'),
-                'health_score': max(0, health_score),
-                'status': 'healthy' if health_score > 75 else ('degraded' if health_score > 25 else 'critical'),
-                'issues': issues,
-                'uptime_seconds': (current_time - start_time).total_seconds() if start_time else 0,
-                'last_frame_age_seconds': (current_time - last_frame_time).total_seconds() if last_frame_time else None
-            })
-        
-        return {
-            'timestamp': current_time.isoformat(),
-            'total_cameras': len(camera_health),
-            'healthy': len([c for c in camera_health if c['health_score'] > 75]),
-            'degraded': len([c for c in camera_health if 25 < c['health_score'] <= 75]),
-            'critical': len([c for c in camera_health if c['health_score'] <= 25]),
-            'cameras': sorted(camera_health, key=lambda x: x['health_score'])
-        }
-        
 # ==================== Global Instance ====================
 
 stream_manager = StreamManager()

@@ -114,6 +114,7 @@ class RedisBatchService:
         fire_status: str,
         location_info: Optional[Dict[str, Any]] = None,
         result_id: Optional[str] = None,
+        s3_path: Optional[str] = None,
     ) -> bool:
         """
         Serialise detection metadata and push it to a Redis list.
@@ -141,12 +142,13 @@ class RedisBatchService:
             "date": now.date().isoformat(),
             "time": now.time().isoformat(),
             "location_info": location_info or {},
+            "s3_path": s3_path,
         }
 
         key = _make_key(workspace_id, stream_id)
 
         try:
-            await self._client.rpush(key, json.dumps(record))
+            await self._client.rpush(key, json.dumps(record, default=str))
             logger.debug(f"📥 Pushed detection to Redis key={key}")
             return True
         except Exception as exc:

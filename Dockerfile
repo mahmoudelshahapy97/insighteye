@@ -49,14 +49,15 @@ RUN uv pip install --system --no-cache \
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
 
 RUN ldconfig
+RUN pip install boto3 aioboto3
 
 # Copy application code
 COPY . .
 
-EXPOSE 8001
+EXPOSE 8000
 
 # IMPORTANT: We removed the 'RUN python3 -c "import cv2"' line.
 # It will always fail during BUILD because there is no GPU driver access.
 # It will work at RUNTIME when you use --gpus all.
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
