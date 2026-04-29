@@ -1325,7 +1325,7 @@ class StreamProcessingService:
                                         behavior_category="shoplifting",
                                         confidence=float(conf),
                                         objects_detected=objs,
-                                        image_path=s3_path   # Re-using image_path column for video S3 path
+                                        video_path=s3_path   # Save video S3 path correctly
                                     )
                                     logger.info(f"✅ Saved shoplifting video to {s3_path}")
                                     

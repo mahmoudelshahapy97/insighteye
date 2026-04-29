@@ -5,6 +5,7 @@ import logging
 from botocore.exceptions import ClientError
 from app.config.settings import config
 import asyncio
+import os
 
 logger = logging.getLogger(__name__)
 

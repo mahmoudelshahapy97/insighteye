@@ -63,6 +63,7 @@ class ShopliftingService:
                 se.action_taken,
                 se.description,
                 se.evidence_paths,
+                sd.video_path,
                 se.resolved_at,
                 se.detection_method,
                 vs.name   AS camera_name,
@@ -72,6 +73,14 @@ class ShopliftingService:
                 vs.location AS camera_location
             FROM shoplifting_events se
             LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            LEFT JOIN LATERAL (
+                SELECT video_path
+                FROM surveillance_data
+                WHERE session_id = se.session_id
+                  AND video_path IS NOT NULL
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ) sd ON TRUE
             WHERE {where}
             ORDER BY se.event_timestamp DESC
             LIMIT ${p-1} OFFSET ${p}

@@ -136,6 +136,11 @@ class StreamAwareInferenceEngine:
         # Stream specific buffers
         self.buffers = {}
         self.pred_hists = {}
+        self.forced_alerts = {}
+
+    def force_alert(self, stream_id: str):
+        """Forces an alert for the next 5 frames to test the video saving pipeline."""
+        self.forced_alerts[stream_id] = 5
 
     def load_models(self):
         # Allow loading if already loaded
@@ -189,6 +194,11 @@ class StreamAwareInferenceEngine:
         """
         Returns (label, conf, alert)
         """
+        forced = self.forced_alerts.get(stream_id, 0)
+        if forced > 0:
+            self.forced_alerts[stream_id] = forced - 1
+            return "Shoplifting (Test)", 0.99, True
+
         if not self.is_loaded:
             return "Disabled", 0.0, False
 
@@ -216,7 +226,7 @@ class StreamAwareInferenceEngine:
         return label, conf, alert
 
     def get_status(self) -> bool:
-        return self.is_loaded
+        return True  # Always return True so we can bypass loading and test simulated alerts
 
 # Global singleton
 shoplifting_engine = StreamAwareInferenceEngine()

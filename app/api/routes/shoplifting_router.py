@@ -141,6 +141,16 @@ async def resolve_shoplifting_event(
     return {"message": f"Event {event_id} updated to '{request.status}'"}
 
 
+@router.post("/test-alert/{camera_id}")
+async def trigger_test_alert(camera_id: str):
+    """
+    Test Endpoint: Force a shoplifting alert on the specified camera stream.
+    This bypasses the ML model and triggers the S3 video buffering and Postgres save pipeline.
+    """
+    from app.services.shoplifting_inference import shoplifting_engine
+    shoplifting_engine.force_alert(camera_id)
+    return {"message": f"Simulated shoplifting alert triggered on camera {camera_id}. Please wait ~10 seconds for the buffer to save to S3."}
+
 # ─────────────────────────────────────────────
 # Active dashboard (legacy / quick view)
 # ─────────────────────────────────────────────
