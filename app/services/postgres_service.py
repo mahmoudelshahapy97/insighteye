@@ -170,25 +170,29 @@ class PostgresService:
         workspace_id: UUID
     ) -> Dict[str, Any]:
         """Batch insert multiple detection data points."""
-        try:
-            inserted_count = 0
-            
-            async with self.db_manager.transaction() as conn:
-                for detection in detection_batch:
+        from fastapi import HTTPException as _HTTPException
+
+        inserted_count = 0
+        skipped_count = 0
+        requeue_items = []
+
+        for detection in detection_batch:
+            try:
+                async with self.db_manager.transaction() as conn:
                     # Use the result_id from Redis
                     # Fall back to a new UUID for backwards compatibility
                     result_id = UUID(detection['result_id']) if detection.get('result_id') else uuid4()
-                    
+
                     # Process frame if provided
                     frame_base64 = None
                     if 'frame' in detection and detection['frame'] is not None:
                         frame_base64 = frame_to_base64(detection['frame'])
-                    
+
                     # ===== DATA VALIDATION: Ensure gender counts don't exceed person count =====
                     person_count = max(0, detection['person_count'])
                     male_count = max(0, detection.get('male_count', 0))
                     female_count = max(0, detection.get('female_count', 0))
-                    
+
                     gender_sum = male_count + female_count
                     if gender_sum > person_count:
                         logger.warning(
@@ -197,7 +201,7 @@ class PostgresService:
                         )
                         person_count = gender_sum
                     # ===========================================================================
-                    
+
                     # Insert result
                     result_query = """
                         INSERT INTO stream_results (
@@ -211,9 +215,9 @@ class PostgresService:
                             $14, $15, $16, $17, $18, $19, $20, $21, $22
                         )
                     """
-                    
+
                     location_info = detection.get('location_info', {})
-                    
+
                     await self.db_manager.execute_query(
                         result_query,
                         (
@@ -242,13 +246,13 @@ class PostgresService:
                         ),
                         connection=conn
                     )
-                    
+
                     # Insert frame if available
                     s3_path = detection.get('s3_path')
                     if s3_path and detection.get('save_frame', True):
                         frame_size = 0
                         image_path_or_base64 = s3_path
-                        
+
                         frame_query = """
                             INSERT INTO stream_frames (
                                 frame_id, result_id, stream_id,
@@ -257,7 +261,7 @@ class PostgresService:
                         """
                         await self.db_manager.execute_query(
                             frame_query,
-                            (uuid4(), result_id, UUID(detection['camera_id']), 
+                            (uuid4(), result_id, UUID(detection['camera_id']),
                              image_path_or_base64, frame_size, datetime.now(ZoneInfo("Africa/Cairo"))),
                             connection=conn
                         )
@@ -274,22 +278,40 @@ class PostgresService:
                         """
                         await self.db_manager.execute_query(
                             frame_query,
-                            (uuid4(), result_id, UUID(detection['camera_id']), 
+                            (uuid4(), result_id, UUID(detection['camera_id']),
                              image_path_or_base64, frame_size, datetime.now(ZoneInfo("Africa/Cairo"))),
                             connection=conn
                         )
-                    
+
                     inserted_count += 1
-            
-            return {
-                "success": True,
-                "inserted_count": inserted_count,
-                "database": "postgresql"
-            }
-            
-        except Exception as e:
-            logger.error(f"Error batch inserting: {e}", exc_info=True)
-            return {"success": False, "error": str(e), "inserted_count": 0}
+
+            except _HTTPException as exc:
+                if exc.status_code in (422, 409):
+                    # Permanent error: FK violation (stream deleted) or duplicate result_id
+                    logger.warning(
+                        f"Discarding detection for stream_id={detection.get('camera_id')} "
+                        f"(permanent error {exc.status_code}): {exc.detail}"
+                    )
+                    skipped_count += 1
+                else:
+                    # Transient error: DB connection failure, timeout, etc.
+                    logger.error(
+                        f"Transient DB error ({exc.status_code}) for stream_id={detection.get('camera_id')}, "
+                        f"will re-queue: {exc.detail}"
+                    )
+                    requeue_items.append(detection)
+
+            except Exception as exc:
+                logger.error(f"Unexpected error inserting detection: {exc}", exc_info=True)
+                requeue_items.append(detection)
+
+        return {
+            "success": True,
+            "inserted_count": inserted_count,
+            "skipped_count": skipped_count,
+            "requeue_items": requeue_items,
+            "database": "postgresql"
+        }
 
     # ========== Search Operations ==========
     

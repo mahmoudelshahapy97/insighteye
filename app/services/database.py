@@ -324,11 +324,14 @@ class DatabaseManager:
                 detail="Cannot connect to database service."
             )
             
+        except HTTPException:
+            raise
+
         except Exception as e:
             logger.error(f"Unexpected error acquiring connection: {e}", exc_info=True)
             pool_stats['failed_queries'] += 1
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Error acquiring database connection."
             )
         except asyncpg.PostgresConnectionError:
@@ -428,12 +431,18 @@ class DatabaseManager:
                 
                 if isinstance(db_err, asyncpg.exceptions.UniqueViolationError):
                     raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT, 
+                        status_code=status.HTTP_409_CONFLICT,
                         detail=f"Database constraint violation: {db_err.detail or db_err.message}"
                     )
-                    
+
+                elif isinstance(db_err, asyncpg.exceptions.ForeignKeyViolationError):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"Foreign key violation: {db_err.detail or db_err.message}"
+                    )
+
                 raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"A database error occurred: {db_err}"
                 )
                 

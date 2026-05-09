@@ -148,7 +148,7 @@ class Settings(BaseSettings):
     postgres_db: str = "insighteye_db"
     postgres_user: str = "insighteye_user"
     postgres_password: str
-    db_host: str = "172.31.25.133"
+    db_host: str = "16.171.140.77"
     db_port: int = 6432
 
     db_min_pool_size: int = 50

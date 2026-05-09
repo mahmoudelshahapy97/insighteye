@@ -226,21 +226,28 @@ class RedisBatchService:
                     workspace_id=ws_uuid,
                 )
 
-                if result.get("success"):
-                    n = result.get("inserted_count", len(records))
-                    total_flushed += n
+                n = result.get("inserted_count", 0)
+                skipped = result.get("skipped_count", 0)
+                requeue_items = result.get("requeue_items", [])
+
+                total_flushed += n
+
+                if n:
                     logger.info(
                         f"✅ Flushed {n} detections to PostgreSQL "
                         f"(key={key}, workspace={ws_id_str})"
                     )
-                else:
-                    logger.error(
-                        f"❌ batch_insert_detection_data failed for key {key}: "
-                        f"{result.get('error')}"
+                if skipped:
+                    logger.warning(
+                        f"⚠️ Discarded {skipped} detections with invalid stream_id (key={key}) — "
+                        f"stream no longer exists, data permanently dropped"
                     )
-                    # Re-push items back so they are not lost
-                    for raw in raw_items:
-                        await self._client.rpush(key, raw)
+                if requeue_items:
+                    logger.error(
+                        f"❌ Re-queuing {len(requeue_items)} detections after transient DB error (key={key})"
+                    )
+                    for item in requeue_items:
+                        await self._client.rpush(key, json.dumps(item, default=str))
 
             except Exception as exc:
                 logger.error(
