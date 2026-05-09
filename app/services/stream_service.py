@@ -601,7 +601,7 @@ class StreamManager:
                     
                     if current_state == StreamState.ACTIVE and is_healthy and task_alive:
                         logger.info(f"✅ {stream_id_str} already healthy on THIS server")
-                        return
+                        return True
                     
                     # Unhealthy or needs restart - we must exit lock before calling _stop_stream
                     needs_stop = True

@@ -47,16 +47,11 @@ async def get_workspace_id_for_user(username: str) -> UUID:
 
 
 async def resolve_s3_paths(paths: Optional[List[str]]) -> Optional[List[str]]:
-    """
-    Convert s3:// URIs to pre-signed HTTPS URLs.
-    Also normalises image extensions to .webp as per spec.
-    """
     if not paths:
         return paths
     resolved = []
     for path in paths:
         if isinstance(path, str) and path.startswith("s3://"):
-            # Normalise image extension
             lower = path.lower()
             for old_ext in (".jpg", ".jpeg", ".png"):
                 if lower.endswith(old_ext):
@@ -70,12 +65,30 @@ async def resolve_s3_paths(paths: Optional[List[str]]) -> Optional[List[str]]:
 
 
 async def enrich_event(event: dict) -> dict:
-    """Resolve evidence_paths and video_path S3 URLs in place."""
     if event.get("evidence_paths"):
         event["evidence_paths"] = await resolve_s3_paths(event["evidence_paths"])
     if event.get("video_path") and str(event["video_path"]).startswith("s3://"):
         event["video_path"] = await s3_service.get_presigned_url(event["video_path"])
     return event
+
+
+# Shared filter dependency – same 8 params on every filterable endpoint
+def _filters(
+    start_date: Optional[str]   = Query(None, description="ISO-8601 start datetime"),
+    end_date: Optional[str]     = Query(None, description="ISO-8601 end datetime"),
+    start_time: Optional[str]   = Query(None, description="Time-of-day lower bound (HH:MM)"),
+    end_time: Optional[str]     = Query(None, description="Time-of-day upper bound (HH:MM)"),
+    location: Optional[str]     = Query(None, description="Filter by camera location"),
+    building: Optional[str]     = Query(None, description="Filter by building"),
+    floor_level: Optional[str]  = Query(None, description="Filter by floor level"),
+    zone: Optional[str]         = Query(None, description="Filter by zone"),
+):
+    return dict(
+        start_date=start_date, end_date=end_date,
+        start_time=start_time, end_time=end_time,
+        location=location, building=building,
+        floor_level=floor_level, zone=zone,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -86,34 +99,25 @@ async def enrich_event(event: dict) -> dict:
 async def get_shoplifting_events(
     status_filter: Optional[str] = Query(None, description="detected | confirmed | dismissed | resolved"),
     camera_id: Optional[str]     = Query(None, description="Filter by stream/camera UUID"),
-    start_date: Optional[str]    = Query(None, description="ISO-8601 start datetime"),
-    end_date: Optional[str]      = Query(None, description="ISO-8601 end datetime"),
+    f: dict = Depends(_filters),
     page: int  = Query(1,  ge=1),
     limit: int = Query(50, ge=1, le=200),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
-    """
-    Paginated list of shoplifting events.
-    Returns evidence_paths as pre-signed S3 URLs.
-    """
+    """Paginated list of shoplifting events. Returns evidence_paths as pre-signed S3 URLs."""
     workspace_id = await get_workspace_id_for_user(current_user["username"])
     offset = (page - 1) * limit
 
     events = await shoplifting_service.get_events(
-        workspace_id=workspace_id,
-        status=status_filter,
-        camera_id=camera_id,
-        start_date=start_date,
-        end_date=end_date,
-        limit=limit,
-        offset=offset,
+        workspace_id=workspace_id, status=status_filter, camera_id=camera_id,
+        limit=limit, offset=offset, **f,
     )
-
     for ev in events:
         await enrich_event(ev)
 
-    total = await shoplifting_service.count_events(workspace_id=workspace_id, status=status_filter)
-
+    total = await shoplifting_service.count_events(
+        workspace_id=workspace_id, status=status_filter, camera_id=camera_id, **f,
+    )
     return ShopliftingEventListResponse(items=events, total=total, limit=limit, offset=offset)
 
 
@@ -128,28 +132,22 @@ async def resolve_shoplifting_event(
     action_taken values: 'intervened' | 'police_called' | 'no_action' (or any free text).
     """
     await get_workspace_id_for_user(current_user["username"])
-
     success = await shoplifting_service.resolve_event(
-        event_id=event_id,
-        status=request.status,
-        action_taken=request.action_taken,
-        description=request.description,
+        event_id=event_id, status=request.status,
+        action_taken=request.action_taken, description=request.description,
     )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to resolve event")
-
     return {"message": f"Event {event_id} updated to '{request.status}'"}
 
 
 @router.post("/test-alert/{camera_id}")
 async def trigger_test_alert(camera_id: str):
-    """
-    Test Endpoint: Force a shoplifting alert on the specified camera stream.
-    This bypasses the ML model and triggers the S3 video buffering and Postgres save pipeline.
-    """
+    """Test Endpoint: Force a shoplifting alert on the specified camera stream."""
     from app.services.shoplifting_inference import shoplifting_engine
     shoplifting_engine.force_alert(camera_id)
     return {"message": f"Simulated shoplifting alert triggered on camera {camera_id}. Please wait ~10 seconds for the buffer to save to S3."}
+
 
 # ─────────────────────────────────────────────
 # Active dashboard (legacy / quick view)
@@ -172,7 +170,7 @@ async def get_shoplifting_daily_summary(
     limit: int = Query(30, ge=1, le=365, description="Days to return"),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
-    """Daily rollup summary (existing view)."""
+    """Daily rollup summary."""
     workspace_id = await get_workspace_id_for_user(current_user["username"])
     return await shoplifting_service.get_daily_summary(workspace_id=workspace_id, limit=limit)
 
@@ -183,9 +181,8 @@ async def get_shoplifting_daily_summary(
 
 @router.get("/incidents/videos")
 async def get_incident_videos(
-    camera_id: Optional[str]  = Query(None, description="Filter by camera UUID"),
-    start_date: Optional[str] = Query(None, description="ISO-8601 start datetime"),
-    end_date: Optional[str]   = Query(None, description="ISO-8601 end datetime"),
+    camera_id: Optional[str] = Query(None, description="Filter by camera UUID"),
+    f: dict = Depends(_filters),
     page: int  = Query(1,  ge=1),
     limit: int = Query(10, ge=1, le=100),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
@@ -193,29 +190,21 @@ async def get_incident_videos(
     """
     Feature 4 – Behavioral Sequence Analysis (video tab).
     Returns the most recent incident videos as S3 pre-signed URLs.
-    No filter  → latest 10 incidents.
-    With filter → paginated by camera hierarchy and/or date range.
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
     offset = (page - 1) * limit
-
     videos = await shoplifting_service.get_incident_videos(
-        workspace_id=workspace_id,
-        camera_id=camera_id,
-        start_date=start_date,
-        end_date=end_date,
-        limit=limit,
-        offset=offset,
+        workspace_id=workspace_id, camera_id=camera_id,
+        limit=limit, offset=offset, **f,
     )
-
     for v in videos:
         await enrich_event(v)
-
     return {"items": videos, "page": page, "limit": limit}
 
 
 @router.get("/incidents/behavior-sequences")
 async def get_behavior_sequences(
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -223,11 +212,12 @@ async def get_behavior_sequences(
     State frequencies and which states correlate with shoplifting.
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_behavior_sequences(workspace_id=workspace_id)
+    return await shoplifting_service.get_behavior_sequences(workspace_id=workspace_id, **f)
 
 
 @router.get("/incidents/confidence-audit")
 async def get_confidence_audit(
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -235,8 +225,7 @@ async def get_confidence_audit(
     Per-event confidence scores + evidence URLs.
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id)
-    # enrich evidence paths in per-event list
+    data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
     for ev in data.get("confidence_per_event", []):
         await enrich_event(ev)
     return data
@@ -250,15 +239,12 @@ async def set_incident_action(
 ):
     """
     Feature 6 – Dropdown action for each incident (Page 1).
-    Convenience alias for resolve endpoint.
     action_taken: 'intervened' | 'police_called' | 'no_action'
     """
     await get_workspace_id_for_user(current_user["username"])
     await shoplifting_service.resolve_event(
-        event_id=event_id,
-        status=request.status,
-        action_taken=request.action_taken,
-        description=request.description,
+        event_id=event_id, status=request.status,
+        action_taken=request.action_taken, description=request.description,
     )
     return {"message": f"Action recorded for event {event_id}"}
 
@@ -269,6 +255,7 @@ async def set_incident_action(
 
 @router.get("/dashboard/executive-summary")
 async def get_executive_summary(
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -279,11 +266,12 @@ async def get_executive_summary(
       • trend                  → line chart (shoplifting events over time)
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_executive_summary(workspace_id=workspace_id)
+    return await shoplifting_service.get_executive_summary(workspace_id=workspace_id, **f)
 
 
 @router.get("/dashboard/hotspots")
 async def get_hotspots(
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -293,11 +281,12 @@ async def get_hotspots(
       • event_type_breakdown  → event_type distribution by location
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_hotspots(workspace_id=workspace_id)
+    return await shoplifting_service.get_hotspots(workspace_id=workspace_id, **f)
 
 
 @router.get("/dashboard/high-value-analysis")
 async def get_high_value_analysis(
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -307,11 +296,12 @@ async def get_high_value_analysis(
       • total_estimated_value  → bar chart (total value per date + severity)
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_high_value_analysis(workspace_id=workspace_id)
+    return await shoplifting_service.get_high_value_analysis(workspace_id=workspace_id, **f)
 
 
 @router.get("/dashboard/session-insights")
 async def get_session_insights(
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -321,11 +311,12 @@ async def get_session_insights(
                                     broken down by camera / zone / location)
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_session_insights(workspace_id=workspace_id)
+    return await shoplifting_service.get_session_insights(workspace_id=workspace_id, **f)
 
 
 @router.get("/dashboard/model-accuracy")
 async def get_model_accuracy(
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -335,7 +326,7 @@ async def get_model_accuracy(
       • average_per_camera    → bar chart (avg confidence per camera)
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id)
+    data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
     for ev in data.get("confidence_per_event", []):
         await enrich_event(ev)
     return data
@@ -343,7 +334,7 @@ async def get_model_accuracy(
 
 @router.get("/dashboard/regional-risk")
 async def get_regional_risk(
-    zone: Optional[str] = Query(None, description="Filter by zone name"),
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -351,10 +342,9 @@ async def get_regional_risk(
     Returns:
       • incidents_per_1000_sessions  → bar chart (normalized incident rate)
       • top_risk_areas               → top-5 highest risk locations (bar chart)
-    No time filter; optional zone filter.
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_regional_risk(workspace_id=workspace_id, zone=zone)
+    return await shoplifting_service.get_regional_risk(workspace_id=workspace_id, **f)
 
 
 # ─────────────────────────────────────────────
@@ -364,18 +354,18 @@ async def get_regional_risk(
 @router.get("/dashboard/camera-health")
 async def get_camera_health(
     camera_name: Optional[str] = Query(None, description="Filter by camera name (partial match)"),
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
     Feature 8 – Camera Health & Coverage.
     Returns camera status (active/inactive), observation counts,
     installation date, and location hierarchy.
-    Filterable by camera name only.
+    Date/time filters narrow the observation count window.
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
     return await shoplifting_service.get_camera_health(
-        workspace_id=workspace_id,
-        camera_name=camera_name,
+        workspace_id=workspace_id, camera_name=camera_name, **f,
     )
 
 
@@ -394,6 +384,7 @@ async def get_realtime_activity(
 
 @router.get("/dashboard/operational-efficiency")
 async def get_operational_efficiency(
+    f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
@@ -404,4 +395,4 @@ async def get_operational_efficiency(
       • open_events       → unresolved events (for status table)
     """
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_operational_efficiency(workspace_id=workspace_id)
+    return await shoplifting_service.get_operational_efficiency(workspace_id=workspace_id, **f)
