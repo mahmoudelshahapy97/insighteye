@@ -472,10 +472,10 @@ class SessionManager:
             # If it's already an HTTP exception from blacklist check, raise it
             raise http_exc
         except Exception as e:
-            # FIXED: Don't fail on blacklist check errors (e.g., DB unavailable)
-            # Log the error but continue to token verification
-            logger.warning(f"Error checking token blacklist (continuing to verification): {e}")
-            # Don't raise - let token verification handle validity
+            # SECURITY FIX: Fail-closed on blacklist check errors
+            # If we cannot verify if a token is revoked, we must assume it is unsafe.
+            logger.error(f"Critical error checking token blacklist: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unable to verify token status. Access denied.")
         
         token_data = await self.verify_token(token, expected_token_type="access")
         if not token_data:

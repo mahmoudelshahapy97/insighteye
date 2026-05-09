@@ -16,6 +16,7 @@ from app.schemas import (
     TimestampRangeResponse, CameraIdsResponse
 )
 from app.utils import parse_camera_ids, parse_string_or_list
+from app.services.s3_service import s3_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["postgres_data"])#, prefix="/postgres"
@@ -220,6 +221,12 @@ async def workspace_search_results_with_location(
             per_page=processed_per_page,
             include_frame=include_frame
         )
+
+        # Resolve S3 image paths to presigned URLs in each result item
+        for item in results.get("data", []):
+            frame = item.get("frame")
+            if isinstance(frame, str) and frame.startswith("s3://"):
+                item["frame"] = await s3_service.get_presigned_url(frame)
 
         # Add location filters to search scope
         if "search_scope" not in results:

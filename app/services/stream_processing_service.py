@@ -57,6 +57,7 @@ class StreamProcessingService:
         self.video_file_manager = None
 
         self._cached_results = {}
+        self._active_incidents = {}
         self.use_gpu = True
 
         # Initialize models
@@ -1281,7 +1282,19 @@ class StreamProcessingService:
                             # 1. Take a snapshot of the buffer
                             shoplifting_frames = list(video_buffer)
                             
-                            async def save_shoplifting_video(frames, s_id, w_id, u_id, conf, objs):
+                            # Retrieve or create active incident session
+                            current_incident = self._active_incidents.get(stream_id_str)
+                            if current_incident and (current_time - current_incident['last_detected']).total_seconds() < 300:
+                                incident_session_id = current_incident['session_id']
+                                current_incident['last_detected'] = current_time
+                            else:
+                                incident_session_id = uuid.uuid4()
+                                self._active_incidents[stream_id_str] = {
+                                    'session_id': incident_session_id,
+                                    'last_detected': current_time
+                                }
+                            
+                            async def save_shoplifting_video(frames, s_id, w_id, u_id, conf, objs, session_uuid):
                                 if not frames: return
                                 
                                 # Setup temp file
@@ -1316,7 +1329,7 @@ class StreamProcessingService:
                                 if s3_path:
                                     # Save to DB
                                     await shoplifting_service.insert_surveillance_frame(
-                                        session_id=uuid.uuid4(),
+                                        session_id=session_uuid,
                                         stream_id=s_id,
                                         workspace_id=w_id,
                                         user_id=u_id,
@@ -1332,7 +1345,7 @@ class StreamProcessingService:
                             # Create task so it doesn't block stream processing
                             asyncio.create_task(save_shoplifting_video(
                                 shoplifting_frames, stream_id, workspace_id, owner_id, 
-                                shoplifting_conf, shoplifting_objects
+                                shoplifting_conf, shoplifting_objects, incident_session_id
                             ))
                             
                             frames_since_last_shoplifting_save = 0
