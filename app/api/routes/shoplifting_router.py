@@ -1,3 +1,4 @@
+# app/routes/shoplifting_router.py
 """
 Shoplifting Detection API
 =========================
@@ -12,7 +13,10 @@ Page 3 – Camera / Ops     : /dashboard/camera-health, /dashboard/real-time-act
                             /dashboard/operational-efficiency
 """
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import JSONResponse
 from typing import Dict, Any, List, Optional
 from uuid import UUID
 
@@ -27,6 +31,8 @@ from app.schemas.shoplifting_schema import (
     ShopliftingDailySummary,
     ActiveShopliftingEventSummary,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/shoplifting", tags=["Shoplifting"])
 
@@ -105,20 +111,26 @@ async def get_shoplifting_events(
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """Paginated list of shoplifting events. Returns evidence_paths as pre-signed S3 URLs."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    offset = (page - 1) * limit
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        offset = (page - 1) * limit
 
-    events = await shoplifting_service.get_events(
-        workspace_id=workspace_id, status=status_filter, camera_id=camera_id,
-        limit=limit, offset=offset, **f,
-    )
-    for ev in events:
-        await enrich_event(ev)
+        events = await shoplifting_service.get_events(
+            workspace_id=workspace_id, status=status_filter, camera_id=camera_id,
+            limit=limit, offset=offset, **f,
+        )
+        for ev in events:
+            await enrich_event(ev)
 
-    total = await shoplifting_service.count_events(
-        workspace_id=workspace_id, status=status_filter, camera_id=camera_id, **f,
-    )
-    return ShopliftingEventListResponse(items=events, total=total, limit=limit, offset=offset)
+        total = await shoplifting_service.count_events(
+            workspace_id=workspace_id, status=status_filter, camera_id=camera_id, **f,
+        )
+        return ShopliftingEventListResponse(items=events, total=total, limit=limit, offset=offset)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_shoplifting_events error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving shoplifting events.")
 
 
 @router.patch("/events/{event_id}/resolve")
@@ -158,11 +170,17 @@ async def get_active_shoplifting_dashboard(
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """All detected / under-review events (live view)."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    events = await shoplifting_service.get_active_dashboard(workspace_id=workspace_id)
-    for ev in events:
-        await enrich_event(ev)
-    return events
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        events = await shoplifting_service.get_active_dashboard(workspace_id=workspace_id)
+        for ev in events:
+            await enrich_event(ev)
+        return events
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_active_shoplifting_dashboard error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving active dashboard.")
 
 
 @router.get("/dashboard/summary", response_model=List[ShopliftingDailySummary])
@@ -171,8 +189,14 @@ async def get_shoplifting_daily_summary(
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """Daily rollup summary."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_daily_summary(workspace_id=workspace_id, limit=limit)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return await shoplifting_service.get_daily_summary(workspace_id=workspace_id, limit=limit)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_shoplifting_daily_summary error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving daily summary.")
 
 
 # ─────────────────────────────────────────────
@@ -191,15 +215,21 @@ async def get_incident_videos(
     Feature 4 – Behavioral Sequence Analysis (video tab).
     Returns the most recent incident videos as S3 pre-signed URLs.
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    offset = (page - 1) * limit
-    videos = await shoplifting_service.get_incident_videos(
-        workspace_id=workspace_id, camera_id=camera_id,
-        limit=limit, offset=offset, **f,
-    )
-    for v in videos:
-        await enrich_event(v)
-    return {"items": videos, "page": page, "limit": limit}
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        offset = (page - 1) * limit
+        videos = await shoplifting_service.get_incident_videos(
+            workspace_id=workspace_id, camera_id=camera_id,
+            limit=limit, offset=offset, **f,
+        )
+        for v in videos:
+            await enrich_event(v)
+        return JSONResponse(content={"items": videos, "page": page, "limit": limit})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_incident_videos error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving incident videos.")
 
 
 @router.get("/incidents/behavior-sequences")
@@ -211,8 +241,14 @@ async def get_behavior_sequences(
     Feature 4 – Behavioral Sequence Analysis (stats).
     State frequencies and which states correlate with shoplifting.
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_behavior_sequences(workspace_id=workspace_id, **f)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_behavior_sequences(workspace_id=workspace_id, **f))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_behavior_sequences error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving behavior sequences.")
 
 
 @router.get("/incidents/confidence-audit")
@@ -224,11 +260,17 @@ async def get_confidence_audit(
     Feature 5 – Model Accuracy & Confidence Audit (incident video tab).
     Per-event confidence scores + evidence URLs.
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
-    for ev in data.get("confidence_per_event", []):
-        await enrich_event(ev)
-    return data
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
+        for ev in data.get("confidence_per_event", []):
+            await enrich_event(ev)
+        return JSONResponse(content=data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_confidence_audit error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving confidence audit.")
 
 
 @router.patch("/incidents/{event_id}/action")
@@ -265,8 +307,14 @@ async def get_executive_summary(
       • lost_items_by_camera   → bar chart (# lost items per camera + date)
       • trend                  → line chart (shoplifting events over time)
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_executive_summary(workspace_id=workspace_id, **f)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_executive_summary(workspace_id=workspace_id, **f))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_executive_summary error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving executive summary.")
 
 
 @router.get("/dashboard/hotspots")
@@ -280,8 +328,14 @@ async def get_hotspots(
       • heatmap               → incidents per camera zone & name per day
       • event_type_breakdown  → event_type distribution by location
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_hotspots(workspace_id=workspace_id, **f)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_hotspots(workspace_id=workspace_id, **f))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_hotspots error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving hotspots.")
 
 
 @router.get("/dashboard/high-value-analysis")
@@ -295,8 +349,14 @@ async def get_high_value_analysis(
       • items_stolen           → bar chart (items count per zone + date)
       • total_estimated_value  → bar chart (total value per date + severity)
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_high_value_analysis(workspace_id=workspace_id, **f)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_high_value_analysis(workspace_id=workspace_id, **f))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_high_value_analysis error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving high-value analysis.")
 
 
 @router.get("/dashboard/session-insights")
@@ -310,8 +370,14 @@ async def get_session_insights(
       • avg_behavior_per_session  → bar chart (avg # behaviors per session
                                     broken down by camera / zone / location)
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_session_insights(workspace_id=workspace_id, **f)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_session_insights(workspace_id=workspace_id, **f))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_session_insights error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving session insights.")
 
 
 @router.get("/dashboard/model-accuracy")
@@ -325,11 +391,17 @@ async def get_model_accuracy(
       • confidence_per_event  → confidence score per incident video
       • average_per_camera    → bar chart (avg confidence per camera)
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
-    for ev in data.get("confidence_per_event", []):
-        await enrich_event(ev)
-    return data
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
+        for ev in data.get("confidence_per_event", []):
+            await enrich_event(ev)
+        return JSONResponse(content=data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_model_accuracy error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving model accuracy.")
 
 
 @router.get("/dashboard/regional-risk")
@@ -343,8 +415,14 @@ async def get_regional_risk(
       • incidents_per_1000_sessions  → bar chart (normalized incident rate)
       • top_risk_areas               → top-5 highest risk locations (bar chart)
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_regional_risk(workspace_id=workspace_id, **f)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_regional_risk(workspace_id=workspace_id, **f))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_regional_risk error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving regional risk.")
 
 
 # ─────────────────────────────────────────────
@@ -363,10 +441,16 @@ async def get_camera_health(
     installation date, and location hierarchy.
     Date/time filters narrow the observation count window.
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_camera_health(
-        workspace_id=workspace_id, camera_name=camera_name, **f,
-    )
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_camera_health(
+            workspace_id=workspace_id, camera_name=camera_name, **f,
+        ))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_camera_health error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving camera health.")
 
 
 @router.get("/dashboard/real-time-activity")
@@ -378,8 +462,14 @@ async def get_realtime_activity(
     Returns sessions observed in the last hour, sorted by
     detection_confidence descending, with full camera location hierarchy.
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_realtime_activity(workspace_id=workspace_id)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_realtime_activity(workspace_id=workspace_id))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_realtime_activity error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving real-time activity.")
 
 
 @router.get("/dashboard/operational-efficiency")
@@ -394,5 +484,11 @@ async def get_operational_efficiency(
       • action_breakdown  → counts of each action_taken value
       • open_events       → unresolved events (for status table)
     """
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    return await shoplifting_service.get_operational_efficiency(workspace_id=workspace_id, **f)
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        return JSONResponse(content=await shoplifting_service.get_operational_efficiency(workspace_id=workspace_id, **f))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_operational_efficiency error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving operational efficiency.")

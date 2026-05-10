@@ -1,8 +1,13 @@
 import logging
+from datetime import datetime, time as dt_time
 from typing import List, Dict, Any, Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from app.services.database import db_manager
+from app.utils.parser_utils import parse_date_format, parse_time_string
+
+_TZ = ZoneInfo("Africa/Cairo")
 
 logger = logging.getLogger(__name__)
 
@@ -51,21 +56,27 @@ class ShopliftingService:
             conditions.append(f"{table_alias}.stream_id = ${p}::uuid")
             params.append(camera_id)
         if start_date:
+            sd = parse_date_format(start_date)
+            st = parse_time_string(start_time, dt_time.min) if start_time else dt_time.min
             p += 1
-            conditions.append(f"{table_alias}.event_timestamp >= ${p}::timestamptz")
-            params.append(start_date)
+            conditions.append(f"{table_alias}.event_timestamp >= ${p}")
+            params.append(datetime.combine(sd, st).replace(tzinfo=_TZ))
+        elif start_time:
+            t = parse_time_string(start_time, dt_time.min)
+            p += 1
+            conditions.append(f"{table_alias}.event_timestamp::time >= ${p}")
+            params.append(t)
         if end_date:
+            ed = parse_date_format(end_date)
+            et = parse_time_string(end_time, dt_time(23, 59, 59)) if end_time else dt_time(23, 59, 59)
             p += 1
-            conditions.append(f"{table_alias}.event_timestamp <= ${p}::timestamptz")
-            params.append(end_date)
-        if start_time:
+            conditions.append(f"{table_alias}.event_timestamp <= ${p}")
+            params.append(datetime.combine(ed, et).replace(tzinfo=_TZ))
+        elif end_time and not start_date:
+            t = parse_time_string(end_time, dt_time(23, 59, 59))
             p += 1
-            conditions.append(f"{table_alias}.event_timestamp::time >= ${p}::time")
-            params.append(start_time)
-        if end_time:
-            p += 1
-            conditions.append(f"{table_alias}.event_timestamp::time <= ${p}::time")
-            params.append(end_time)
+            conditions.append(f"{table_alias}.event_timestamp::time <= ${p}")
+            params.append(t)
         if location:
             p += 1
             conditions.append(f"{vs_alias}.location = ${p}")
@@ -106,21 +117,27 @@ class ShopliftingService:
         p = 1
 
         if start_date:
+            sd = parse_date_format(start_date)
+            st = parse_time_string(start_time, dt_time.min) if start_time else dt_time.min
             p += 1
-            conditions.append(f"{table_alias}.timestamp >= ${p}::timestamptz")
-            params.append(start_date)
+            conditions.append(f"{table_alias}.timestamp >= ${p}")
+            params.append(datetime.combine(sd, st).replace(tzinfo=_TZ))
+        elif start_time:
+            t = parse_time_string(start_time, dt_time.min)
+            p += 1
+            conditions.append(f"{table_alias}.timestamp::time >= ${p}")
+            params.append(t)
         if end_date:
+            ed = parse_date_format(end_date)
+            et = parse_time_string(end_time, dt_time(23, 59, 59)) if end_time else dt_time(23, 59, 59)
             p += 1
-            conditions.append(f"{table_alias}.timestamp <= ${p}::timestamptz")
-            params.append(end_date)
-        if start_time:
+            conditions.append(f"{table_alias}.timestamp <= ${p}")
+            params.append(datetime.combine(ed, et).replace(tzinfo=_TZ))
+        elif end_time and not start_date:
+            t = parse_time_string(end_time, dt_time(23, 59, 59))
             p += 1
-            conditions.append(f"{table_alias}.timestamp::time >= ${p}::time")
-            params.append(start_time)
-        if end_time:
-            p += 1
-            conditions.append(f"{table_alias}.timestamp::time <= ${p}::time")
-            params.append(end_time)
+            conditions.append(f"{table_alias}.timestamp::time <= ${p}")
+            params.append(t)
         if location:
             p += 1
             conditions.append(f"{vs_alias}.location = ${p}")
@@ -319,14 +336,14 @@ class ShopliftingService:
         q_items = f"""
             SELECT
                 vs.name AS camera_name, vs.zone, vs.building,
-                DATE(se.event_timestamp)::text AS date,
+                DATE(se.event_timestamp)::text AS event_date,
                 item, COUNT(*) AS item_count
             FROM shoplifting_events se
-            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id,
-            UNNEST(se.items_stolen) AS item
+            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            CROSS JOIN LATERAL UNNEST(se.items_stolen) AS item
             WHERE {where}
             GROUP BY vs.name, vs.zone, vs.building, DATE(se.event_timestamp), item
-            ORDER BY date DESC, item_count DESC
+            ORDER BY event_date DESC, item_count DESC
         """
         q_trend = f"""
             SELECT
@@ -801,21 +818,27 @@ class ShopliftingService:
         # Date/time filters narrow the observation_count sub-query
         obs_conditions = []
         if start_date:
+            sd = parse_date_format(start_date)
+            st = parse_time_string(start_time, dt_time.min) if start_time else dt_time.min
             p += 1
-            obs_conditions.append(f"timestamp >= ${p}::timestamptz")
-            params.append(start_date)
+            obs_conditions.append(f"timestamp >= ${p}")
+            params.append(datetime.combine(sd, st).replace(tzinfo=_TZ))
+        elif start_time:
+            t = parse_time_string(start_time, dt_time.min)
+            p += 1
+            obs_conditions.append(f"timestamp::time >= ${p}")
+            params.append(t)
         if end_date:
+            ed = parse_date_format(end_date)
+            et = parse_time_string(end_time, dt_time(23, 59, 59)) if end_time else dt_time(23, 59, 59)
             p += 1
-            obs_conditions.append(f"timestamp <= ${p}::timestamptz")
-            params.append(end_date)
-        if start_time:
+            obs_conditions.append(f"timestamp <= ${p}")
+            params.append(datetime.combine(ed, et).replace(tzinfo=_TZ))
+        elif end_time and not start_date:
+            t = parse_time_string(end_time, dt_time(23, 59, 59))
             p += 1
-            obs_conditions.append(f"timestamp::time >= ${p}::time")
-            params.append(start_time)
-        if end_time:
-            p += 1
-            obs_conditions.append(f"timestamp::time <= ${p}::time")
-            params.append(end_time)
+            obs_conditions.append(f"timestamp::time <= ${p}")
+            params.append(t)
 
         obs_where = ("WHERE " + " AND ".join(obs_conditions)) if obs_conditions else ""
         where = " AND ".join(conditions)
@@ -931,25 +954,31 @@ class ShopliftingService:
         event_extra = ""
         session_extra = ""
         if start_date:
+            sd = parse_date_format(start_date)
+            st = parse_time_string(start_time, dt_time.min) if start_time else dt_time.min
             p += 1
-            event_extra   += f" AND se.event_timestamp >= ${p}::timestamptz"
-            session_extra += f" AND s.timestamp >= ${p}::timestamptz"
-            params.append(start_date)
+            event_extra   += f" AND se.event_timestamp >= ${p}"
+            session_extra += f" AND s.timestamp >= ${p}"
+            params.append(datetime.combine(sd, st).replace(tzinfo=_TZ))
+        elif start_time:
+            t = parse_time_string(start_time, dt_time.min)
+            p += 1
+            event_extra   += f" AND se.event_timestamp::time >= ${p}"
+            session_extra += f" AND s.timestamp::time >= ${p}"
+            params.append(t)
         if end_date:
+            ed = parse_date_format(end_date)
+            et = parse_time_string(end_time, dt_time(23, 59, 59)) if end_time else dt_time(23, 59, 59)
             p += 1
-            event_extra   += f" AND se.event_timestamp <= ${p}::timestamptz"
-            session_extra += f" AND s.timestamp <= ${p}::timestamptz"
-            params.append(end_date)
-        if start_time:
+            event_extra   += f" AND se.event_timestamp <= ${p}"
+            session_extra += f" AND s.timestamp <= ${p}"
+            params.append(datetime.combine(ed, et).replace(tzinfo=_TZ))
+        elif end_time and not start_date:
+            t = parse_time_string(end_time, dt_time(23, 59, 59))
             p += 1
-            event_extra   += f" AND se.event_timestamp::time >= ${p}::time"
-            session_extra += f" AND s.timestamp::time >= ${p}::time"
-            params.append(start_time)
-        if end_time:
-            p += 1
-            event_extra   += f" AND se.event_timestamp::time <= ${p}::time"
-            session_extra += f" AND s.timestamp::time <= ${p}::time"
-            params.append(end_time)
+            event_extra   += f" AND se.event_timestamp::time <= ${p}"
+            session_extra += f" AND s.timestamp::time <= ${p}"
+            params.append(t)
 
         vs_where = " AND ".join(vs_conditions)
         base_params = tuple(params)
