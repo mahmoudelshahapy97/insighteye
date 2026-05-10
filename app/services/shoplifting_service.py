@@ -845,7 +845,7 @@ class ShopliftingService:
 
         query = f"""
             SELECT
-                vs.stream_id,
+                vs.stream_id::text AS stream_id,
                 vs.name        AS camera_name,
                 vs.status,
                 vs.is_streaming,
@@ -853,7 +853,7 @@ class ShopliftingService:
                 vs.building,
                 vs.floor_level,
                 vs.zone,
-                vs.created_at  AS installed_at,
+                vs.created_at::text AS installed_at,
                 COALESCE(obs.observation_count, 0) AS observation_count
             FROM video_stream vs
             LEFT JOIN (
