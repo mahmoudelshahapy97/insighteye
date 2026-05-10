@@ -24,6 +24,8 @@ from app.services.session_service import session_manager
 from app.services.workspace_service import workspace_service
 from app.services.shoplifting_service import shoplifting_service
 from app.services.s3_service import s3_service
+from app.services.user_service import user_manager
+from app.services.database import db_manager
 from app.schemas.shoplifting_schema import (
     ShopliftingEventResponse,
     ShopliftingEventListResponse,
@@ -492,3 +494,84 @@ async def get_operational_efficiency(
     except Exception as e:
         logger.error(f"get_operational_efficiency error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving operational efficiency.")
+
+
+# ─────────────────────────────────────────────
+# Data Management – delete events & videos
+# ─────────────────────────────────────────────
+
+async def _require_admin_or_owner(current_user: Dict) -> tuple:
+    """Return (user_db_info, workspace_id) after verifying admin/owner role."""
+    requesting_user_id = current_user["user_id"]
+    username = current_user["username"]
+
+    user_db_info = await user_manager.get_user_by_id(requesting_user_id)
+    if not user_db_info:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    system_role = user_db_info.get("role")
+    is_system_admin = system_role == "admin"
+
+    workspace_id = await get_workspace_id_for_user(username)
+
+    if not is_system_admin:
+        member = await db_manager.execute_query(
+            "SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2",
+            (requesting_user_id, workspace_id),
+            fetch_one=True,
+        )
+        if not member:
+            raise HTTPException(status_code=403, detail="You are not a member of this workspace.")
+        if member["role"] not in ("admin", "owner"):
+            raise HTTPException(status_code=403, detail="Only workspace admins can delete data.")
+
+    return user_db_info, workspace_id
+
+
+@router.delete("/workspace/delete_data")
+async def delete_shoplifting_data(
+    camera_id: Optional[str]    = Query(None, description="Filter by camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """
+    Delete shoplifting events (and their S3 videos/evidence) matching the given filters.
+    Requires workspace admin/owner or system admin role.
+    """
+    try:
+        _, workspace_id = await _require_admin_or_owner(current_user)
+        result = await shoplifting_service.delete_events(
+            workspace_id=workspace_id, camera_id=camera_id, **f,
+        )
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_shoplifting_data error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error deleting shoplifting data.")
+
+
+@router.delete("/workspace/delete_all_data")
+async def delete_all_shoplifting_data(
+    confirm: bool = Query(False, description="Must be true to confirm deletion of all events"),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """
+    Delete ALL shoplifting events and their S3 videos/evidence for the workspace.
+    Requires workspace admin/owner or system admin role.
+    Requires explicit confirm=true query parameter.
+    """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmation required. Set 'confirm=true' to delete all shoplifting data.",
+        )
+    try:
+        _, workspace_id = await _require_admin_or_owner(current_user)
+        result = await shoplifting_service.delete_all_events(workspace_id=workspace_id)
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_all_shoplifting_data error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error deleting all shoplifting data.")

@@ -1077,4 +1077,161 @@ class ShopliftingService:
             return None
 
 
+    # =========================================================
+    # Delete Events (videos + DB rows)
+    # =========================================================
+
+    async def delete_events(
+        self,
+        workspace_id: UUID,
+        *,
+        camera_id: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        location: Optional[str] = None,
+        building: Optional[str] = None,
+        floor_level: Optional[str] = None,
+        zone: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from app.services.s3_service import s3_service
+
+        needs_join = any([location, building, floor_level, zone])
+        join_clause = "LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id" if needs_join else ""
+
+        conditions, params, _ = self._build_event_conditions(
+            workspace_id,
+            camera_id=camera_id,
+            start_date=start_date, end_date=end_date,
+            start_time=start_time, end_time=end_time,
+            location=location, building=building,
+            floor_level=floor_level, zone=zone,
+        )
+        where = " AND ".join(conditions)
+
+        try:
+            # Step 1: Fetch matching events – collect event_ids, session_ids, evidence_paths
+            fetch_events_query = f"""
+                SELECT se.event_id, se.session_id, se.evidence_paths
+                FROM shoplifting_events se
+                {join_clause}
+                WHERE {where}
+            """
+            rows = await self.db.execute_query(fetch_events_query, tuple(params), fetch_all=True) or []
+
+            if not rows:
+                return {"status": "success", "deleted_events": 0, "deleted_s3_files": 0}
+
+            event_ids = [row["event_id"] for row in rows]
+            session_ids = list({row["session_id"] for row in rows if row.get("session_id")})
+
+            # Collect evidence_paths (images stored on shoplifting_events)
+            s3_paths: List[str] = []
+            for row in rows:
+                if row.get("evidence_paths"):
+                    s3_paths.extend(p for p in row["evidence_paths"] if p)
+
+            # Step 2: Collect ALL image_path + video_path from surveillance_data for those sessions
+            if session_ids:
+                sd_rows = await self.db.execute_query(
+                    """SELECT image_path, video_path FROM surveillance_data
+                       WHERE session_id = ANY($1) AND workspace_id = $2""",
+                    (session_ids, workspace_id),
+                    fetch_all=True,
+                ) or []
+                for row in sd_rows:
+                    if row.get("image_path"):
+                        s3_paths.append(row["image_path"])
+                    if row.get("video_path"):
+                        s3_paths.append(row["video_path"])
+
+                # Delete surveillance_data rows from PostgreSQL
+                await self.db.execute_query(
+                    "DELETE FROM surveillance_data WHERE session_id = ANY($1) AND workspace_id = $2",
+                    (session_ids, workspace_id),
+                )
+
+            # Step 3: Delete shoplifting_events rows (by id – avoids invalid alias/JOIN DELETE syntax)
+            await self.db.execute_query(
+                "DELETE FROM shoplifting_events WHERE event_id = ANY($1)",
+                (event_ids,),
+            )
+
+            # Step 4: Delete unique S3 files
+            unique_paths = list({p for p in s3_paths if p and isinstance(p, str) and p.startswith("s3://")})
+            s3_deleted = await s3_service.delete_files(unique_paths)
+
+            return {
+                "status": "success",
+                "deleted_events": len(event_ids),
+                "deleted_s3_files": s3_deleted,
+            }
+        except Exception as e:
+            logger.error(f"delete_events error: {e}")
+            raise
+
+    async def delete_all_events(self, workspace_id: UUID) -> Dict[str, Any]:
+        from app.services.s3_service import s3_service
+
+        try:
+            # Step 1: Fetch all events for the workspace
+            se_rows = await self.db.execute_query(
+                "SELECT session_id, evidence_paths FROM shoplifting_events WHERE workspace_id = $1",
+                (workspace_id,),
+                fetch_all=True,
+            ) or []
+
+            if not se_rows:
+                return {"status": "success", "deleted_events": 0, "deleted_s3_files": 0}
+
+            deleted_count = len(se_rows)
+            session_ids = list({row["session_id"] for row in se_rows if row.get("session_id")})
+
+            # Collect evidence_paths (images on shoplifting_events)
+            s3_paths: List[str] = []
+            for row in se_rows:
+                if row.get("evidence_paths"):
+                    s3_paths.extend(p for p in row["evidence_paths"] if p)
+
+            # Step 2: Collect ALL image_path + video_path from surveillance_data
+            if session_ids:
+                sd_rows = await self.db.execute_query(
+                    """SELECT image_path, video_path FROM surveillance_data
+                       WHERE session_id = ANY($1) AND workspace_id = $2""",
+                    (session_ids, workspace_id),
+                    fetch_all=True,
+                ) or []
+                for row in sd_rows:
+                    if row.get("image_path"):
+                        s3_paths.append(row["image_path"])
+                    if row.get("video_path"):
+                        s3_paths.append(row["video_path"])
+
+                # Delete surveillance_data rows from PostgreSQL
+                await self.db.execute_query(
+                    "DELETE FROM surveillance_data WHERE session_id = ANY($1) AND workspace_id = $2",
+                    (session_ids, workspace_id),
+                )
+
+            # Step 3: Delete shoplifting_events
+            await self.db.execute_query(
+                "DELETE FROM shoplifting_events WHERE workspace_id = $1",
+                (workspace_id,),
+            )
+
+            # Step 4: Delete unique S3 files
+            unique_paths = list({p for p in s3_paths if p and isinstance(p, str) and p.startswith("s3://")})
+            s3_deleted = await s3_service.delete_files(unique_paths)
+
+            return {
+                "status": "success",
+                "deleted_events": deleted_count,
+                "deleted_s3_files": s3_deleted,
+            }
+        except Exception as e:
+            logger.error(f"delete_all_events error: {e}")
+            raise
+
+
 shoplifting_service = ShopliftingService()

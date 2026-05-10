@@ -2,6 +2,8 @@ import boto3
 import base64
 import uuid
 import logging
+from collections import defaultdict
+from typing import List
 from botocore.exceptions import ClientError
 from app.config.settings import config
 import asyncio
@@ -96,6 +98,36 @@ class S3Service:
         except Exception as e:
             logger.error(f"Failed to generate presigned URL: {e}")
             return s3_uri
+
+    async def delete_files(self, s3_uris: List[str]) -> int:
+        """Delete multiple S3 objects by URI. Returns the count of successfully deleted objects."""
+        if not self.s3_client or not s3_uris:
+            return 0
+
+        bucket_keys: dict = defaultdict(list)
+        for uri in s3_uris:
+            if uri and isinstance(uri, str) and uri.startswith("s3://"):
+                parts = uri.replace("s3://", "").split("/", 1)
+                if len(parts) == 2:
+                    bucket, key = parts
+                    bucket_keys[bucket].append(key)
+
+        total_deleted = 0
+        for bucket, keys in bucket_keys.items():
+            for i in range(0, len(keys), 1000):
+                batch = keys[i : i + 1000]
+                try:
+                    def do_delete(b=bucket, k=batch):
+                        return self.s3_client.delete_objects(
+                            Bucket=b,
+                            Delete={"Objects": [{"Key": key} for key in k]},
+                        )
+                    result = await asyncio.to_thread(do_delete)
+                    total_deleted += len(result.get("Deleted", []))
+                except Exception as e:
+                    logger.error(f"Failed to delete S3 batch from {bucket}: {e}")
+
+        return total_deleted
 
     async def get_image_data(self, s3_uri: str) -> bytes:
         if not self.s3_client or not s3_uri.startswith('s3://'):
