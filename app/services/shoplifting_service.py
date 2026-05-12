@@ -1059,30 +1059,25 @@ class ShopliftingService:
         Skips insert if an 'detected' event for this stream already exists
         within the last 5 minutes (mirrors the trigger's dedup logic).
         """
-        check_query = """
-            SELECT 1 FROM shoplifting_events
-            WHERE stream_id = $1
-              AND workspace_id = $2
-              AND status = 'detected'
-              AND event_timestamp > NOW() - INTERVAL '5 minutes'
-            LIMIT 1
-        """
-        insert_query = """
+        upsert_query = """
             INSERT INTO shoplifting_events (
                 stream_id, workspace_id,
                 event_timestamp, detection_method, severity, status, description
-            ) VALUES ($1, $2, NOW(), 'ml_model', 'medium', 'detected', $3)
+            )
+            SELECT $1, $2, NOW(), 'ml_model', 'medium', 'detected', $3
+            WHERE NOT EXISTS (
+                SELECT 1 FROM shoplifting_events
+                WHERE stream_id = $1
+                  AND workspace_id = $2
+                  AND status = 'detected'
+                  AND event_timestamp > NOW() - INTERVAL '5 minutes'
+            )
             RETURNING event_id
         """
         try:
-            existing = await self.db.execute_query(
-                check_query, (stream_id, workspace_id), fetch_one=True
-            )
-            if existing:
-                return None
             desc = f"Auto-created by stream pipeline. confidence={confidence:.2f}" if confidence else "Auto-created by stream pipeline."
             result = await self.db.execute_query(
-                insert_query, (stream_id, workspace_id, desc), fetch_one=True
+                upsert_query, (stream_id, workspace_id, desc), fetch_one=True
             )
             return result.get("event_id") if result else None
         except Exception as e:

@@ -131,7 +131,7 @@ class StreamAwareInferenceEngine:
 
         self.num_frames = config.shoplifting_num_frames
         self.conf_thresh = config.shoplifting_confidence
-        self.smooth_window = 10
+        self.smooth_window = 3
         self.class_names = ["Normal", "Shoplifting"]
         self.device = "cuda" if torch.cuda.is_available() and config.model_device == "cuda" else "cpu"
 
@@ -174,6 +174,7 @@ class StreamAwareInferenceEngine:
 
     @torch.no_grad()
     def _predict_buffer(self, stream_id: str):
+        """Returns (cls, shop_prob) or (None, None) if buffer not full."""
         buf = self.buffers.get(stream_id)
         if buf is None or len(buf) < self.num_frames:
             return None, None
@@ -186,11 +187,11 @@ class StreamAwareInferenceEngine:
         x   = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)  # (1, T, 17, 12)
         x   = x.to(self.device)
 
-        logits = self.classifier(x)                   # (1, num_classes)
-        probs  = F.softmax(logits, dim=1)[0]
-        cls    = probs.argmax().item()
-        conf   = probs[cls].item()
-        return cls, conf
+        logits    = self.classifier(x)                    # (1, num_classes)
+        probs     = F.softmax(logits, dim=1)[0]
+        cls       = probs.argmax().item()
+        shop_prob = float(probs[1])                       # always the Shoplifting class probability
+        return cls, shop_prob
 
     def process_frame(self, stream_id: str, frame: np.ndarray):
         """
@@ -213,19 +214,18 @@ class StreamAwareInferenceEngine:
         feat = self.extractor.extract(stream_id, frame)
         self.buffers[stream_id].append(feat)
 
-        cls, conf = self._predict_buffer(stream_id)
+        cls, shop_prob = self._predict_buffer(stream_id)
 
         if cls is None:
             return "Buffering...", 0.0, False
 
-        self.pred_hists[stream_id].append(cls)
-        # majority vote
-        hist = list(self.pred_hists[stream_id])
-        smoothed_cls = max(set(hist), key=hist.count)
-        
-        label = self.class_names[smoothed_cls]
-        alert = (smoothed_cls == 1) and (conf >= self.conf_thresh)
-        return label, conf, alert
+        # Store Shoplifting probabilities (not just class labels) for averaging
+        self.pred_hists[stream_id].append(shop_prob)
+        smoothed_prob = sum(self.pred_hists[stream_id]) / len(self.pred_hists[stream_id])
+
+        label = "Shoplifting" if smoothed_prob >= self.conf_thresh else "Normal"
+        alert = smoothed_prob >= self.conf_thresh
+        return label, smoothed_prob, alert
 
     def get_status(self) -> bool:
         return True  # Always return True so we can bypass loading and test simulated alerts

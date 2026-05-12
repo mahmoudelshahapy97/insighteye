@@ -33,6 +33,12 @@ from app.services.people_count_service import people_count_service
 
 logger = logging.getLogger(__name__)
 
+
+def _log_shoplifting_task_exception(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Shoplifting video save task failed", exc_info=task.exception())
+
+
 # ThreadPoolExecutor for CPU-bound tasks
 thread_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=min(32, (os.cpu_count() or 1) * 2 + 4)
@@ -114,12 +120,12 @@ class StreamProcessingService:
             
             from app.services.shoplifting_inference import shoplifting_engine
             self.shoplifting_engine = shoplifting_engine
-            
+
             # Load models immediately to fail fast if there's an issue
             self.people_model.load_model()
             self.gender_model.load_model()
             self.fire_model.load_model()
-            self.shoplifting_engine.load_models()
+            # Shoplifting engine loaded lazily in the stream loop after logging is set up
             
             logger.info(f"✅ Models initialized successfully using {backend}")
         except Exception as e:
@@ -263,34 +269,11 @@ class StreamProcessingService:
                 except Exception as e:
                     logger.error(f"Fire detection error for stream {stream_id_str}: {e}")
 
-            # Shoplifting detection (temporal sequence sliding window)
-            # We run it on all frames available to keep the buffer flowing smoothly
+            # Shoplifting detection is handled in the stream loop at its own frame rate,
+            # independent of the main detection gate. Always return neutral values here.
             is_shoplifting = False
             shoplifting_conf = 0.0
             shoplifting_objects = []
-            
-            if self.shoplifting_engine and self.shoplifting_engine.get_status():
-                try:
-                    # Stream ID dictates the buffer to which the frame's features are added
-                    label, conf, alert = self.shoplifting_engine.process_frame(stream_id_str, input_frame)
-                    
-                    if label != "Buffering...":
-                        if alert:
-                            is_shoplifting = True
-                            shoplifting_conf = conf
-                            logger.info(f"🚨 Shoplifting detected on stream {stream_id_str} with {conf:.2f} conf")
-                            
-                            cv2.putText(input_frame, f"Shoplifting (Temp): {conf:.2f}", (10, input_frame.shape[0] - 20), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                        else:
-                            cv2.putText(input_frame, f"State: {label}", (10, input_frame.shape[0] - 20), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    else:
-                        cv2.putText(input_frame, f"State: Buffering...", (10, input_frame.shape[0] - 20), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                        
-                except Exception as e:
-                    logger.error(f"Shoplifting detection error for stream {stream_id_str}: {e}")
 
             # Use cached results
             male_count = cache['male_count']
@@ -1070,10 +1053,11 @@ class StreamProcessingService:
 
         frame_count = 0
         frames_since_last_save = 0
-        
+
         from collections import deque
-        video_buffer = deque(maxlen=120)
-        frames_since_last_shoplifting_save = 999
+        video_buffer = deque(maxlen=300)   # ~10 s at 30 fps
+        last_shoplifting_save_time = None  # time-based dedup — save at most once per 5 min
+        shoplifting_engine_load_attempted = False  # throttle: only retry once per stream session
 
         last_db_update_activity = datetime.now(ZoneInfo("Africa/Cairo"))
         last_heartbeat = datetime.now(ZoneInfo("Africa/Cairo"))
@@ -1164,7 +1148,7 @@ class StreamProcessingService:
                             
                     frame_count += 1
                     frames_since_last_save += 1
-                    frames_since_last_shoplifting_save += 1
+                    # (no per-frame shoplifting counter needed — dedup is time-based now)
                     
                     # Buffer resized frame to save memory
                     small_frame = cv2.resize(frame, (640, 480))
@@ -1193,9 +1177,153 @@ class StreamProcessingService:
                             except Exception as batch_err:
                                 logger.error(f"Error queuing status update: {batch_err}")
 
+                    # ===== SHOPLIFTING DETECTION (independent rate, never gated by frame_skip) =====
+                    # Feeds one frame every (frame_skip // 30) video frames so the 120-frame
+                    # temporal buffer fills in ~120 * (frame_skip // 30) video frames.
+                    is_shoplifting = False
+                    shoplifting_conf = 0.0
+                    shoplifting_objects = []
+                    shoplifting_frame_rate = max(1, frame_skip // 30)
+                    if frame_count % shoplifting_frame_rate == 0 and self.shoplifting_engine:
+                        engine = self.shoplifting_engine
+                        # Lazy-load: if startup load failed, retry once in a background thread
+                        if not engine.is_loaded and not shoplifting_engine_load_attempted:
+                            shoplifting_engine_load_attempted = True
+                            logger.warning(f"[shoplifting] engine not loaded for {stream_id_str[:8]}, retrying load_models() in thread")
+                            try:
+                                await loop.run_in_executor(thread_pool, engine.load_models)
+                                logger.info(f"[shoplifting] lazy-load result: is_loaded={engine.is_loaded}")
+                            except Exception as _le:
+                                logger.error(f"[shoplifting] lazy load_models failed: {_le}")
+                        # Log engine state every 300 shoplifting frames for diagnostics
+                        shoplifting_tick = frame_count // shoplifting_frame_rate
+                        if shoplifting_tick % 300 == 0:
+                            buf_len = len(engine.buffers.get(stream_id_str, []))
+                            logger.info(
+                                f"[shoplifting] stream={stream_id_str[:8]} "
+                                f"is_loaded={engine.is_loaded} "
+                                f"buf={buf_len}/{engine.num_frames} "
+                                f"tick={shoplifting_tick}"
+                            )
+                        try:
+                            shop_label, shop_conf, shop_alert = await loop.run_in_executor(
+                                thread_pool,
+                                engine.process_frame,
+                                stream_id_str,
+                                small_frame,
+                            )
+                            if shop_label not in ("Buffering...", "Disabled"):
+                                if shop_alert:
+                                    logger.info(f"🚨 Shoplifting detected on stream {stream_id_str} with {shop_conf:.2f} conf")
+                                is_shoplifting = shop_alert
+                                shoplifting_conf = shop_conf if shop_alert else 0.0
+                        except Exception as e:
+                            logger.error(f"Shoplifting detection error for stream {stream_id_str}: {e}")
+
+                    # ---------- Shoplifting Event DB Insertion ----------
+                    # Save at most once per 5 minutes per stream (matches DB dedup window)
+                    _shoplifting_cooldown_ok = (
+                        last_shoplifting_save_time is None
+                        or (current_time - last_shoplifting_save_time).total_seconds() >= 300
+                    )
+                    if is_shoplifting and _shoplifting_cooldown_ok:
+                        from app.services.s3_service import s3_service
+                        from app.services.shoplifting_service import shoplifting_service
+
+                        try:
+                            shoplifting_frames = list(video_buffer)
+
+                            current_incident = self._active_incidents.get(stream_id_str)
+                            if current_incident and (current_time - current_incident['last_detected']).total_seconds() < 300:
+                                incident_session_id = current_incident['session_id']
+                                current_incident['last_detected'] = current_time
+                            else:
+                                incident_session_id = uuid.uuid4()
+                                self._active_incidents[stream_id_str] = {
+                                    'session_id': incident_session_id,
+                                    'last_detected': current_time
+                                }
+
+                            async def save_shoplifting_video(frames, s_id, w_id, u_id, conf, objs, session_uuid):
+                                if not frames:
+                                    return
+
+                                try:
+                                    temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
+
+                                    def write_video():
+                                        out = None
+                                        try:
+                                            h, w = frames[0].shape[:2]
+                                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                            out = cv2.VideoWriter(temp_path, fourcc, 10.0, (w, h))
+                                            for f in frames:
+                                                out.write(f)
+                                            return True
+                                        except Exception as e:
+                                            logger.error(f"Error writing video: {e}")
+                                            return False
+                                        finally:
+                                            if out is not None:
+                                                out.release()
+
+                                    success = await asyncio.to_thread(write_video)
+                                    if not success:
+                                        try:
+                                            if os.path.exists(temp_path):
+                                                os.remove(temp_path)
+                                        except Exception:
+                                            pass
+                                        return
+
+                                    s3_path = await s3_service.upload_video_file_to_s3(temp_path)
+
+                                    try:
+                                        if os.path.exists(temp_path):
+                                            os.remove(temp_path)
+                                    except Exception:
+                                        pass
+
+                                    if s3_path:
+                                        await shoplifting_service.insert_surveillance_frame(
+                                            session_id=session_uuid,
+                                            stream_id=s_id,
+                                            workspace_id=w_id,
+                                            user_id=u_id,
+                                            is_shoplifting=True,
+                                            behavior_state="suspicious",
+                                            behavior_category="shoplifting",
+                                            confidence=float(conf),
+                                            objects_detected=objs,
+                                            video_path=s3_path,
+                                        )
+                                        await shoplifting_service.insert_shoplifting_event(
+                                            stream_id=s_id,
+                                            workspace_id=w_id,
+                                            confidence=float(conf),
+                                            video_path=s3_path,
+                                        )
+                                        logger.info(f"✅ Saved shoplifting video to {s3_path}")
+                                except Exception:
+                                    logger.error(
+                                        f"Unhandled exception in save_shoplifting_video for stream {s_id}",
+                                        exc_info=True,
+                                    )
+
+                            _save_task = asyncio.create_task(save_shoplifting_video(
+                                shoplifting_frames, stream_id, workspace_id, owner_id,
+                                shoplifting_conf, shoplifting_objects, incident_session_id
+                            ))
+                            _save_task.add_done_callback(_log_shoplifting_task_exception)
+
+                            last_shoplifting_save_time = current_time
+
+                        except Exception as e:
+                            logger.error(f"Error triggering shoplifting video save for stream {stream_id_str}: {e}")
+
                     # ===== DETECTION GATE =====
                     run_detection = (frame_count % frame_skip == 0)
-                    
+
                     # Skip frame if not running detection
                     if not run_detection:
                         await asyncio.sleep(frame_delay_target)
@@ -1272,96 +1400,6 @@ class StreamProcessingService:
                         except Exception as save_err:
                             logger.error(f"Error saving detection: {save_err}")
                             # ✅ Don't crash, just log and continue
-
-                    # ---------- Shoplifting Event DB Insertion ----------
-                    if is_shoplifting and frames_since_last_shoplifting_save > 120:
-                        from app.services.s3_service import s3_service
-                        from app.services.shoplifting_service import shoplifting_service
-                        
-                        try:
-                            # 1. Take a snapshot of the buffer
-                            shoplifting_frames = list(video_buffer)
-                            
-                            # Retrieve or create active incident session
-                            current_incident = self._active_incidents.get(stream_id_str)
-                            if current_incident and (current_time - current_incident['last_detected']).total_seconds() < 300:
-                                incident_session_id = current_incident['session_id']
-                                current_incident['last_detected'] = current_time
-                            else:
-                                incident_session_id = uuid.uuid4()
-                                self._active_incidents[stream_id_str] = {
-                                    'session_id': incident_session_id,
-                                    'last_detected': current_time
-                                }
-
-                            async def save_shoplifting_video(frames, s_id, w_id, u_id, conf, objs, session_uuid):
-                                if not frames: return
-
-                                # Setup temp file
-                                temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
-
-                                def write_video():
-                                    try:
-                                        h, w = frames[0].shape[:2]
-                                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                                        out = cv2.VideoWriter(temp_path, fourcc, 10.0, (w, h))
-                                        for f in frames:
-                                            out.write(f)
-                                        out.release()
-                                        return True
-                                    except Exception as e:
-                                        logger.error(f"Error writing video: {e}")
-                                        return False
-
-                                success = await asyncio.to_thread(write_video)
-                                if not success: return
-
-                                # Upload video to S3
-                                s3_path = await s3_service.upload_video_file_to_s3(temp_path)
-
-                                # Cleanup temp file
-                                try:
-                                    if os.path.exists(temp_path):
-                                        os.remove(temp_path)
-                                except Exception:
-                                    pass
-
-                                if s3_path:
-                                    # Save surveillance frame — session_id=None avoids FK violation
-                                    # since incident_session_id is not a real sessions table entry.
-                                    await shoplifting_service.insert_surveillance_frame(
-                                        session_id=None,
-                                        stream_id=s_id,
-                                        workspace_id=w_id,
-                                        user_id=u_id,
-                                        is_shoplifting=True,
-                                        behavior_state="suspicious",
-                                        behavior_category="shoplifting",
-                                        confidence=float(conf),
-                                        objects_detected=objs,
-                                        video_path=s3_path,
-                                    )
-                                    # Also insert directly into shoplifting_events so the
-                                    # incidents/videos endpoint returns results regardless of
-                                    # whether the DB trigger is present.
-                                    await shoplifting_service.insert_shoplifting_event(
-                                        stream_id=s_id,
-                                        workspace_id=w_id,
-                                        confidence=float(conf),
-                                        video_path=s3_path,
-                                    )
-                                    logger.info(f"✅ Saved shoplifting video to {s3_path}")
-                                    
-                            # Create task so it doesn't block stream processing
-                            asyncio.create_task(save_shoplifting_video(
-                                shoplifting_frames, stream_id, workspace_id, owner_id, 
-                                shoplifting_conf, shoplifting_objects, incident_session_id
-                            ))
-                            
-                            frames_since_last_shoplifting_save = 0
-                            
-                        except Exception as e:
-                            logger.error(f"Error triggering shoplifting video save for stream {stream_id_str}: {e}")
 
                     # ---------- ALERTS (with error isolation) ----------
                     try:
