@@ -14,6 +14,7 @@ Page 3 – Camera / Ops     : /dashboard/camera-health, /dashboard/real-time-act
 """
 
 import logging
+from datetime import datetime, date
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
@@ -78,6 +79,17 @@ async def enrich_event(event: dict) -> dict:
     if event.get("video_path") and str(event["video_path"]).startswith("s3://"):
         event["video_path"] = await s3_service.get_presigned_url(event["video_path"])
     return event
+
+
+def _to_json_safe(obj):
+    """Recursively convert datetime/date objects to ISO-format strings."""
+    if isinstance(obj, dict):
+        return {k: _to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_json_safe(i) for i in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return obj
 
 
 # Shared filter dependency – same 8 params on every filterable endpoint
@@ -226,7 +238,7 @@ async def get_incident_videos(
         )
         for v in videos:
             await enrich_event(v)
-        return JSONResponse(content={"items": videos, "page": page, "limit": limit})
+        return JSONResponse(content=_to_json_safe({"items": videos, "page": page, "limit": limit}))
     except HTTPException:
         raise
     except Exception as e:
@@ -245,7 +257,7 @@ async def get_behavior_sequences(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_behavior_sequences(workspace_id=workspace_id, **f))
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_behavior_sequences(workspace_id=workspace_id, **f)))
     except HTTPException:
         raise
     except Exception as e:
@@ -267,7 +279,7 @@ async def get_confidence_audit(
         data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
         for ev in data.get("confidence_per_event", []):
             await enrich_event(ev)
-        return JSONResponse(content=data)
+        return JSONResponse(content=_to_json_safe(data))
     except HTTPException:
         raise
     except Exception as e:
@@ -311,7 +323,7 @@ async def get_executive_summary(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_executive_summary(workspace_id=workspace_id, **f))
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_executive_summary(workspace_id=workspace_id, **f)))
     except HTTPException:
         raise
     except Exception as e:
@@ -332,7 +344,7 @@ async def get_hotspots(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_hotspots(workspace_id=workspace_id, **f))
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_hotspots(workspace_id=workspace_id, **f)))
     except HTTPException:
         raise
     except Exception as e:
@@ -353,7 +365,7 @@ async def get_high_value_analysis(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_high_value_analysis(workspace_id=workspace_id, **f))
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_high_value_analysis(workspace_id=workspace_id, **f)))
     except HTTPException:
         raise
     except Exception as e:
@@ -374,7 +386,7 @@ async def get_session_insights(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_session_insights(workspace_id=workspace_id, **f))
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_session_insights(workspace_id=workspace_id, **f)))
     except HTTPException:
         raise
     except Exception as e:
@@ -398,7 +410,7 @@ async def get_model_accuracy(
         data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
         for ev in data.get("confidence_per_event", []):
             await enrich_event(ev)
-        return JSONResponse(content=data)
+        return JSONResponse(content=_to_json_safe(data))
     except HTTPException:
         raise
     except Exception as e:
@@ -419,7 +431,7 @@ async def get_regional_risk(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_regional_risk(workspace_id=workspace_id, **f))
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_regional_risk(workspace_id=workspace_id, **f)))
     except HTTPException:
         raise
     except Exception as e:
@@ -445,9 +457,9 @@ async def get_camera_health(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_camera_health(
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_camera_health(
             workspace_id=workspace_id, camera_name=camera_name, **f,
-        ))
+        )))
     except HTTPException:
         raise
     except Exception as e:
@@ -466,7 +478,7 @@ async def get_realtime_activity(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_realtime_activity(workspace_id=workspace_id))
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_realtime_activity(workspace_id=workspace_id)))
     except HTTPException:
         raise
     except Exception as e:
@@ -488,7 +500,7 @@ async def get_operational_efficiency(
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        return JSONResponse(content=await shoplifting_service.get_operational_efficiency(workspace_id=workspace_id, **f))
+        return JSONResponse(content=_to_json_safe(await shoplifting_service.get_operational_efficiency(workspace_id=workspace_id, **f)))
     except HTTPException:
         raise
     except Exception as e:

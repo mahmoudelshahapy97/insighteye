@@ -212,8 +212,10 @@ class ShopliftingService:
             LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
             LEFT JOIN LATERAL (
                 SELECT video_path FROM surveillance_data
-                WHERE session_id = se.session_id AND video_path IS NOT NULL
-                ORDER BY timestamp DESC LIMIT 1
+                WHERE stream_id = se.stream_id AND video_path IS NOT NULL
+                  AND ABS(EXTRACT(EPOCH FROM (timestamp - se.event_timestamp))) < 600
+                ORDER BY ABS(EXTRACT(EPOCH FROM (timestamp - se.event_timestamp)))
+                LIMIT 1
             ) sd ON TRUE
             WHERE {where}
             ORDER BY se.event_timestamp DESC
@@ -496,8 +498,10 @@ class ShopliftingService:
             LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
             LEFT JOIN LATERAL (
                 SELECT video_path FROM surveillance_data
-                WHERE session_id = se.session_id AND video_path IS NOT NULL
-                ORDER BY timestamp DESC LIMIT 1
+                WHERE stream_id = se.stream_id AND video_path IS NOT NULL
+                  AND ABS(EXTRACT(EPOCH FROM (timestamp - se.event_timestamp))) < 600
+                ORDER BY ABS(EXTRACT(EPOCH FROM (timestamp - se.event_timestamp)))
+                LIMIT 1
             ) sd ON TRUE
             WHERE {where}
             ORDER BY se.event_timestamp DESC
@@ -1040,6 +1044,50 @@ class ShopliftingService:
     # =========================================================
     # Insert helpers (used by stream pipeline)
     # =========================================================
+
+    async def insert_shoplifting_event(
+        self,
+        stream_id: UUID,
+        workspace_id: UUID,
+        confidence: Optional[float] = None,
+        video_path: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Directly insert a detected shoplifting event into shoplifting_events.
+        Used as a fallback alongside the DB trigger so the incidents endpoint
+        always returns results.
+        Skips insert if an 'detected' event for this stream already exists
+        within the last 5 minutes (mirrors the trigger's dedup logic).
+        """
+        check_query = """
+            SELECT 1 FROM shoplifting_events
+            WHERE stream_id = $1
+              AND workspace_id = $2
+              AND status = 'detected'
+              AND event_timestamp > NOW() - INTERVAL '5 minutes'
+            LIMIT 1
+        """
+        insert_query = """
+            INSERT INTO shoplifting_events (
+                stream_id, workspace_id,
+                event_timestamp, detection_method, severity, status, description
+            ) VALUES ($1, $2, NOW(), 'ml_model', 'medium', 'detected', $3)
+            RETURNING event_id
+        """
+        try:
+            existing = await self.db.execute_query(
+                check_query, (stream_id, workspace_id), fetch_one=True
+            )
+            if existing:
+                return None
+            desc = f"Auto-created by stream pipeline. confidence={confidence:.2f}" if confidence else "Auto-created by stream pipeline."
+            result = await self.db.execute_query(
+                insert_query, (stream_id, workspace_id, desc), fetch_one=True
+            )
+            return result.get("event_id") if result else None
+        except Exception as e:
+            logger.error(f"insert_shoplifting_event error: {e}")
+            return None
 
     async def insert_surveillance_frame(
         self,

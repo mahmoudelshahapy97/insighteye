@@ -57,7 +57,9 @@ def load_classifier() -> ShopliftingClassifier:
     
     model = ShopliftingClassifier(T=T, V=V, C=C, num_classes=num_classes)
     
-    classifier_path = config.shoplifting_model_path
+    # The shoplifting classifier is always a custom PyTorch model loaded via torch.load(),
+    # so always use the .pt path regardless of the global MODEL_BACKEND setting.
+    classifier_path = config.pt_shoplifting_model_path
     if not os.path.exists(classifier_path):
         logger.warning(f"⚠️ Shoplifting classifier weights not found at {classifier_path}. Returning uninitialized model.")
         return model

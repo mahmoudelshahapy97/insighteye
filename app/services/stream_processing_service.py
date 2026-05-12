@@ -1293,13 +1293,13 @@ class StreamProcessingService:
                                     'session_id': incident_session_id,
                                     'last_detected': current_time
                                 }
-                            
+
                             async def save_shoplifting_video(frames, s_id, w_id, u_id, conf, objs, session_uuid):
                                 if not frames: return
-                                
+
                                 # Setup temp file
                                 temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
-                                
+
                                 def write_video():
                                     try:
                                         h, w = frames[0].shape[:2]
@@ -1312,24 +1312,25 @@ class StreamProcessingService:
                                     except Exception as e:
                                         logger.error(f"Error writing video: {e}")
                                         return False
-                                        
+
                                 success = await asyncio.to_thread(write_video)
                                 if not success: return
-                                
+
                                 # Upload video to S3
                                 s3_path = await s3_service.upload_video_file_to_s3(temp_path)
-                                
+
                                 # Cleanup temp file
                                 try:
                                     if os.path.exists(temp_path):
                                         os.remove(temp_path)
                                 except Exception:
                                     pass
-                                    
+
                                 if s3_path:
-                                    # Save to DB
+                                    # Save surveillance frame — session_id=None avoids FK violation
+                                    # since incident_session_id is not a real sessions table entry.
                                     await shoplifting_service.insert_surveillance_frame(
-                                        session_id=session_uuid,
+                                        session_id=None,
                                         stream_id=s_id,
                                         workspace_id=w_id,
                                         user_id=u_id,
@@ -1338,7 +1339,16 @@ class StreamProcessingService:
                                         behavior_category="shoplifting",
                                         confidence=float(conf),
                                         objects_detected=objs,
-                                        video_path=s3_path   # Save video S3 path correctly
+                                        video_path=s3_path,
+                                    )
+                                    # Also insert directly into shoplifting_events so the
+                                    # incidents/videos endpoint returns results regardless of
+                                    # whether the DB trigger is present.
+                                    await shoplifting_service.insert_shoplifting_event(
+                                        stream_id=s_id,
+                                        workspace_id=w_id,
+                                        confidence=float(conf),
+                                        video_path=s3_path,
                                     )
                                     logger.info(f"✅ Saved shoplifting video to {s3_path}")
                                     
