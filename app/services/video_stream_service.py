@@ -27,29 +27,48 @@ class VideoStreamService:
         return await self.db_manager.execute_query(query, (stream_id,), fetch_one=True)
 
     async def get_workspace_streams(
-        self, 
-        workspace_id: UUID, 
+        self,
+        workspace_id: UUID,
         status: Optional[str] = None,
-        stream_type: Optional[str] = None
+        stream_type: Optional[str] = None,
+        location: Optional[str] = None,
+        building: Optional[str] = None,
+        floor_level: Optional[str] = None,
+        zone: Optional[str] = None,
+        search: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Get all video streams for a workspace with optional filters."""
         base_query = "SELECT * FROM video_stream WHERE workspace_id = $1"
         params = [workspace_id]
         conditions = []
-        
+
         if status:
             conditions.append(f"status = ${len(params) + 1}")
             params.append(status)
-        
         if stream_type:
             conditions.append(f"type = ${len(params) + 1}")
             params.append(stream_type)
-        
+        if location:
+            conditions.append(f"location = ${len(params) + 1}")
+            params.append(location)
+        if building:
+            conditions.append(f"building = ${len(params) + 1}")
+            params.append(building)
+        if floor_level:
+            conditions.append(f"floor_level = ${len(params) + 1}")
+            params.append(floor_level)
+        if zone:
+            conditions.append(f"zone = ${len(params) + 1}")
+            params.append(zone)
+        if search:
+            conditions.append(f"name ILIKE ${len(params) + 1}")
+            params.append(f"%{search}%")
+
         if conditions:
             base_query += " AND " + " AND ".join(conditions)
-        
+
         base_query += " ORDER BY created_at DESC"
-        
+
         return await self.db_manager.execute_query(base_query, tuple(params), fetch_all=True)
 
     async def get_user_streams(

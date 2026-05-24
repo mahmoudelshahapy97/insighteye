@@ -4,6 +4,7 @@ import uuid
 import logging
 from collections import defaultdict
 from typing import List
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from app.config.settings import config
 import asyncio
@@ -21,8 +22,30 @@ class S3Service:
                 's3',
                 aws_access_key_id=config.aws_access_key_id,
                 aws_secret_access_key=config.aws_secret_access_key,
-                region_name=config.aws_region
+                region_name=config.aws_region,
+                config=Config(
+                    signature_version='s3v4',
+                    s3={'addressing_style': 'virtual'},
+                ),
             )
+            self._ensure_cors()
+
+    def _ensure_cors(self):
+        try:
+            self.s3_client.put_bucket_cors(
+                Bucket=config.s3_bucket_name,
+                CORSConfiguration={
+                    'CORSRules': [{
+                        'AllowedOrigins': ['*'],
+                        'AllowedMethods': ['GET', 'HEAD'],
+                        'AllowedHeaders': ['*'],
+                        'MaxAgeSeconds': 3600,
+                    }]
+                }
+            )
+            logger.info(f"S3 CORS configured for bucket: {config.s3_bucket_name}")
+        except Exception as e:
+            logger.warning(f"Could not configure S3 CORS: {e}")
 
     async def upload_image_base64_to_s3(self, base64_image: str, filename: str = None) -> str:
         if not self.s3_client:

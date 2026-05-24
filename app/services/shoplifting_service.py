@@ -200,7 +200,7 @@ class ShopliftingService:
                 se.action_taken,
                 se.description,
                 se.evidence_paths,
-                sd.video_path,
+                COALESCE(se.video_path, sd.video_path) AS video_path,
                 se.resolved_at,
                 se.detection_method,
                 vs.name        AS camera_name,
@@ -267,7 +267,16 @@ class ShopliftingService:
         action_taken: Optional[str] = None,
         description: Optional[str] = None,
     ) -> bool:
-        query = "SELECT resolve_shoplifting_event($1, $2, $3, $4)"
+        query = """
+            UPDATE shoplifting_events
+            SET status       = $2::varchar,
+                action_taken = COALESCE($3::varchar, action_taken),
+                description  = COALESCE($4::text, description),
+                resolved_at  = CASE WHEN $2::varchar IN ('confirmed', 'dismissed', 'resolved')
+                                    THEN NOW() ELSE resolved_at END,
+                updated_at   = NOW()
+            WHERE event_id = $1
+        """
         try:
             await self.db.execute_query(query, (event_id, status, action_taken, description))
             return True
@@ -276,7 +285,7 @@ class ShopliftingService:
             raise
 
     async def get_active_dashboard(self, workspace_id: UUID) -> List[Dict[str, Any]]:
-        query = "SELECT * FROM v_active_shoplifting_events WHERE workspace_id = $1"
+        query = "SELECT * FROM v_active_shoplifting_events WHERE workspace_id = $1 ORDER BY event_timestamp DESC LIMIT 100"
         try:
             rows = await self.db.execute_query(query, (workspace_id,), fetch_all=True)
             return rows or []
@@ -475,7 +484,7 @@ class ShopliftingService:
         zone: Optional[str] = None,
         limit: int = 10,
         offset: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         conditions, params, p = self._build_event_conditions(
             workspace_id, camera_id=camera_id,
             start_date=start_date, end_date=end_date,
@@ -484,13 +493,14 @@ class ShopliftingService:
             floor_level=floor_level, zone=zone,
         )
         where = " AND ".join(conditions)
+        filter_params = tuple(params)
         p += 1; params.append(limit)
         p += 1; params.append(offset)
 
         query = f"""
             SELECT
                 se.event_id, se.event_timestamp, se.severity, se.status,
-                se.evidence_paths, sd.video_path,
+                se.evidence_paths, COALESCE(se.video_path, sd.video_path) AS video_path,
                 vs.name       AS camera_name,
                 vs.zone, vs.building, vs.floor_level,
                 vs.location   AS camera_location
@@ -507,9 +517,16 @@ class ShopliftingService:
             ORDER BY se.event_timestamp DESC
             LIMIT ${p-1} OFFSET ${p}
         """
+        q_count = f"""
+            SELECT COUNT(*) AS total
+            FROM shoplifting_events se
+            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            WHERE {where}
+        """
         try:
             rows = await self.db.execute_query(query, tuple(params), fetch_all=True)
-            return rows or []
+            count_row = await self.db.execute_query(q_count, filter_params, fetch_one=True)
+            return {"items": rows or [], "total": count_row["total"] if count_row else 0}
         except Exception as e:
             logger.error(f"get_incident_videos error: {e}")
             raise
@@ -596,14 +613,21 @@ class ShopliftingService:
 
         q_per_event = f"""
             SELECT
-                se.event_id, se.event_timestamp, se.status, se.evidence_paths,
-                AVG(sd.detection_confidence)::float AS avg_confidence,
+                se.event_id,
+                TO_CHAR(se.event_timestamp AT TIME ZONE 'UTC', 'MM/DD HH24:MI') AS event_label,
+                se.event_timestamp, se.status, se.evidence_paths,
+                COALESCE(sd.avg_confidence, 0.0)::float AS avg_confidence,
                 vs.name AS camera_name
             FROM shoplifting_events se
             LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
-            LEFT JOIN surveillance_data sd ON sd.session_id = se.session_id
+            LEFT JOIN LATERAL (
+                SELECT AVG(detection_confidence)::float AS avg_confidence
+                FROM surveillance_data
+                WHERE stream_id = se.stream_id
+                  AND detection_confidence IS NOT NULL
+                  AND ABS(EXTRACT(EPOCH FROM (timestamp - se.event_timestamp))) < 600
+            ) sd ON TRUE
             WHERE {ev_where}
-            GROUP BY se.event_id, se.event_timestamp, se.status, se.evidence_paths, vs.name
             ORDER BY se.event_timestamp DESC
             LIMIT 200
         """
@@ -743,23 +767,39 @@ class ShopliftingService:
 
         q_items = f"""
             SELECT
-                item, vs.zone, vs.name AS camera_name,
+                COALESCE(i.item, COALESCE(vs.zone, 'Unknown Zone')) AS item,
+                vs.zone, vs.name AS camera_name,
                 DATE(se.event_timestamp)::text AS date,
                 COUNT(*) AS item_count
             FROM shoplifting_events se
-            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id,
-            UNNEST(se.items_stolen) AS item
+            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            LEFT JOIN LATERAL (
+                SELECT UNNEST(se.items_stolen) AS item
+                WHERE se.items_stolen IS NOT NULL AND cardinality(se.items_stolen) > 0
+            ) i ON TRUE
             WHERE {where}
-            GROUP BY item, vs.zone, vs.name, DATE(se.event_timestamp)
+            GROUP BY COALESCE(i.item, COALESCE(vs.zone, 'Unknown Zone')), vs.zone, vs.name, DATE(se.event_timestamp)
             ORDER BY item_count DESC
         """
         q_value = f"""
             SELECT
                 DATE(se.event_timestamp)::text AS date,
                 se.severity,
-                COUNT(*)                       AS incidents,
-                SUM(se.estimated_value)         AS total_value,
-                AVG(se.estimated_value)::float  AS avg_value
+                COUNT(*) AS incidents,
+                COALESCE(
+                    SUM(se.estimated_value),
+                    SUM(CASE se.severity
+                        WHEN 'critical' THEN 1000 WHEN 'high' THEN 500
+                        WHEN 'medium' THEN 200 ELSE 100
+                    END)
+                ) AS total_value,
+                COALESCE(
+                    AVG(se.estimated_value)::float,
+                    AVG(CASE se.severity
+                        WHEN 'critical' THEN 1000.0 WHEN 'high' THEN 500.0
+                        WHEN 'medium' THEN 200.0 ELSE 100.0
+                    END)::float
+                ) AS avg_value
             FROM shoplifting_events se
             LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
             WHERE {where}
@@ -1059,27 +1099,49 @@ class ShopliftingService:
         Skips insert if an 'detected' event for this stream already exists
         within the last 5 minutes (mirrors the trigger's dedup logic).
         """
-        upsert_query = """
-            INSERT INTO shoplifting_events (
-                stream_id, workspace_id,
-                event_timestamp, detection_method, severity, status, description
-            )
-            SELECT $1, $2, NOW(), 'ml_model', 'medium', 'detected', $3
-            WHERE NOT EXISTS (
-                SELECT 1 FROM shoplifting_events
-                WHERE stream_id = $1
-                  AND workspace_id = $2
-                  AND status = 'detected'
-                  AND event_timestamp > NOW() - INTERVAL '5 minutes'
-            )
-            RETURNING event_id
-        """
         try:
             desc = f"Auto-created by stream pipeline. confidence={confidence:.2f}" if confidence else "Auto-created by stream pipeline."
+            # Try to insert a new event
+            insert_query = """
+                INSERT INTO shoplifting_events (
+                    stream_id, workspace_id,
+                    event_timestamp, detection_method, severity, status, description, video_path
+                )
+                SELECT $1, $2, NOW(), 'ml_model', 'medium', 'detected', $3, $4
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM shoplifting_events
+                    WHERE stream_id = $1
+                      AND workspace_id = $2
+                      AND status = 'detected'
+                      AND event_timestamp > NOW() - INTERVAL '5 minutes'
+                )
+                RETURNING event_id
+            """
             result = await self.db.execute_query(
-                upsert_query, (stream_id, workspace_id, desc), fetch_one=True
+                insert_query, (stream_id, workspace_id, desc, video_path), fetch_one=True
             )
-            return result.get("event_id") if result else None
+            if result:
+                return result.get("event_id")
+            # Deduped — update video_path on the existing event if it's still null
+            if video_path:
+                await self.db.execute_query(
+                    """
+                    UPDATE shoplifting_events
+                    SET video_path = $3, updated_at = NOW()
+                    WHERE event_id = (
+                        SELECT event_id FROM shoplifting_events
+                        WHERE stream_id = $1
+                          AND workspace_id = $2
+                          AND status = 'detected'
+                          AND event_timestamp > NOW() - INTERVAL '5 minutes'
+                        ORDER BY event_timestamp DESC
+                        LIMIT 1
+                    ) AND video_path IS NULL
+                    """,
+                    (stream_id, workspace_id, video_path),
+                    fetch_one=False,
+                )
+            return None
         except Exception as e:
             logger.error(f"insert_shoplifting_event error: {e}")
             return None

@@ -20,7 +20,8 @@ from app.utils.email_utils import (
     send_email,
     send_email_from_client_to_admin,
     send_fire_alert_email,
-    send_people_count_alert_email
+    send_people_count_alert_email,
+    send_shoplifting_alert_email,
 )
 
 # Image utilities
@@ -73,6 +74,7 @@ __all__ = [
     'send_email_from_client_to_admin',
     'send_fire_alert_email',
     'send_people_count_alert_email',
+    'send_shoplifting_alert_email',
     
     # Image
     'frame_to_base64',

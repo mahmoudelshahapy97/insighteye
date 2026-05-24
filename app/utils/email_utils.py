@@ -21,6 +21,7 @@ _last_email_sent = defaultdict(lambda: None)
 _email_rate_limits = {
     'fire_alert': timedelta(minutes=10),  # 10 minutes between fire alerts per camera
     'people_count': timedelta(minutes=5),  # 5 minutes between count alerts per camera
+    'shoplifting_alert': timedelta(minutes=5),  # 5 minutes between shoplifting alerts per camera
     'general': timedelta(seconds=30)  # 30 seconds between general emails
 }
 
@@ -493,4 +494,106 @@ Configure your alert settings in the camera management section.
         
     except Exception as e:
         logger.error(f"Error sending people count alert email to {user_email}: {e}", exc_info=True)
+        return False
+
+
+async def send_shoplifting_alert_email(
+    user_email: str,
+    camera_name: str,
+    confidence: float,
+    location_info: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Send shoplifting alert email to user with rate limiting.
+    Will not send more than once per 5 minutes per camera.
+    """
+    identifier = camera_name
+    if not _can_send_email('shoplifting_alert', identifier):
+        logger.info(f"Shoplifting alert email rate-limited for {camera_name}.")
+        return False
+
+    if not _check_daily_limit():
+        logger.error(f"Daily email limit exceeded, cannot send shoplifting alert to {user_email}")
+        return False
+
+    try:
+        location_parts = []
+        if location_info:
+            if location_info.get('location'):
+                location_parts.append(f"Location: {location_info['location']}")
+            if location_info.get('building'):
+                location_parts.append(f"Building: {location_info['building']}")
+            if location_info.get('area'):
+                location_parts.append(f"Area: {location_info['area']}")
+            if location_info.get('zone'):
+                location_parts.append(f"Zone: {location_info['zone']}")
+            if location_info.get('floor_level'):
+                location_parts.append(f"Floor: {location_info['floor_level']}")
+
+        location_text = (
+            "\nLocation Details:\n" + "\n".join(f"  • {p}" for p in location_parts)
+            if location_parts else ""
+        )
+
+        timestamp = datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d %H:%M:%S UTC")
+        subject = f"🚨 SHOPLIFTING ALERT - {camera_name}"
+
+        body = f"""SHOPLIFTING ALERT
+
+Camera: {camera_name}
+Confidence: {confidence * 100:.1f}%
+Time: {timestamp}{location_text}
+
+Suspicious behavior has been detected by your InsightEye surveillance system.
+Please review the incident video in your dashboard immediately.
+
+---
+InsightEye Surveillance System
+This alert will not be sent again for the next 5 minutes to prevent spam.
+"""
+
+        html_body = f"""
+<html>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+    <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="background-color: #dc3545; color: white; padding: 15px; border-radius: 5px; text-align: center; margin-bottom: 20px;">
+            <h1 style="margin: 0; font-size: 24px;">🚨 SHOPLIFTING ALERT</h1>
+        </div>
+
+        <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin-bottom: 20px;">
+            <h3 style="color: #dc3545; margin-top: 0;">Alert Details:</h3>
+            <ul style="list-style: none; padding: 0;">
+                <li style="padding: 5px 0;"><strong>Camera:</strong> {camera_name}</li>
+                <li style="padding: 5px 0;"><strong>Confidence:</strong> <span style="color: #dc3545; font-weight: bold;">{confidence * 100:.1f}%</span></li>
+                <li style="padding: 5px 0;"><strong>Time:</strong> {timestamp}</li>
+            </ul>
+            {('<h4>Location Details:</h4><ul style="list-style: none; padding-left: 20px;">' + ''.join(f'<li style="padding: 2px 0;">• {p}</li>' for p in location_parts) + '</ul>') if location_parts else ''}
+        </div>
+
+        <div style="background-color: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+            <h4 style="color: #856404; margin-top: 0;">⚠️ Action Required</h4>
+            <p style="margin-bottom: 0; color: #856404;">Please review the incident video in your dashboard and take appropriate action.</p>
+        </div>
+
+        <div style="font-size: 12px; color: #6c757d; border-top: 1px solid #dee2e6; padding-top: 15px;">
+            <p>This is an automated alert from your InsightEye surveillance system.</p>
+            <p><strong>Note:</strong> This alert will not be sent again for the next 5 minutes to prevent spam.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+        success = await send_email(user_email, subject, body, html_body=html_body, skip_rate_limit=True)
+
+        if success:
+            _mark_email_sent('shoplifting_alert', identifier)
+            logger.info(f"✅ Shoplifting alert email sent to {user_email} for camera {camera_name}")
+        else:
+            logger.error(f"❌ Failed to send shoplifting alert email to {user_email} for camera {camera_name}")
+
+        return success
+
+    except Exception as e:
+        logger.error(f"Error sending shoplifting alert email to {user_email}: {e}", exc_info=True)
         return False

@@ -1480,7 +1480,13 @@ class StreamManager:
     async def get_workspace_streams_for_user(
         self,
         user_id: UUID,
-        workspace_id: Optional[UUID] = None
+        workspace_id: Optional[UUID] = None,
+        location: Optional[str] = None,
+        building: Optional[str] = None,
+        floor_level: Optional[str] = None,
+        zone: Optional[str] = None,
+        status: Optional[str] = None,
+        search: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Get all streams accessible to a user through their workspaces."""
         if workspace_id:
@@ -1501,7 +1507,15 @@ class StreamManager:
         
         for ws_id in target_workspaces:
             ws_info = await self.workspace_service.get_workspace_by_id(ws_id)
-            streams = await self.video_stream_service.get_workspace_streams(ws_id)
+            streams = await self.video_stream_service.get_workspace_streams(
+                ws_id,
+                status=status,
+                location=location,
+                building=building,
+                floor_level=floor_level,
+                zone=zone,
+                search=search,
+            )
             active_streams = await self.get_workspace_active_streams(ws_id)
             
             for stream in streams:

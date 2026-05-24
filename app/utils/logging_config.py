@@ -12,7 +12,7 @@ def setup_logging(log_file_path: str = "/app/logs/app.log"):
 
     file_handler = RotatingFileHandler(
         log_file_path,
-        maxBytes=10 * 1024 * 1024,   # 10 MB
+        maxBytes=3 * 1024 * 1024,   # 10 MB
         backupCount=5
     )
     file_handler.setFormatter(formatter)

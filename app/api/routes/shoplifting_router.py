@@ -13,11 +13,13 @@ Page 3 – Camera / Ops     : /dashboard/camera-health, /dashboard/real-time-act
                             /dashboard/operational-efficiency
 """
 
+import asyncio
 import logging
 from datetime import datetime, date
+from decimal import Decimal
 
-from fastapi import APIRouter, HTTPException, Depends, Query
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, Depends, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from typing import Dict, Any, List, Optional
 from uuid import UUID
 
@@ -58,37 +60,38 @@ async def get_workspace_id_for_user(username: str) -> UUID:
 async def resolve_s3_paths(paths: Optional[List[str]]) -> Optional[List[str]]:
     if not paths:
         return paths
-    resolved = []
-    for path in paths:
+
+    async def _resolve_one(path: str) -> str:
         if isinstance(path, str) and path.startswith("s3://"):
             lower = path.lower()
             for old_ext in (".jpg", ".jpeg", ".png"):
                 if lower.endswith(old_ext):
                     path = path[: -len(old_ext)] + ".webp"
                     break
-            url = await s3_service.get_presigned_url(path)
-            resolved.append(url)
-        else:
-            resolved.append(path)
-    return resolved
+            return await s3_service.get_presigned_url(path)
+        return path
+
+    return list(await asyncio.gather(*[_resolve_one(p) for p in paths]))
 
 
-async def enrich_event(event: dict) -> dict:
+async def enrich_event(event: dict, request: Request) -> dict:
     if event.get("evidence_paths"):
         event["evidence_paths"] = await resolve_s3_paths(event["evidence_paths"])
     if event.get("video_path") and str(event["video_path"]).startswith("s3://"):
-        event["video_path"] = await s3_service.get_presigned_url(event["video_path"])
+        event["video_path"] = await s3_service.get_presigned_url(event["video_path"], expiration=3600)
     return event
 
 
 def _to_json_safe(obj):
-    """Recursively convert datetime/date objects to ISO-format strings."""
+    """Recursively convert datetime/date/Decimal objects to JSON-serializable types."""
     if isinstance(obj, dict):
         return {k: _to_json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_to_json_safe(i) for i in obj]
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
     return obj
 
 
@@ -117,6 +120,7 @@ def _filters(
 
 @router.get("/events", response_model=ShopliftingEventListResponse)
 async def get_shoplifting_events(
+    request: Request,
     status_filter: Optional[str] = Query(None, description="detected | confirmed | dismissed | resolved"),
     camera_id: Optional[str]     = Query(None, description="Filter by stream/camera UUID"),
     f: dict = Depends(_filters),
@@ -134,7 +138,7 @@ async def get_shoplifting_events(
             limit=limit, offset=offset, **f,
         )
         for ev in events:
-            await enrich_event(ev)
+            await enrich_event(ev, request)
 
         total = await shoplifting_service.count_events(
             workspace_id=workspace_id, status=status_filter, camera_id=camera_id, **f,
@@ -181,14 +185,14 @@ async def trigger_test_alert(camera_id: str):
 
 @router.get("/dashboard/active", response_model=List[ActiveShopliftingEventSummary])
 async def get_active_shoplifting_dashboard(
+    request: Request,
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """All detected / under-review events (live view)."""
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         events = await shoplifting_service.get_active_dashboard(workspace_id=workspace_id)
-        for ev in events:
-            await enrich_event(ev)
+        await asyncio.gather(*[enrich_event(ev, request) for ev in events])
         return events
     except HTTPException:
         raise
@@ -219,6 +223,7 @@ async def get_shoplifting_daily_summary(
 
 @router.get("/incidents/videos")
 async def get_incident_videos(
+    request: Request,
     camera_id: Optional[str] = Query(None, description="Filter by camera UUID"),
     f: dict = Depends(_filters),
     page: int  = Query(1,  ge=1),
@@ -232,13 +237,15 @@ async def get_incident_videos(
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         offset = (page - 1) * limit
-        videos = await shoplifting_service.get_incident_videos(
+        result = await shoplifting_service.get_incident_videos(
             workspace_id=workspace_id, camera_id=camera_id,
             limit=limit, offset=offset, **f,
         )
-        for v in videos:
-            await enrich_event(v)
-        return JSONResponse(content=_to_json_safe({"items": videos, "page": page, "limit": limit}))
+        for v in result["items"]:
+            await enrich_event(v, request)
+        return JSONResponse(content=_to_json_safe({
+            "items": result["items"], "total": result["total"], "page": page, "limit": limit,
+        }))
     except HTTPException:
         raise
     except Exception as e:
@@ -265,8 +272,52 @@ async def get_behavior_sequences(
         raise HTTPException(status_code=500, detail="Error retrieving behavior sequences.")
 
 
+@router.get(
+    "/incidents/{event_id}/video/download",
+    name="download_incident_video",
+)
+async def download_incident_video(
+    event_id: int,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Stable video download proxy — generates a fresh presigned URL on every call."""
+    try:
+        workspace_id = await get_workspace_id_for_user(current_user["username"])
+        row = await db_manager.execute_query(
+            """
+            SELECT COALESCE(se.video_path, sd.video_path) AS video_path
+            FROM shoplifting_events se
+            LEFT JOIN LATERAL (
+                SELECT video_path
+                FROM surveillance_data
+                WHERE stream_id = se.stream_id
+                  AND video_path IS NOT NULL
+                  AND ABS(EXTRACT(EPOCH FROM (timestamp - se.event_timestamp))) < 600
+                ORDER BY ABS(EXTRACT(EPOCH FROM (timestamp - se.event_timestamp)))
+                LIMIT 1
+            ) sd ON TRUE
+            WHERE se.event_id = $1 AND se.workspace_id = $2
+            """,
+            (event_id, workspace_id),
+            fetch_one=True,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Incident not found.")
+        s3_uri = row.get("video_path")
+        if not s3_uri or not str(s3_uri).startswith("s3://"):
+            raise HTTPException(status_code=404, detail="No video available for this incident.")
+        fresh_url = await s3_service.get_presigned_url(s3_uri, expiration=3600)
+        return RedirectResponse(url=fresh_url, status_code=302)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"download_incident_video error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error generating video download URL.")
+
+
 @router.get("/incidents/confidence-audit")
 async def get_confidence_audit(
+    request: Request,
     f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
@@ -278,7 +329,7 @@ async def get_confidence_audit(
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
         for ev in data.get("confidence_per_event", []):
-            await enrich_event(ev)
+            await enrich_event(ev, request)
         return JSONResponse(content=_to_json_safe(data))
     except HTTPException:
         raise
@@ -396,6 +447,7 @@ async def get_session_insights(
 
 @router.get("/dashboard/model-accuracy")
 async def get_model_accuracy(
+    request: Request,
     f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
@@ -409,7 +461,7 @@ async def get_model_accuracy(
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         data = await shoplifting_service.get_model_accuracy(workspace_id=workspace_id, **f)
         for ev in data.get("confidence_per_event", []):
-            await enrich_event(ev)
+            await enrich_event(ev, request)
         return JSONResponse(content=_to_json_safe(data))
     except HTTPException:
         raise

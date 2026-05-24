@@ -1228,20 +1228,22 @@ async def restart_stream(
 
 @router.get("/list")
 async def list_user_streams(
-    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+    location:    Optional[str] = Query(None, description="Filter by camera location"),
+    building:    Optional[str] = Query(None, description="Filter by building"),
+    floor_level: Optional[str] = Query(None, description="Filter by floor level"),
+    zone:        Optional[str] = Query(None, description="Filter by zone"),
+    stream_status: Optional[str] = Query(None, description="Filter by stream status", alias="status"),
+    search:      Optional[str] = Query(None, description="Partial name match"),
+    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
-    """
-    List all streams accessible to the user.
-    
-    Optionally filter by workspace.
-    """
+    """List all streams accessible to the user, with optional filters."""
     try:
         user_id = str(current_user["user_id"])
         username = current_user["username"]
 
         # Get workspace_id for the user
         workspace_id_obj = await get_workspace_id_for_user(username)
-        
+
         # Verify user has access to this workspace
         await check_workspace_access(
             db_manager,
@@ -1250,10 +1252,16 @@ async def list_user_streams(
             required_role=None
         )
 
-        # Get streams
+        # Get streams with filters
         result = await stream_manager.get_workspace_streams_for_user(
             user_id=user_id,
-            workspace_id=workspace_id_obj
+            workspace_id=workspace_id_obj,
+            location=location,
+            building=building,
+            floor_level=floor_level,
+            zone=zone,
+            status=stream_status,
+            search=search,
         )
         
         return JSONResponse(

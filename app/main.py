@@ -44,6 +44,16 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("DB health check failed after pool init")
     except Exception as e:
         logger.warning("Index/health check failed: %s", e)
+
+    try:
+        from app.services.database import db_manager as _db
+        await _db.execute_query(
+            "ALTER TABLE shoplifting_events ADD COLUMN IF NOT EXISTS video_path VARCHAR(500)",
+            fetch_one=False,
+        )
+        logger.info("shoplifting_events.video_path column ensured.")
+    except Exception as e:
+        logger.warning("Could not add video_path column: %s", e)
     
     try:
         stream_processing_service._initialize_models()

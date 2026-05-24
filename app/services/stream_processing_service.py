@@ -20,7 +20,7 @@ import os
 import sys
 from app.config.settings import config
 from app.services.model_loader import ModelFactory, ModelBackend
-from app.utils import send_people_count_alert_email, send_fire_alert_email
+from app.utils import send_people_count_alert_email, send_fire_alert_email, send_shoplifting_alert_email
 from app.services.database import db_manager
 from app.services.user_service import user_manager
 from app.services.postgres_service import postgres_service
@@ -1244,7 +1244,7 @@ class StreamProcessingService:
                                     'last_detected': current_time
                                 }
 
-                            async def save_shoplifting_video(frames, s_id, w_id, u_id, conf, objs, session_uuid):
+                            async def save_shoplifting_video(frames, s_id, w_id, u_id, conf, objs, session_uuid, cam_name):
                                 if not frames:
                                     return
 
@@ -1286,7 +1286,7 @@ class StreamProcessingService:
 
                                     if s3_path:
                                         await shoplifting_service.insert_surveillance_frame(
-                                            session_id=session_uuid,
+                                            session_id=None,
                                             stream_id=s_id,
                                             workspace_id=w_id,
                                             user_id=u_id,
@@ -1304,6 +1304,58 @@ class StreamProcessingService:
                                             video_path=s3_path,
                                         )
                                         logger.info(f"✅ Saved shoplifting video to {s3_path}")
+                                        try:
+                                            notification = await notification_service.create_notification(
+                                                workspace_id=w_id,
+                                                user_id=u_id,
+                                                status="urgent",
+                                                message=f"🚨 SHOPLIFTING ALERT: Suspicious behavior detected on {cam_name}",
+                                                stream_id=s_id,
+                                                camera_name=cam_name,
+                                            )
+                                            if notification and self.stream_manager:
+                                                await self.stream_manager.broadcast_notification(
+                                                    str(u_id),
+                                                    {
+                                                        "type": "new_notification",
+                                                        "notification": {
+                                                            "id": str(notification.get("notification_id")),
+                                                            "user_id": str(notification.get("user_id")),
+                                                            "workspace_id": str(notification.get("workspace_id")),
+                                                            "stream_id": str(s_id),
+                                                            "camera_name": cam_name,
+                                                            "status": "urgent",
+                                                            "message": notification.get("message"),
+                                                            "timestamp": notification.get("timestamp").timestamp() if notification.get("timestamp") else None,
+                                                            "read": False,
+                                                        },
+                                                    },
+                                                )
+                                        except Exception as notif_err:
+                                            logger.error(f"Failed to send shoplifting notification: {notif_err}")
+
+                                        # Send email alert
+                                        try:
+                                            user_info = await user_manager.get_user_by_id(u_id)
+                                            if user_info and user_info.get('email'):
+                                                stream_info = await video_stream_service.get_video_stream_by_id(s_id)
+                                                location_info = None
+                                                if stream_info:
+                                                    location_info = {
+                                                        'location': stream_info.get('location'),
+                                                        'area': stream_info.get('area'),
+                                                        'building': stream_info.get('building'),
+                                                        'zone': stream_info.get('zone'),
+                                                        'floor_level': stream_info.get('floor_level'),
+                                                    }
+                                                await send_shoplifting_alert_email(
+                                                    user_email=user_info['email'],
+                                                    camera_name=cam_name,
+                                                    confidence=conf,
+                                                    location_info=location_info,
+                                                )
+                                        except Exception as email_err:
+                                            logger.error(f"Failed to send shoplifting alert email: {email_err}")
                                 except Exception:
                                     logger.error(
                                         f"Unhandled exception in save_shoplifting_video for stream {s_id}",
@@ -1312,7 +1364,8 @@ class StreamProcessingService:
 
                             _save_task = asyncio.create_task(save_shoplifting_video(
                                 shoplifting_frames, stream_id, workspace_id, owner_id,
-                                shoplifting_conf, shoplifting_objects, incident_session_id
+                                shoplifting_conf, shoplifting_objects, incident_session_id,
+                                camera_name
                             ))
                             _save_task.add_done_callback(_log_shoplifting_task_exception)
 
