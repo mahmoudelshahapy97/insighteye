@@ -1348,12 +1348,12 @@ class StreamProcessingService:
                                                         'zone': stream_info.get('zone'),
                                                         'floor_level': stream_info.get('floor_level'),
                                                     }
-                                                await send_shoplifting_alert_email(
-                                                    user_email=user_info['email'],
-                                                    camera_name=cam_name,
-                                                    confidence=conf,
-                                                    location_info=location_info,
-                                                )
+                                                # await send_shoplifting_alert_email(
+                                                #     user_email=user_info['email'],
+                                                #     camera_name=cam_name,
+                                                #     confidence=conf,
+                                                #     location_info=location_info,
+                                                # )
                                         except Exception as email_err:
                                             logger.error(f"Failed to send shoplifting alert email: {email_err}")
                                 except Exception:

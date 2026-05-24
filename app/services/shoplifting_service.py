@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, time as dt_time
 from typing import List, Dict, Any, Optional
@@ -703,6 +704,7 @@ class ShopliftingService:
             WHERE {where}
               AND se.resolved_at IS NOT NULL
             ORDER BY se.event_timestamp DESC
+            LIMIT 500
         """
         q_actions = f"""
             SELECT
@@ -721,15 +723,18 @@ class ShopliftingService:
             WHERE {where}
               AND se.status IN ('detected', 'under_review')
             ORDER BY se.event_timestamp ASC
+            LIMIT 200
         """
         try:
-            resolution  = await self.db.execute_query(q_resolution, base_params, fetch_all=True)
+            resolution, actions, open_events = await asyncio.gather(
+                self.db.execute_query(q_resolution, base_params, fetch_all=True),
+                self.db.execute_query(q_actions,    base_params, fetch_all=True),
+                self.db.execute_query(q_open,       base_params, fetch_all=True),
+            )
             if resolution:
                 for r in resolution:
                     if r.get("resolution_seconds") is not None:
                         r["resolution_seconds"] = float(r["resolution_seconds"])
-            actions     = await self.db.execute_query(q_actions,    base_params, fetch_all=True)
-            open_events = await self.db.execute_query(q_open,       base_params, fetch_all=True)
             return {
                 "resolution_times": resolution  or [],
                 "action_breakdown": actions     or [],
