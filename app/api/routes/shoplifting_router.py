@@ -125,7 +125,7 @@ async def get_shoplifting_events(
     camera_id: Optional[str]     = Query(None, description="Filter by stream/camera UUID"),
     f: dict = Depends(_filters),
     page: int  = Query(1,  ge=1),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(10, ge=1, le=200),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """Paginated list of shoplifting events. Returns evidence_paths as pre-signed S3 URLs."""
@@ -151,7 +151,7 @@ async def get_shoplifting_events(
         raise HTTPException(status_code=500, detail="Error retrieving shoplifting events.")
 
 
-@router.patch("/events/{event_id}/resolve")
+@router.post("/events/{event_id}/resolve")
 async def resolve_shoplifting_event(
     event_id: int,
     request: ResolveEventRequest,
@@ -338,7 +338,7 @@ async def get_confidence_audit(
         raise HTTPException(status_code=500, detail="Error retrieving confidence audit.")
 
 
-@router.patch("/incidents/{event_id}/action")
+@router.post("/incidents/{event_id}/action")
 async def set_incident_action(
     event_id: int,
     request: ResolveEventRequest,
