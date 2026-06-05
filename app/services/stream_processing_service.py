@@ -18,6 +18,7 @@ from datetime import datetime, timezone, timedelta
 import concurrent.futures
 import os
 import sys
+import subprocess
 from app.config.settings import config
 from app.services.model_loader import ModelFactory, ModelBackend
 from app.utils import send_people_count_alert_email, send_fire_alert_email, send_shoplifting_alert_email
@@ -1252,20 +1253,40 @@ class StreamProcessingService:
                                     temp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp4")
 
                                     def write_video():
-                                        out = None
                                         try:
                                             h, w = frames[0].shape[:2]
-                                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                                            out = cv2.VideoWriter(temp_path, fourcc, 10.0, (w, h))
+                                            cmd = [
+                                                'ffmpeg', '-y',
+                                                '-f', 'rawvideo',
+                                                '-vcodec', 'rawvideo',
+                                                '-s', f'{w}x{h}',
+                                                '-pix_fmt', 'bgr24',
+                                                '-r', '10',
+                                                '-i', 'pipe:0',
+                                                '-c:v', 'libx264',
+                                                '-preset', 'fast',
+                                                '-crf', '23',
+                                                '-pix_fmt', 'yuv420p',
+                                                '-movflags', '+faststart',
+                                                temp_path,
+                                            ]
+                                            proc = subprocess.Popen(
+                                                cmd,
+                                                stdin=subprocess.PIPE,
+                                                stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.PIPE,
+                                            )
                                             for f in frames:
-                                                out.write(f)
+                                                proc.stdin.write(f.tobytes())
+                                            proc.stdin.close()
+                                            proc.wait()
+                                            if proc.returncode != 0:
+                                                logger.error(f"ffmpeg error: {proc.stderr.read().decode()}")
+                                                return False
                                             return True
                                         except Exception as e:
                                             logger.error(f"Error writing video: {e}")
                                             return False
-                                        finally:
-                                            if out is not None:
-                                                out.release()
 
                                     success = await asyncio.to_thread(write_video)
                                     if not success:

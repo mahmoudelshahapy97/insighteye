@@ -28,7 +28,28 @@ class S3Service:
                     s3={'addressing_style': 'virtual'},
                 ),
             )
+            real_region = self._detect_bucket_region()
+            if real_region != config.aws_region:
+                logger.info(f"Bucket is in {real_region}, reinitialising S3 client for correct SigV4 region.")
+                self.s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=config.aws_access_key_id,
+                    aws_secret_access_key=config.aws_secret_access_key,
+                    region_name=real_region,
+                    config=Config(
+                        signature_version='s3v4',
+                        s3={'addressing_style': 'virtual'},
+                    ),
+                )
             self._ensure_cors()
+
+    def _detect_bucket_region(self) -> str:
+        try:
+            resp = self.s3_client.get_bucket_location(Bucket=config.s3_bucket_name)
+            return resp.get('LocationConstraint') or 'us-east-1'
+        except Exception as e:
+            logger.warning(f"Could not detect bucket region, using configured region: {e}")
+            return config.aws_region
 
     def _ensure_cors(self):
         try:
@@ -39,6 +60,13 @@ class S3Service:
                         'AllowedOrigins': ['*'],
                         'AllowedMethods': ['GET', 'HEAD'],
                         'AllowedHeaders': ['*'],
+                        'ExposeHeaders': [
+                            'Content-Range',
+                            'Accept-Ranges',
+                            'Content-Length',
+                            'Content-Type',
+                            'ETag',
+                        ],
                         'MaxAgeSeconds': 3600,
                     }]
                 }
