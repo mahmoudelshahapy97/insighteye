@@ -336,13 +336,13 @@ class ShopliftingService:
 
         q_location = f"""
             SELECT
-                vs.location, vs.building, vs.zone,
+                vs.location,
                 COUNT(se.event_id)      AS incident_count,
                 SUM(se.estimated_value) AS total_loss_value
             FROM shoplifting_events se
             LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
             WHERE {where}
-            GROUP BY vs.location, vs.building, vs.zone
+            GROUP BY vs.location
             ORDER BY incident_count DESC
         """
         q_items = f"""
