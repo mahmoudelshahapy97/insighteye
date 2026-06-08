@@ -31,6 +31,7 @@ class StreamCreate(BaseModel):
     count_threshold_greater: Optional[int] = Field(None, ge=0)
     count_threshold_less: Optional[int] = Field(None, ge=0)
     alert_enabled: bool = Field(default=False)
+    is_shoplifting_camera: bool = Field(default=False)
 
 class StreamUpdate(BaseModel):
     id: str = Field(...)
@@ -49,6 +50,7 @@ class StreamUpdate(BaseModel):
     count_threshold_greater: Optional[int] = Field(None, ge=0)
     count_threshold_less: Optional[int] = Field(None, ge=0)
     alert_enabled: bool = Field(default=False)
+    is_shoplifting_camera: Optional[bool] = Field(default=None)
 
 class StreamUpdateList(BaseModel):
     streams: List[StreamUpdate]
@@ -76,6 +78,7 @@ class StreamCreateWithLocation(BaseModel):
     type: str = Field("local", pattern="^(rtsp|http|local|other|video file)$")
     status: str = Field("inactive", description="Status: active, inactive")
     is_streaming: bool = False
+    is_shoplifting_camera: bool = False
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -91,6 +94,7 @@ class StreamUpdateWithLocation(BaseModel):
     type: Optional[str] = None
     status: Optional[str] = Field(None, description="Status: active, inactive")
     is_streaming: Optional[bool] = None
+    is_shoplifting_camera: Optional[bool] = None
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -160,6 +164,7 @@ class CameraDetailedResponse(BaseModel):
     count_threshold_greater: Optional[int] = Field(None, description="Alert threshold for greater count")
     count_threshold_less: Optional[int] = Field(None, description="Alert threshold for less count")
     alert_enabled: bool = Field(default=False, description="Whether alerts are enabled")
+    is_shoplifting_camera: bool = Field(default=False, description="Whether shoplifting model is active for this camera")
     created_at: datetime = Field(..., description="Camera creation timestamp")
     updated_at: datetime = Field(..., description="Camera last update timestamp")
     last_activity: datetime = Field(..., description="Camera last activity timestamp")

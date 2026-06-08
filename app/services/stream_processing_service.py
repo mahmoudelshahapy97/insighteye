@@ -1095,6 +1095,11 @@ class StreamProcessingService:
             frame_delay_target = params.get("frame_delay", 0.033)
             conf_threshold = params.get("conf", 0.5)
 
+            from app.services.video_stream_service import video_stream_service as _vs_svc
+            _stream_db = await _vs_svc.get_video_stream_by_id(stream_id)
+            is_shoplifting_camera = bool(_stream_db.get('is_shoplifting_camera', False)) if _stream_db else False
+            logger.info(f"[shoplifting] stream={stream_id_str[:8]} is_shoplifting_camera={is_shoplifting_camera}")
+
             # -------------------- SOURCE --------------------
             if not source.startswith("rtsp://"):
                 if not await self._validate_stream_source(source):
@@ -1185,7 +1190,7 @@ class StreamProcessingService:
                     shoplifting_conf = 0.0
                     shoplifting_objects = []
                     shoplifting_frame_rate = max(1, frame_skip // 30)
-                    if frame_count % shoplifting_frame_rate == 0 and self.shoplifting_engine:
+                    if frame_count % shoplifting_frame_rate == 0 and self.shoplifting_engine and is_shoplifting_camera:
                         engine = self.shoplifting_engine
                         # Lazy-load: if startup load failed, retry once in a background thread
                         if not engine.is_loaded and not shoplifting_engine_load_attempted:
@@ -1307,7 +1312,7 @@ class StreamProcessingService:
 
                                     if s3_path:
                                         await shoplifting_service.insert_surveillance_frame(
-                                            session_id=None,
+                                            session_id=session_uuid,
                                             stream_id=s_id,
                                             workspace_id=w_id,
                                             user_id=u_id,

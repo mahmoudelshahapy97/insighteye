@@ -950,8 +950,8 @@ class ShopliftingService:
             SELECT
                 vs.location, vs.zone, vs.name AS camera_name,
                 COUNT(sd.observation_id)::float /
-                    NULLIF(COUNT(DISTINCT sd.session_id), 0) AS avg_behavior_per_session,
-                COUNT(DISTINCT sd.session_id) AS session_count
+                    NULLIF(SUM(vs.session_count), 0) AS avg_behavior_per_session,
+                COALESCE(SUM(vs.session_count), 0) AS session_count
             FROM surveillance_data sd
             JOIN video_stream vs ON sd.stream_id = vs.stream_id
             WHERE {where}
@@ -1035,18 +1035,16 @@ class ShopliftingService:
         q_rate = f"""
             SELECT
                 vs.location, vs.zone,
-                COUNT(DISTINCT se.event_id)   AS incident_count,
-                COUNT(DISTINCT s.session_id)  AS session_count,
+                COUNT(DISTINCT se.event_id)      AS incident_count,
+                COALESCE(SUM(vs.session_count), 0) AS session_count,
                 CASE
-                    WHEN COUNT(DISTINCT s.session_id) = 0 THEN 0
+                    WHEN SUM(vs.session_count) = 0 THEN 0
                     ELSE ROUND(
                         COUNT(DISTINCT se.event_id) * 1000.0
-                        / COUNT(DISTINCT s.session_id), 2
+                        / NULLIF(SUM(vs.session_count), 0), 2
                     )
                 END::float AS incidents_per_1000_sessions
             FROM video_stream vs
-            LEFT JOIN surveillance_data s
-                ON s.stream_id = vs.stream_id AND s.workspace_id = $1{session_extra}
             LEFT JOIN shoplifting_events se
                 ON se.stream_id = vs.stream_id AND se.workspace_id = $1{event_extra}
             WHERE {vs_where}

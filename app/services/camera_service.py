@@ -69,24 +69,26 @@ class CameraService:
             now_utc = datetime.now(ZoneInfo("Africa/Cairo"))
             
             insert_query = """
-                INSERT INTO video_stream 
-                (stream_id, user_id, workspace_id, name, path, type, status, is_streaming, 
+                INSERT INTO video_stream
+                (stream_id, user_id, workspace_id, name, path, type, status, is_streaming,
                  location, area, building, floor_level, zone, latitude, longitude,
                  count_threshold_greater, count_threshold_less, alert_enabled,
-                 created_at, updated_at, last_activity) 
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                 is_shoplifting_camera,
+                 created_at, updated_at, last_activity)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
             """
-            
+
             await self.db_manager.execute_query(
                 insert_query,
                 params=(
-                    stream_id, user_id, workspace_id, stream.name, stream.path, stream.type, 
+                    stream_id, user_id, workspace_id, stream.name, stream.path, stream.type,
                     stream.status, stream.is_streaming,
                     getattr(stream, 'location', None), getattr(stream, 'area', None),
                     getattr(stream, 'building', None), getattr(stream, 'floor_level', None),
                     getattr(stream, 'zone', None), getattr(stream, 'latitude', None),
                     getattr(stream, 'longitude', None), getattr(stream, 'count_threshold_greater', None),
                     getattr(stream, 'count_threshold_less', None), getattr(stream, 'alert_enabled', False),
+                    getattr(stream, 'is_shoplifting_camera', False),
                     now_utc, now_utc, now_utc
                 )
             )
@@ -108,11 +110,12 @@ class CameraService:
         """Get cameras for a user in their workspace."""
         try:
             query_sql_base = """
-                SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path, 
+                SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path,
                        vs.type, vs.status, vs.is_streaming, vs.created_at, vs.updated_at,
                        vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
                        vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
-                       w.name as workspace_name 
+                       vs.is_shoplifting_camera,
+                       w.name as workspace_name
                 FROM video_stream vs
                 JOIN users u ON vs.user_id = u.user_id
                 LEFT JOIN workspaces w ON vs.workspace_id = w.workspace_id
@@ -147,6 +150,7 @@ class CameraService:
                     "count_threshold_greater": s["count_threshold_greater"],
                     "count_threshold_less": s["count_threshold_less"],
                     "alert_enabled": s["alert_enabled"],
+                    "is_shoplifting_camera": s["is_shoplifting_camera"],
                     "created_at": s["created_at"].isoformat() if s["created_at"] else None,
                     "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
                     "workspace_id": str(workspace_id), 
@@ -248,7 +252,12 @@ class CameraService:
                     set_clauses.append(f"{field} = ${param_idx}")
                     params.append(getattr(stream_update, field))
                     param_idx += 1
-            
+
+            if hasattr(stream_update, 'is_shoplifting_camera') and stream_update.is_shoplifting_camera is not None:
+                set_clauses.append(f"is_shoplifting_camera = ${param_idx}")
+                params.append(stream_update.is_shoplifting_camera)
+                param_idx += 1
+
             if not set_clauses:
                 return True, None  # Nothing to update
             
