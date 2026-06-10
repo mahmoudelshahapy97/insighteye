@@ -745,6 +745,197 @@ class ShopliftingService:
             raise
 
     # =========================================================
+    # action_taken Analytics
+    # =========================================================
+
+    async def get_action_summary(
+        self,
+        workspace_id: UUID,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        location: Optional[str] = None,
+        building: Optional[str] = None,
+        floor_level: Optional[str] = None,
+        zone: Optional[str] = None,
+    ) -> list:
+        conditions, params, _ = self._build_event_conditions(
+            workspace_id,
+            start_date=start_date, end_date=end_date,
+            start_time=start_time, end_time=end_time,
+            location=location, building=building,
+            floor_level=floor_level, zone=zone,
+        )
+        where = " AND ".join(conditions)
+        q = f"""
+            SELECT COALESCE(se.action_taken, 'no_action') AS action_taken,
+                   COUNT(*) AS count
+            FROM shoplifting_events se
+            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            WHERE {where}
+            GROUP BY se.action_taken
+            ORDER BY count DESC
+        """
+        try:
+            return await self.db.execute_query(q, tuple(params), fetch_all=True) or []
+        except Exception as e:
+            logger.error(f"get_action_summary error: {e}")
+            raise
+
+    async def get_action_by_camera(
+        self,
+        workspace_id: UUID,
+        camera_id: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        location: Optional[str] = None,
+        building: Optional[str] = None,
+        floor_level: Optional[str] = None,
+        zone: Optional[str] = None,
+    ) -> list:
+        conditions, params, _ = self._build_event_conditions(
+            workspace_id,
+            camera_id=camera_id,
+            start_date=start_date, end_date=end_date,
+            start_time=start_time, end_time=end_time,
+            location=location, building=building,
+            floor_level=floor_level, zone=zone,
+        )
+        where = " AND ".join(conditions)
+        q = f"""
+            SELECT vs.name AS camera_name,
+                   se.stream_id::text AS camera_id,
+                   COALESCE(se.action_taken, 'no_action') AS action_taken,
+                   COUNT(*) AS count
+            FROM shoplifting_events se
+            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            WHERE {where}
+            GROUP BY vs.name, se.stream_id, se.action_taken
+            ORDER BY vs.name, count DESC
+        """
+        try:
+            return await self.db.execute_query(q, tuple(params), fetch_all=True) or []
+        except Exception as e:
+            logger.error(f"get_action_by_camera error: {e}")
+            raise
+
+    async def get_action_by_date(
+        self,
+        workspace_id: UUID,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        location: Optional[str] = None,
+        building: Optional[str] = None,
+        floor_level: Optional[str] = None,
+        zone: Optional[str] = None,
+    ) -> list:
+        conditions, params, _ = self._build_event_conditions(
+            workspace_id,
+            start_date=start_date, end_date=end_date,
+            start_time=start_time, end_time=end_time,
+            location=location, building=building,
+            floor_level=floor_level, zone=zone,
+        )
+        where = " AND ".join(conditions)
+        q = f"""
+            SELECT DATE(se.event_timestamp AT TIME ZONE 'UTC') AS event_date,
+                   COALESCE(se.action_taken, 'no_action') AS action_taken,
+                   COUNT(*) AS count
+            FROM shoplifting_events se
+            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            WHERE {where}
+            GROUP BY event_date, se.action_taken
+            ORDER BY event_date, count DESC
+        """
+        try:
+            return await self.db.execute_query(q, tuple(params), fetch_all=True) or []
+        except Exception as e:
+            logger.error(f"get_action_by_date error: {e}")
+            raise
+
+    async def get_action_by_location(
+        self,
+        workspace_id: UUID,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        location: Optional[str] = None,
+        building: Optional[str] = None,
+        floor_level: Optional[str] = None,
+        zone: Optional[str] = None,
+    ) -> list:
+        conditions, params, _ = self._build_event_conditions(
+            workspace_id,
+            start_date=start_date, end_date=end_date,
+            start_time=start_time, end_time=end_time,
+            location=location, building=building,
+            floor_level=floor_level, zone=zone,
+        )
+        where = " AND ".join(conditions)
+        q = f"""
+            SELECT vs.location,
+                   vs.zone,
+                   COALESCE(se.action_taken, 'no_action') AS action_taken,
+                   COUNT(*) AS count
+            FROM shoplifting_events se
+            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            WHERE {where}
+            GROUP BY vs.location, vs.zone, se.action_taken
+            ORDER BY vs.location, vs.zone, count DESC
+        """
+        try:
+            return await self.db.execute_query(q, tuple(params), fetch_all=True) or []
+        except Exception as e:
+            logger.error(f"get_action_by_location error: {e}")
+            raise
+
+    async def get_action_by_camera_date(
+        self,
+        workspace_id: UUID,
+        camera_id: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        location: Optional[str] = None,
+        building: Optional[str] = None,
+        floor_level: Optional[str] = None,
+        zone: Optional[str] = None,
+    ) -> list:
+        conditions, params, _ = self._build_event_conditions(
+            workspace_id,
+            camera_id=camera_id,
+            start_date=start_date, end_date=end_date,
+            start_time=start_time, end_time=end_time,
+            location=location, building=building,
+            floor_level=floor_level, zone=zone,
+        )
+        where = " AND ".join(conditions)
+        q = f"""
+            SELECT vs.name AS camera_name,
+                   se.stream_id::text AS camera_id,
+                   DATE(se.event_timestamp AT TIME ZONE 'UTC') AS event_date,
+                   COALESCE(se.action_taken, 'no_action') AS action_taken,
+                   COUNT(*) AS count
+            FROM shoplifting_events se
+            LEFT JOIN video_stream vs ON se.stream_id = vs.stream_id
+            WHERE {where}
+            GROUP BY vs.name, se.stream_id, event_date, se.action_taken
+            ORDER BY vs.name, event_date, count DESC
+        """
+        try:
+            return await self.db.execute_query(q, tuple(params), fetch_all=True) or []
+        except Exception as e:
+            logger.error(f"get_action_by_camera_date error: {e}")
+            raise
+
+    # =========================================================
     # 7. High-Value Target & Item Analysis
     # =========================================================
 
