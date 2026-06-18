@@ -748,9 +748,24 @@ class ShopliftingService:
     # action_taken Analytics
     # =========================================================
 
+    def _apply_camera_name_filter(
+        self,
+        conditions: list,
+        params: list,
+        p: int,
+        camera_name: Optional[str],
+    ) -> tuple:
+        """Append a case-insensitive partial-match filter on vs.name (requires video_stream join)."""
+        if camera_name:
+            p += 1
+            conditions.append(f"vs.name ILIKE ${p}")
+            params.append(f"%{camera_name}%")
+        return conditions, params, p
+
     async def get_action_summary(
         self,
         workspace_id: UUID,
+        camera_name: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         start_time: Optional[str] = None,
@@ -760,13 +775,14 @@ class ShopliftingService:
         floor_level: Optional[str] = None,
         zone: Optional[str] = None,
     ) -> list:
-        conditions, params, _ = self._build_event_conditions(
+        conditions, params, p = self._build_event_conditions(
             workspace_id,
             start_date=start_date, end_date=end_date,
             start_time=start_time, end_time=end_time,
             location=location, building=building,
             floor_level=floor_level, zone=zone,
         )
+        conditions, params, _ = self._apply_camera_name_filter(conditions, params, p, camera_name)
         where = " AND ".join(conditions)
         q = f"""
             SELECT COALESCE(se.action_taken, 'no_action') AS action_taken,
@@ -787,6 +803,7 @@ class ShopliftingService:
         self,
         workspace_id: UUID,
         camera_id: Optional[str] = None,
+        camera_name: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         start_time: Optional[str] = None,
@@ -796,7 +813,7 @@ class ShopliftingService:
         floor_level: Optional[str] = None,
         zone: Optional[str] = None,
     ) -> list:
-        conditions, params, _ = self._build_event_conditions(
+        conditions, params, p = self._build_event_conditions(
             workspace_id,
             camera_id=camera_id,
             start_date=start_date, end_date=end_date,
@@ -804,6 +821,7 @@ class ShopliftingService:
             location=location, building=building,
             floor_level=floor_level, zone=zone,
         )
+        conditions, params, _ = self._apply_camera_name_filter(conditions, params, p, camera_name)
         where = " AND ".join(conditions)
         q = f"""
             SELECT vs.name AS camera_name,
@@ -825,6 +843,7 @@ class ShopliftingService:
     async def get_action_by_date(
         self,
         workspace_id: UUID,
+        camera_name: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         start_time: Optional[str] = None,
@@ -834,13 +853,14 @@ class ShopliftingService:
         floor_level: Optional[str] = None,
         zone: Optional[str] = None,
     ) -> list:
-        conditions, params, _ = self._build_event_conditions(
+        conditions, params, p = self._build_event_conditions(
             workspace_id,
             start_date=start_date, end_date=end_date,
             start_time=start_time, end_time=end_time,
             location=location, building=building,
             floor_level=floor_level, zone=zone,
         )
+        conditions, params, _ = self._apply_camera_name_filter(conditions, params, p, camera_name)
         where = " AND ".join(conditions)
         q = f"""
             SELECT DATE(se.event_timestamp AT TIME ZONE 'UTC') AS event_date,
@@ -861,6 +881,7 @@ class ShopliftingService:
     async def get_action_by_location(
         self,
         workspace_id: UUID,
+        camera_name: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         start_time: Optional[str] = None,
@@ -870,13 +891,14 @@ class ShopliftingService:
         floor_level: Optional[str] = None,
         zone: Optional[str] = None,
     ) -> list:
-        conditions, params, _ = self._build_event_conditions(
+        conditions, params, p = self._build_event_conditions(
             workspace_id,
             start_date=start_date, end_date=end_date,
             start_time=start_time, end_time=end_time,
             location=location, building=building,
             floor_level=floor_level, zone=zone,
         )
+        conditions, params, _ = self._apply_camera_name_filter(conditions, params, p, camera_name)
         where = " AND ".join(conditions)
         q = f"""
             SELECT vs.location,
@@ -899,6 +921,7 @@ class ShopliftingService:
         self,
         workspace_id: UUID,
         camera_id: Optional[str] = None,
+        camera_name: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         start_time: Optional[str] = None,
@@ -908,7 +931,7 @@ class ShopliftingService:
         floor_level: Optional[str] = None,
         zone: Optional[str] = None,
     ) -> list:
-        conditions, params, _ = self._build_event_conditions(
+        conditions, params, p = self._build_event_conditions(
             workspace_id,
             camera_id=camera_id,
             start_date=start_date, end_date=end_date,
@@ -916,6 +939,7 @@ class ShopliftingService:
             location=location, building=building,
             floor_level=floor_level, zone=zone,
         )
+        conditions, params, _ = self._apply_camera_name_filter(conditions, params, p, camera_name)
         where = " AND ".join(conditions)
         q = f"""
             SELECT vs.name AS camera_name,

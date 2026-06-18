@@ -566,17 +566,22 @@ async def get_operational_efficiency(
 
 @router.get("/actions/summary")
 async def get_action_summary(
+    camera_name: Optional[str] = Query(None, description="Filter by camera name (partial match)"),
     f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
     Overall count per action_taken value across all cameras.
     Returns a list of {action_taken, count} ordered by count desc.
+    Filters: camera_name (partial), start_date, end_date, start_time, end_time,
+             location, building, floor_level, zone.
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         return JSONResponse(content=_to_json_safe(
-            await shoplifting_service.get_action_summary(workspace_id=workspace_id, **f)
+            await shoplifting_service.get_action_summary(
+                workspace_id=workspace_id, camera_name=camera_name, **f
+            )
         ))
     except HTTPException:
         raise
@@ -588,18 +593,21 @@ async def get_action_summary(
 @router.get("/actions/by-camera")
 async def get_action_by_camera(
     camera_id: Optional[str] = Query(None, description="Filter by camera UUID"),
+    camera_name: Optional[str] = Query(None, description="Filter by camera name (partial match)"),
     f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
     Count per action_taken grouped by camera.
     Returns a list of {camera_name, camera_id, action_taken, count}.
+    Filters: camera_id (exact UUID), camera_name (partial), start_date, end_date,
+             start_time, end_time, location, building, floor_level, zone.
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         return JSONResponse(content=_to_json_safe(
             await shoplifting_service.get_action_by_camera(
-                workspace_id=workspace_id, camera_id=camera_id, **f
+                workspace_id=workspace_id, camera_id=camera_id, camera_name=camera_name, **f
             )
         ))
     except HTTPException:
@@ -611,17 +619,22 @@ async def get_action_by_camera(
 
 @router.get("/actions/by-date")
 async def get_action_by_date(
+    camera_name: Optional[str] = Query(None, description="Filter by camera name (partial match)"),
     f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
     Count per action_taken grouped by day.
     Returns a list of {event_date, action_taken, count} ordered by date asc.
+    Filters: camera_name (partial), start_date, end_date, start_time, end_time,
+             location, building, floor_level, zone.
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         return JSONResponse(content=_to_json_safe(
-            await shoplifting_service.get_action_by_date(workspace_id=workspace_id, **f)
+            await shoplifting_service.get_action_by_date(
+                workspace_id=workspace_id, camera_name=camera_name, **f
+            )
         ))
     except HTTPException:
         raise
@@ -632,17 +645,22 @@ async def get_action_by_date(
 
 @router.get("/actions/by-location")
 async def get_action_by_location(
+    camera_name: Optional[str] = Query(None, description="Filter by camera name (partial match)"),
     f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
     Count per action_taken grouped by location and zone.
     Returns a list of {location, zone, action_taken, count}.
+    Filters: camera_name (partial), start_date, end_date, start_time, end_time,
+             location, building, floor_level, zone.
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         return JSONResponse(content=_to_json_safe(
-            await shoplifting_service.get_action_by_location(workspace_id=workspace_id, **f)
+            await shoplifting_service.get_action_by_location(
+                workspace_id=workspace_id, camera_name=camera_name, **f
+            )
         ))
     except HTTPException:
         raise
@@ -654,18 +672,21 @@ async def get_action_by_location(
 @router.get("/actions/by-camera-date")
 async def get_action_by_camera_date(
     camera_id: Optional[str] = Query(None, description="Filter by camera UUID"),
+    camera_name: Optional[str] = Query(None, description="Filter by camera name (partial match)"),
     f: dict = Depends(_filters),
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     """
     Count per action_taken grouped by camera and day.
     Returns a list of {camera_name, camera_id, event_date, action_taken, count}.
+    Filters: camera_id (exact UUID), camera_name (partial), start_date, end_date,
+             start_time, end_time, location, building, floor_level, zone.
     """
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
         return JSONResponse(content=_to_json_safe(
             await shoplifting_service.get_action_by_camera_date(
-                workspace_id=workspace_id, camera_id=camera_id, **f
+                workspace_id=workspace_id, camera_id=camera_id, camera_name=camera_name, **f
             )
         ))
     except HTTPException:
