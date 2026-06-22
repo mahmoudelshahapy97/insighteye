@@ -92,6 +92,8 @@ def _to_json_safe(obj):
         return obj.isoformat()
     if isinstance(obj, Decimal):
         return float(obj)
+    if isinstance(obj, UUID):
+        return str(obj)
     return obj
 
 

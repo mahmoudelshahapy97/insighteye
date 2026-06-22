@@ -387,17 +387,20 @@ class ShopliftingService:
 
     async def get_realtime_activity(self, workspace_id: UUID) -> List[Dict[str, Any]]:
         query = """
-            SELECT DISTINCT ON (sd.session_id)
-                sd.session_id, sd.behavior_state, sd.behavior_category,
-                sd.detection_confidence,
-                sd.timestamp AS last_seen,
-                vs.name      AS camera_name,
-                vs.location, vs.building, vs.floor_level, vs.zone
-            FROM surveillance_data sd
-            JOIN video_stream vs ON sd.stream_id = vs.stream_id
-            WHERE sd.workspace_id = $1
-              AND sd.timestamp >= NOW() - INTERVAL '1 hour'
-            ORDER BY sd.session_id, sd.timestamp DESC, sd.detection_confidence DESC NULLS LAST
+            SELECT * FROM (
+                SELECT DISTINCT ON (sd.stream_id)
+                    sd.session_id, sd.behavior_state, sd.behavior_category,
+                    sd.detection_confidence,
+                    sd.timestamp AS last_seen,
+                    vs.name      AS camera_name,
+                    vs.location, vs.building, vs.floor_level, vs.zone
+                FROM surveillance_data sd
+                JOIN video_stream vs ON sd.stream_id = vs.stream_id
+                WHERE sd.workspace_id = $1
+                  AND sd.timestamp >= NOW() - INTERVAL '1 hour'
+                ORDER BY sd.stream_id, sd.timestamp DESC, sd.detection_confidence DESC NULLS LAST
+            ) latest_per_camera
+            ORDER BY detection_confidence DESC NULLS LAST
         """
         try:
             rows = await self.db.execute_query(query, (workspace_id,), fetch_all=True)
