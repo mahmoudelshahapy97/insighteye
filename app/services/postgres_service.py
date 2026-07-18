@@ -367,24 +367,20 @@ class PostgresService:
                     value = getattr(search_query, field)
                     if value:
                         param_count += 1
-                        conditions.append(f"sr.{field} = ${param_count}")
-                        params.append(value)
-            
-            # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
-                param_count += 1
-                conditions.append(f"sr.username = ${param_count}")
-                params.append(requesting_username)
-            
+                        conditions.append(f"sr.{field} ILIKE ${param_count}")
+                        params.append(f"%{value}%")
+
             where_clause = " AND ".join(conditions)
-            
-            # Get total count
-            count_query = f"SELECT COUNT(*) FROM stream_results sr WHERE {where_clause}"
-            count_result = await self.db_manager.execute_query(
-                count_query, tuple(params), fetch_one=True
-            )
-            total_count = count_result['count']
-            
+
+            # Get total count (skipped when unpaginated — total_count is just len(results) below)
+            total_count = None
+            if per_page is not None:
+                count_query = f"SELECT COUNT(*) FROM stream_results sr WHERE {where_clause}"
+                count_result = await self.db_manager.execute_query(
+                    count_query, tuple(params), fetch_one=True
+                )
+                total_count = count_result['count']
+
             # Get paginated data
             if per_page is None:
                 limit_clause = ""
@@ -404,7 +400,11 @@ class PostgresService:
                 frame_select = ", sf.frame_base64"
             
             data_query = f"""
-                SELECT sr.*, u.username as owner_username {frame_select}
+                SELECT sr.result_id, sr.camera_id, sr.camera_name, sr.timestamp, sr.date, sr.time,
+                       sr.person_count, sr.male_count, sr.female_count, sr.fire_status, sr.username,
+                       sr.location, sr.area, sr.building, sr.floor_level, sr.zone,
+                       sr.latitude, sr.longitude,
+                       u.username as owner_username {frame_select}
                 FROM stream_results sr
                 JOIN users u ON sr.user_id = u.user_id
                 {frame_join}
@@ -421,7 +421,10 @@ class PostgresService:
             if results:
                 for row in results:
                     paginated_data.append(self._format_result_data(row, include_frame))
-            
+
+            if total_count is None:
+                total_count = len(paginated_data)
+
             return {
                 "data": paginated_data,
                 "current_page": page if per_page is not None else 1,

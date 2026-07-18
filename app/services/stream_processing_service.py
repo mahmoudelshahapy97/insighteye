@@ -625,7 +625,20 @@ class StreamProcessingService:
                     f"greater_than={greater_than}, less_than={less_than}"
                 )
                 return
-            
+
+            # ==================== Record Violation ====================
+            # Persisted unconditionally (independent of the notification cooldown below)
+            # so the threshold-violations chart reflects every real crossing.
+            try:
+                await self.db_manager.execute_query(
+                    """INSERT INTO threshold_violations
+                       (violation_id, stream_id, workspace_id, person_count, threshold_type, threshold_value, "timestamp")
+                       VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                    (uuid.uuid4(), stream_id, workspace_id, person_count, threshold_type, threshold_value, current_time)
+                )
+            except Exception as e:
+                logger.error(f"Error recording threshold violation for {stream_id}: {e}")
+
             # ==================== Cooldown Check ====================
             should_notify = False
             cooldown_reason = None

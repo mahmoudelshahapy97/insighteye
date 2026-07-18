@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException, Query, Body, Depends, status, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import Optional, Dict, List
+import asyncio
 import logging
 import io
 
@@ -156,6 +157,8 @@ async def workspace_search_results_with_location(
     page: int = Query(1, ge=1),
     per_page: Optional[str] = Query(None),
     include_frame: bool = Query(True),
+    base64: Optional[bool] = Query(None, description="Alias for include_frame used by the frame-search UI"),
+    full_data: Optional[bool] = Query(None, description="Accepted for compatibility; no effect beyond per_page=null"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Enhanced search with location-based filtering using detection_data_service"""
@@ -200,7 +203,10 @@ async def workspace_search_results_with_location(
         
         # Parse camera IDs
         parsed_camera_ids = parse_camera_ids(camera_id_param) if camera_id_param else None
-        
+
+        # `base64`, when explicitly passed, is the frame-search UI's alias for include_frame
+        effective_include_frame = include_frame if base64 is None else base64
+
         # ===== USE DETECTION_DATA_SERVICE WITH LOCATION FILTERS =====
         results = await detection_data_service.retrieve_detection_data(
             workspace_id=workspace_id_obj,
@@ -219,14 +225,20 @@ async def workspace_search_results_with_location(
             zone=zone,
             page=page,
             per_page=processed_per_page,
-            include_frame=include_frame
+            include_frame=effective_include_frame
         )
 
-        # Resolve S3 image paths to presigned URLs in each result item
-        for item in results.get("data", []):
-            frame = item.get("frame")
-            if isinstance(frame, str) and frame.startswith("s3://"):
-                item["frame"] = await s3_service.get_presigned_url(frame)
+        # Resolve S3 image paths to presigned URLs in each result item (concurrently)
+        s3_items = [
+            item for item in results.get("data", [])
+            if isinstance(item.get("frame"), str) and item["frame"].startswith("s3://")
+        ]
+        if s3_items:
+            presigned_urls = await asyncio.gather(
+                *(s3_service.get_presigned_url(item["frame"]) for item in s3_items)
+            )
+            for item, url in zip(s3_items, presigned_urls):
+                item["frame"] = url
 
         # Add location filters to search scope
         if "search_scope" not in results:

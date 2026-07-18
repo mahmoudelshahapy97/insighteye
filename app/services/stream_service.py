@@ -1011,9 +1011,55 @@ class StreamManager:
             ]
             
             await asyncio.gather(*notification_tasks, return_exceptions=True)
-            
+
         except Exception as e:
             logger.error(f"Error notifying workspace of stream start: {e}")
+
+    async def _notify_workspace_stream_stopped(
+        self,
+        workspace_id: UUID,
+        stream_id: UUID,
+        camera_name: str,
+        stopped_by_username: str,
+    ):
+        """Notify workspace members when a stream is stopped by a user action (DB + live WebSocket push)."""
+        try:
+            message = f"🛑 Camera '{camera_name}' stopped by {stopped_by_username}"
+
+            members = await self.workspace_service.get_workspace_members(
+                workspace_id=workspace_id,
+                current_user_id=workspace_id,
+                is_admin=True
+            )
+
+            for member in members:
+                notification = await self.notification_service.create_notification(
+                    workspace_id=workspace_id,
+                    user_id=UUID(member['user_id']),
+                    status="inactive",
+                    message=message,
+                    stream_id=stream_id,
+                    camera_name=camera_name
+                )
+                if notification:
+                    formatted_notification = {
+                        "type": "new_notification",
+                        "notification": {
+                            "id": str(notification.get("notification_id")),
+                            "user_id": str(notification.get("user_id")),
+                            "workspace_id": str(notification.get("workspace_id")),
+                            "stream_id": str(notification.get("stream_id")),
+                            "camera_name": notification.get("camera_name"),
+                            "status": notification.get("status"),
+                            "message": notification.get("message"),
+                            "timestamp": notification.get("timestamp").timestamp() if notification.get("timestamp") else None,
+                            "read": notification.get("is_read", False)
+                        }
+                    }
+                    await self.broadcast_notification(member['user_id'], formatted_notification)
+
+        except Exception as e:
+            logger.error(f"Error notifying workspace of stream stop: {e}")
 
     # ==================== API Methods ====================
 
@@ -1239,7 +1285,14 @@ class StreamManager:
                 )
             else:
                 logger.info(f"✅ Final verification passed for {stream_id_str}")
-        
+
+            await self._notify_workspace_stream_stopped(
+                workspace_id=workspace_id,
+                stream_id=stream_id,
+                camera_name=stream_info['name'],
+                stopped_by_username=membership_info['username'],
+            )
+
         # Return response
         if stop_reason == 'user_action':
             return {

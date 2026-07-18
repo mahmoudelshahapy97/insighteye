@@ -54,7 +54,46 @@ async def lifespan(app: FastAPI):
         logger.info("shoplifting_events.video_path column ensured.")
     except Exception as e:
         logger.warning("Could not add video_path column: %s", e)
-    
+
+    try:
+        from app.services.database import db_manager as _db
+        await _db.execute_query(
+            """
+            CREATE TABLE IF NOT EXISTS threshold_violations (
+                violation_id UUID PRIMARY KEY,
+                stream_id UUID NOT NULL,
+                workspace_id UUID NOT NULL,
+                person_count INT NOT NULL,
+                threshold_type VARCHAR(20) NOT NULL,
+                threshold_value INT NOT NULL,
+                "timestamp" TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """,
+            fetch_one=False,
+        )
+        await _db.execute_query(
+            """
+            CREATE INDEX IF NOT EXISTS idx_threshold_violations_workspace_stream
+                ON threshold_violations (workspace_id, stream_id, "timestamp")
+            """,
+            fetch_one=False,
+        )
+        logger.info("threshold_violations table ensured.")
+    except Exception as e:
+        logger.warning("Could not create threshold_violations table: %s", e)
+
+    try:
+        from app.services.database import db_manager as _db
+        await _db.execute_query(
+            "CREATE INDEX IF NOT EXISTS idx_stream_results_workspace_timestamp "
+            "ON stream_results (workspace_id, timestamp)",
+            fetch_one=False,
+        )
+        logger.info("stream_results workspace/timestamp index ensured.")
+    except Exception as e:
+        logger.warning("Could not create stream_results index: %s", e)
+
     try:
         stream_processing_service._initialize_models()
         logger.info("Stream manager initialized and background tasks started.")

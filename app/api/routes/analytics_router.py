@@ -2287,107 +2287,97 @@ async def get_threshold_violations_by_camera(
         # Step 2: Build query parameters
         params = [workspace_id_obj]
         param_count = 1
-        date_filter = ""
-        
+        date_filter = ""            # applied to stream_results (checks CTE)
+        violation_date_filter = ""  # applied to threshold_violations (violations CTE)
+
         if start_date:
             param_count += 1
             params.append(start_date)
             date_filter += f" AND sr.date >= ${param_count}"
+            violation_date_filter += f' AND tv."timestamp"::date >= ${param_count}'
         if end_date:
             param_count += 1
             params.append(end_date)
             date_filter += f" AND sr.date <= ${param_count}"
-        
+            violation_date_filter += f' AND tv."timestamp"::date <= ${param_count}'
+
         location_filters, param_count = build_location_filters(
             params, param_count, locations, areas, buildings, floor_levels, zones
         )
-        
-        # Prefix location filters with "sr." for this query
+
+        # Prefix location filters with "vs." — filters directly on video_stream's current hierarchy
         location_where = ""
         if location_filters:
-            prefixed_filters = [f.replace("location", "sr.location")
-                                  .replace("area", "sr.area")
-                                  .replace("building", "sr.building")
-                                  .replace("floor_level", "sr.floor_level")
-                                  .replace("zone", "sr.zone") 
+            prefixed_filters = [f.replace("location", "vs.location")
+                                  .replace("area", "vs.area")
+                                  .replace("building", "vs.building")
+                                  .replace("floor_level", "vs.floor_level")
+                                  .replace("zone", "vs.zone")
                                for f in location_filters]
             location_where = " AND " + " AND ".join(prefixed_filters)
-        
+
         # Step 3: Conditional HAVING clause based on include_zero_violations parameter
         having_clause = ""
         if not include_zero_violations:
             having_clause = """
-            HAVING COUNT(CASE 
-                    WHEN vs.count_threshold_greater IS NOT NULL 
-                         AND sr.person_count > vs.count_threshold_greater 
-                    THEN 1 
-                END) > 0
-                OR COUNT(CASE 
-                    WHEN vs.count_threshold_less IS NOT NULL 
-                         AND sr.person_count < vs.count_threshold_less 
-                    THEN 1 
-                END) > 0
+            HAVING COALESCE(v.above_max_count, 0) > 0
+                OR COALESCE(v.below_min_count, 0) > 0
             """
-            
+
         query = f"""
+            WITH violations AS (
+                SELECT
+                    stream_id,
+                    COUNT(*) FILTER (WHERE threshold_type = 'greater_than') AS above_max_count,
+                    COUNT(*) FILTER (WHERE threshold_type = 'less_than') AS below_min_count,
+                    MAX("timestamp") FILTER (WHERE threshold_type = 'greater_than') AS last_above_max_time,
+                    MAX("timestamp") FILTER (WHERE threshold_type = 'less_than') AS last_below_min_time
+                FROM threshold_violations tv
+                WHERE tv.workspace_id = $1
+                  {violation_date_filter}
+                GROUP BY stream_id
+            ),
+            checks AS (
+                SELECT
+                    sr.stream_id,
+                    COUNT(*) AS total_checks,
+                    AVG(sr.person_count) AS avg_person_count,
+                    MAX(sr.person_count) AS max_person_count,
+                    MIN(sr.person_count) AS min_person_count
+                FROM stream_results sr
+                WHERE sr.workspace_id = $1
+                  AND sr.person_count IS NOT NULL
+                  {date_filter}
+                GROUP BY sr.stream_id
+            )
             SELECT
-                sr.camera_name,
-                MAX(sr.camera_id) AS camera_id,
-                MAX(sr.location) AS location,
-                MAX(sr.area) AS area,
-                MAX(sr.building) AS building,
-                MAX(sr.zone) AS zone,
-                MAX(sr.floor_level) AS floor_level,
-                MAX(vs.count_threshold_greater) AS count_threshold_greater,
-                MAX(vs.count_threshold_less) AS count_threshold_less,
-                MAX(vs.alert_enabled::int)::boolean AS alert_enabled,
-                COUNT(CASE 
-                    WHEN vs.count_threshold_greater IS NOT NULL 
-                         AND sr.person_count > vs.count_threshold_greater 
-                    THEN 1 
-                END) AS above_max_count,
-                COUNT(CASE 
-                    WHEN vs.count_threshold_less IS NOT NULL 
-                         AND sr.person_count < vs.count_threshold_less 
-                    THEN 1 
-                END) AS below_min_count,
-                COUNT(*) AS total_checks,
-                AVG(sr.person_count) AS avg_person_count,
-                MAX(sr.person_count) AS max_person_count,
-                MIN(sr.person_count) AS min_person_count,
-                MAX(CASE 
-                    WHEN vs.count_threshold_greater IS NOT NULL 
-                         AND sr.person_count > vs.count_threshold_greater 
-                    THEN sr.timestamp 
-                END) AS last_above_max_time,
-                MAX(CASE 
-                    WHEN vs.count_threshold_less IS NOT NULL 
-                         AND sr.person_count < vs.count_threshold_less 
-                    THEN sr.timestamp 
-                END) AS last_below_min_time
-            FROM stream_results sr
-            JOIN video_stream vs ON sr.stream_id = vs.stream_id
-            WHERE sr.workspace_id = $1
-              AND sr.camera_name IS NOT NULL
-              AND sr.person_count IS NOT NULL
+                vs.stream_id,
+                vs.name AS camera_name,
+                vs.location,
+                vs.area,
+                vs.building,
+                vs.zone,
+                vs.floor_level,
+                vs.count_threshold_greater,
+                vs.count_threshold_less,
+                vs.alert_enabled,
+                COALESCE(v.above_max_count, 0) AS above_max_count,
+                COALESCE(v.below_min_count, 0) AS below_min_count,
+                COALESCE(c.total_checks, 0) AS total_checks,
+                c.avg_person_count,
+                c.max_person_count,
+                c.min_person_count,
+                v.last_above_max_time,
+                v.last_below_min_time
+            FROM video_stream vs
+            LEFT JOIN checks c ON c.stream_id = vs.stream_id
+            LEFT JOIN violations v ON v.stream_id = vs.stream_id
+            WHERE vs.workspace_id = $1
               AND vs.alert_enabled = TRUE
               AND (vs.count_threshold_greater IS NOT NULL OR vs.count_threshold_less IS NOT NULL)
-              {date_filter}
               {location_where}
-            GROUP BY sr.camera_name
             {having_clause}
-            ORDER BY (
-                COUNT(CASE 
-                    WHEN vs.count_threshold_greater IS NOT NULL 
-                         AND sr.person_count > vs.count_threshold_greater 
-                    THEN 1 
-                END) + 
-                COUNT(CASE 
-                    WHEN vs.count_threshold_less IS NOT NULL 
-                         AND sr.person_count < vs.count_threshold_less 
-                    THEN 1 
-                END)
-            ) DESC, sr.camera_name
+            ORDER BY (COALESCE(v.above_max_count, 0) + COALESCE(v.below_min_count, 0)) DESC, vs.name
         """
         
         logger.info(f"Executing threshold violations query with {len(params)} parameters")
@@ -2401,7 +2391,7 @@ async def get_threshold_violations_by_camera(
         # Step 4: Format results
         data = [{
             'camera_name': row['camera_name'],
-            'camera_id': row['camera_id'],
+            'camera_id': str(row['stream_id']),
             'location': row['location'],
             'area': row['area'],
             'building': row['building'],

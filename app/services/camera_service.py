@@ -214,12 +214,14 @@ class CameraService:
             # Build update query
             set_clauses, params = [], []
             param_idx = 1
-            
+            snapshot_fields = {}
+
             # Core fields
             if stream_update.name is not None:
                 set_clauses.append(f"name = ${param_idx}")
                 params.append(stream_update.name)
                 param_idx += 1
+                snapshot_fields['camera_name'] = stream_update.name
             if stream_update.path is not None:
                 set_clauses.append(f"path = ${param_idx}")
                 params.append(stream_update.path)
@@ -244,6 +246,7 @@ class CameraService:
                     set_clauses.append(f"{field} = ${param_idx}")
                     params.append(getattr(stream_update, field))
                     param_idx += 1
+                    snapshot_fields[field] = getattr(stream_update, field)
             
             # Alert fields
             alert_fields = ['count_threshold_greater', 'count_threshold_less', 'alert_enabled']
@@ -277,13 +280,29 @@ class CameraService:
             )
             
             if rows_affected and rows_affected > 0:
+                await self._sync_stream_results_snapshot(UUID(stream_id_str), snapshot_fields)
                 return True, None
             else:
                 return False, f"Update affected 0 rows for stream {stream_id_str}"
-                
+
         except Exception as e:
             logger.error(f"Error updating stream: {e}", exc_info=True)
             return False, str(e)
+
+    async def _sync_stream_results_snapshot(self, stream_id: UUID, field_values: Dict[str, Any]) -> None:
+        """Propagate camera name/hierarchy changes into the stream_results snapshot so charts reflect the latest values."""
+        if not field_values:
+            return
+        set_clauses, params = [], []
+        for column, value in field_values.items():
+            params.append(value)
+            set_clauses.append(f"{column} = ${len(params)}")
+        params.append(stream_id)
+        query = f"UPDATE stream_results SET {', '.join(set_clauses)} WHERE stream_id = ${len(params)}"
+        try:
+            await self.db_manager.execute_query(query, tuple(params))
+        except Exception as e:
+            logger.error(f"Error syncing stream_results snapshot for {stream_id}: {e}", exc_info=True)
 
     async def delete_cameras(
         self,
@@ -596,13 +615,15 @@ class CameraService:
                 update_fields = []
                 params = []
                 param_count = 0
-                
+                snapshot_fields = {}
+
                 # Location fields
                 for field in ['location', 'area', 'building', 'floor_level', 'zone', 'latitude', 'longitude']:
                     if hasattr(location_data, field) and getattr(location_data, field) is not None:
                         param_count += 1
                         update_fields.append(f"{field} = ${param_count}")
                         params.append(getattr(location_data, field))
+                        snapshot_fields[field] = getattr(location_data, field)
                 
                 # Alert fields
                 for field in ['count_threshold_greater', 'count_threshold_less', 'alert_enabled']:
@@ -642,6 +663,7 @@ class CameraService:
                 )
                 
                 if rows_affected and rows_affected > 0:
+                    await self._sync_stream_results_snapshot(UUID(camera_id_str), snapshot_fields)
                     updated_cameras.append(camera_id_str)
                 else:
                     failed_cameras.append({

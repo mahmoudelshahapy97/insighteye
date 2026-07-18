@@ -1993,21 +1993,6 @@ async def stop_workspace_stream_endpoint(
             additional_context=f"Stopped by {requester_username} via legacy endpoint /stop_stream"
         )
         
-        # Create notification for stream owner (if different from requester)
-        try:
-            from app.services.notification_service import notification_service
-            if str(s_owner_id) != requester_user_id_str:
-                await notification_service.create_notification(
-                    workspace_id=s_workspace_id,
-                    user_id=s_owner_id,
-                    status="inactive",
-                    message=f"Camera '{s_name}' stopped by {requester_username}.",
-                    stream_id=stream_id_uuid,
-                    camera_name=s_name
-                )
-        except Exception as notif_error:
-            logger.warning(f"Failed to create notification: {notif_error}")
-        
         logger.info(
             f"✅ Stream {stream_id_str} ({s_name}) stopped successfully via legacy endpoint. "
             f"Will NOT auto-restart."
