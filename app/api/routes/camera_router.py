@@ -401,7 +401,7 @@ async def get_stream_thresholds(
             "thresholds": {
                 "count_threshold_greater": stream_info.get('count_threshold_greater'),
                 "count_threshold_less": stream_info.get('count_threshold_less'),
-                "alert_enabled": stream_info.get('alert_enabled', False)
+                "alert_enabled": stream_info.get('alert_enabled', True)
             }
         })
         

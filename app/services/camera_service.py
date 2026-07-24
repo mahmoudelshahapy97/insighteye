@@ -87,7 +87,7 @@ class CameraService:
                     getattr(stream, 'building', None), getattr(stream, 'floor_level', None),
                     getattr(stream, 'zone', None), getattr(stream, 'latitude', None),
                     getattr(stream, 'longitude', None), getattr(stream, 'count_threshold_greater', None),
-                    getattr(stream, 'count_threshold_less', None), getattr(stream, 'alert_enabled', False),
+                    getattr(stream, 'count_threshold_less', None), getattr(stream, 'alert_enabled', True),
                     getattr(stream, 'is_shoplifting_camera', False),
                     now_utc, now_utc, now_utc
                 )

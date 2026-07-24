@@ -30,7 +30,7 @@ class StreamCreate(BaseModel):
     longitude: Optional[Decimal] = Field(None, ge=-180, le=180, decimal_places=8)
     count_threshold_greater: Optional[int] = Field(None, ge=0)
     count_threshold_less: Optional[int] = Field(None, ge=0)
-    alert_enabled: bool = Field(default=False)
+    alert_enabled: bool = Field(default=True)
     is_shoplifting_camera: bool = Field(default=False)
 
 class StreamUpdate(BaseModel):
@@ -49,7 +49,7 @@ class StreamUpdate(BaseModel):
     longitude: Optional[Decimal] = Field(None, ge=-180, le=180, decimal_places=8)
     count_threshold_greater: Optional[int] = Field(None, ge=0)
     count_threshold_less: Optional[int] = Field(None, ge=0)
-    alert_enabled: bool = Field(default=False)
+    alert_enabled: bool = Field(default=True)
     is_shoplifting_camera: Optional[bool] = Field(default=None)
 
 class StreamUpdateList(BaseModel):
@@ -163,7 +163,7 @@ class CameraDetailedResponse(BaseModel):
     longitude: Optional[float] = Field(None, description="Camera longitude")
     count_threshold_greater: Optional[int] = Field(None, description="Alert threshold for greater count")
     count_threshold_less: Optional[int] = Field(None, description="Alert threshold for less count")
-    alert_enabled: bool = Field(default=False, description="Whether alerts are enabled")
+    alert_enabled: bool = Field(default=True, description="Whether alerts are enabled")
     is_shoplifting_camera: bool = Field(default=False, description="Whether shoplifting model is active for this camera")
     created_at: datetime = Field(..., description="Camera creation timestamp")
     updated_at: datetime = Field(..., description="Camera last update timestamp")

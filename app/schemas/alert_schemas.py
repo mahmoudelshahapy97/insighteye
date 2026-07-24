@@ -5,13 +5,13 @@ from typing import Optional, List, Dict, Any
 class ThresholdSettings(BaseModel):
     count_threshold_greater: Optional[int] = None
     count_threshold_less: Optional[int] = None
-    alert_enabled: bool = False
+    alert_enabled: bool = True
 
 class CameraAlertSettings(BaseModel):
     """Model for camera alert threshold settings."""
     count_threshold_greater: Optional[int] = Field(None, ge=0, description="Alert when count is greater than this value")
     count_threshold_less: Optional[int] = Field(None, ge=0, description="Alert when count is less than this value")
-    alert_enabled: bool = Field(False, description="Whether alerts are enabled for this camera")
+    alert_enabled: bool = Field(True, description="Whether alerts are enabled for this camera")
     
     @validator('count_threshold_greater', 'count_threshold_less')
     def validate_thresholds(cls, v):
@@ -32,7 +32,7 @@ class CameraCSVRecordWithLocationAndAlerts(BaseModel):
     path: str = Field(..., min_length=1, max_length=255)
     type: str = Field(default="local")
     status: str = Field(default="inactive")
-    is_streaming: bool = Field(default=False)
+    is_streaming: bool = Field(default=True)
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -42,7 +42,7 @@ class CameraCSVRecordWithLocationAndAlerts(BaseModel):
     longitude: Optional[float] = Field(None, ge=-180, le=180)
     count_threshold_greater: Optional[int] = Field(None, ge=0)
     count_threshold_less: Optional[int] = Field(None, ge=0)
-    alert_enabled: bool = Field(default=False)
+    alert_enabled: bool = Field(default=True)
     
     @validator('type')
     def validate_type(cls, v):

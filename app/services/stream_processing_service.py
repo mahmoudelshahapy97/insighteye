@@ -283,7 +283,7 @@ class StreamProcessingService:
 
             # Threshold checking for people count
             alert_triggered = False
-            if threshold_settings and threshold_settings.get("alert_enabled", False):
+            if threshold_settings and threshold_settings.get("alert_enabled", True):
                 greater_than = threshold_settings.get("greater_than")
                 less_than = threshold_settings.get("less_than")
                 
@@ -468,13 +468,13 @@ class StreamProcessingService:
         
         if not result:
             return {
-                "alert_enabled": False,
+                "alert_enabled": True,
                 "greater_than": None,
                 "less_than": None
             }
         
         return {
-            "alert_enabled": result.get("alert_enabled", False),
+            "alert_enabled": result.get("alert_enabled", True),
             "greater_than": result.get("count_threshold_greater"),
             "less_than": result.get("count_threshold_less")
         }
@@ -583,7 +583,7 @@ class StreamProcessingService:
                 logger.warning(f"⚠️ No threshold settings for stream {stream_id_str}")
                 return
             
-            if not threshold_settings.get("alert_enabled", False):
+            if not threshold_settings.get("alert_enabled", True):
                 logger.debug(f"⏭️ Alerts disabled for stream {stream_id_str}")
                 return
             

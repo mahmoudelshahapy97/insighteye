@@ -2316,12 +2316,15 @@ async def get_threshold_violations_by_camera(
                                for f in location_filters]
             location_where = " AND " + " AND ".join(prefixed_filters)
 
-        # Step 3: Conditional HAVING clause based on include_zero_violations parameter
-        having_clause = ""
+        # Step 3: Conditional zero-violations filter based on include_zero_violations parameter
+        # NOTE: this must be a WHERE condition, not HAVING - the outer query has no GROUP BY
+        # (violations/checks CTEs are already one row per stream_id), and a bare HAVING with
+        # no GROUP BY causes Postgres to reject every non-aggregated SELECT column (GroupingError).
+        zero_violations_filter = ""
         if not include_zero_violations:
-            having_clause = """
-            HAVING COALESCE(v.above_max_count, 0) > 0
-                OR COALESCE(v.below_min_count, 0) > 0
+            zero_violations_filter = """
+              AND (COALESCE(v.above_max_count, 0) > 0
+                   OR COALESCE(v.below_min_count, 0) > 0)
             """
 
         query = f"""
@@ -2376,7 +2379,7 @@ async def get_threshold_violations_by_camera(
               AND vs.alert_enabled = TRUE
               AND (vs.count_threshold_greater IS NOT NULL OR vs.count_threshold_less IS NOT NULL)
               {location_where}
-            {having_clause}
+              {zero_violations_filter}
             ORDER BY (COALESCE(v.above_max_count, 0) + COALESCE(v.below_min_count, 0)) DESC, vs.name
         """
         

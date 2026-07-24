@@ -1166,14 +1166,14 @@ class ShopliftingService:
 
         q_avg = f"""
             SELECT
-                vs.location, vs.zone, vs.name AS camera_name,
+                vs.location,
                 COUNT(sd.observation_id)::float /
                     NULLIF(SUM(vs.session_count), 0) AS avg_behavior_per_session,
                 COALESCE(SUM(vs.session_count), 0) AS session_count
             FROM surveillance_data sd
             JOIN video_stream vs ON sd.stream_id = vs.stream_id
             WHERE {where}
-            GROUP BY vs.location, vs.zone, vs.name
+            GROUP BY vs.location
             ORDER BY avg_behavior_per_session DESC NULLS LAST
         """
         try:
@@ -1250,9 +1250,11 @@ class ShopliftingService:
         vs_where = " AND ".join(vs_conditions)
         base_params = tuple(params)
 
+        # NOTE: vs.session_count is never populated by any write path in this codebase,
+        # so most locations legitimately compute a 0 rate here until that's addressed.
         q_rate = f"""
             SELECT
-                vs.location, vs.zone,
+                vs.location,
                 COUNT(DISTINCT se.event_id)      AS incident_count,
                 COALESCE(SUM(vs.session_count), 0) AS session_count,
                 CASE
@@ -1266,7 +1268,7 @@ class ShopliftingService:
             LEFT JOIN shoplifting_events se
                 ON se.stream_id = vs.stream_id AND se.workspace_id = $1{event_extra}
             WHERE {vs_where}
-            GROUP BY vs.location, vs.zone
+            GROUP BY vs.location
             ORDER BY incidents_per_1000_sessions DESC
         """
 
@@ -1281,13 +1283,13 @@ class ShopliftingService:
         se_where = " AND ".join(se_conditions)
         q_top5 = f"""
             SELECT
-                vs.location, vs.zone,
+                vs.location,
                 COUNT(se.event_id)      AS incident_count,
                 SUM(se.estimated_value) AS total_loss
             FROM shoplifting_events se
             JOIN video_stream vs ON se.stream_id = vs.stream_id
             WHERE {se_where}
-            GROUP BY vs.location, vs.zone
+            GROUP BY vs.location
             ORDER BY incident_count DESC
             LIMIT 5
         """

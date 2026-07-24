@@ -66,7 +66,7 @@ def sample_camera_data():
         "longitude": 31.0,
         "count_threshold_greater": 10,
         "count_threshold_less": 0,
-        "alert_enabled": False
+        "alert_enabled": True
     }
 
 
