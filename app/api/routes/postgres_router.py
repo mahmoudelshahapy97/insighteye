@@ -200,6 +200,9 @@ async def workspace_search_results_with_location(
             processed_per_page = int(per_page)
         elif per_page is None:
             processed_per_page = 10
+
+        if full_data and (processed_per_page is None or processed_per_page > 1000):
+            processed_per_page = 1000
         
         # Parse camera IDs
         parsed_camera_ids = parse_camera_ids(camera_id_param) if camera_id_param else None
