@@ -409,7 +409,7 @@ class PostgresService:
                 JOIN users u ON sr.user_id = u.user_id
                 {frame_join}
                 WHERE {where_clause}
-                ORDER BY sr.timestamp DESC
+                ORDER BY sr.timestamp DESC, sr.result_id DESC
                 {limit_clause} {offset_clause}
             """
             
@@ -835,7 +835,7 @@ class PostgresService:
                 FROM stream_results sr
                 {frame_join}
                 WHERE {where_clause}
-                ORDER BY sr.timestamp DESC
+                ORDER BY sr.timestamp DESC, sr.result_id DESC
             """
             
             results = await self.db_manager.execute_query(

@@ -219,7 +219,7 @@ class ShopliftingService:
                 LIMIT 1
             ) sd ON TRUE
             WHERE {where}
-            ORDER BY se.event_timestamp DESC
+            ORDER BY se.event_timestamp DESC, se.event_id DESC
             LIMIT ${p-1} OFFSET ${p}
         """
         try:
@@ -518,7 +518,7 @@ class ShopliftingService:
                 LIMIT 1
             ) sd ON TRUE
             WHERE {where}
-            ORDER BY se.event_timestamp DESC
+            ORDER BY se.event_timestamp DESC, se.event_id DESC
             LIMIT ${p-1} OFFSET ${p}
         """
         q_count = f"""

@@ -197,12 +197,20 @@ async def workspace_search_results_with_location(
         # Process per_page
         processed_per_page = None
         if per_page and per_page.lower() not in ["none", "null", ""]:
-            processed_per_page = int(per_page)
+            try:
+                processed_per_page = int(per_page)
+                if processed_per_page < 1 or processed_per_page > 100:
+                    raise ValueError("Invalid range")
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="per_page must be between 1 and 100"
+                )
         elif per_page is None:
             processed_per_page = 10
 
-        if full_data and (processed_per_page is None or processed_per_page > 1000):
-            processed_per_page = 1000
+        if full_data:
+            processed_per_page = 100
         
         # Parse camera IDs
         parsed_camera_ids = parse_camera_ids(camera_id_param) if camera_id_param else None
