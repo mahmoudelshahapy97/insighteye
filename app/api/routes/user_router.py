@@ -2,16 +2,37 @@
 from fastapi import APIRouter, HTTPException, status, Depends, Request as FastAPIRequest
 from typing import Dict, Any
 from uuid import UUID
+from pydantic import BaseModel, Field
 from app.services.database import db_manager
-from app.services.session_service import session_manager 
+from app.services.session_service import session_manager
 from app.services.user_service import user_manager
-from app.schemas import SQLQueryRequest, SQLQueryResponse, CreateUserRequest, VerifyPasswordRequest, ResetPasswordRequest, EmailRequest, UserRequest 
+from app.services.workspace_service import workspace_service
+from app.schemas import SQLQueryRequest, SQLQueryResponse, CreateUserRequest, VerifyPasswordRequest, ResetPasswordRequest, EmailRequest, UserRequest
 import logging
 import asyncpg
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+class UpdateUserRoleRequest(BaseModel):
+    role: str = Field(..., pattern="^(user|admin|superadmin)$")
+
+
+async def get_current_superadmin_user_dependency(
+    request_obj: FastAPIRequest,
+    current_user_full_data: Dict[str, Any] = Depends(session_manager.get_current_user_full_data_dependency)
+) -> Dict[str, Any]:
+    """Ensures the current user is authenticated and has the 'superadmin' role."""
+    username = current_user_full_data.get("username", "UnknownUser")
+    if not workspace_service.is_superadmin(current_user_full_data):
+        logger.warning(f"Non-superadmin user '{username}' attempted to access superadmin route: {request_obj.url.path}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Superadmin privileges required to access this resource."
+        )
+    return current_user_full_data
 
 @router.post("", status_code=status.HTTP_201_CREATED)  # Use 201 Created for successful creation
 async def create_user_route(request: CreateUserRequest):
@@ -144,10 +165,10 @@ async def reset_password_route(
 
 @router.get("")
 async def get_all_users_route(
-    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+    current_user: dict = Depends(get_current_superadmin_user_dependency)
 ):
     """
-    Gets all users.
+    Gets all users. Superadmin only.
 
     Returns:
         A list of all users.
@@ -160,6 +181,27 @@ async def get_all_users_route(
         return users
     except HTTPException as http_exc:
          raise http_exc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+
+
+@router.put("/{username}/role")
+async def update_user_role_route(
+    username: str,
+    request: UpdateUserRoleRequest,
+    current_user: dict = Depends(get_current_superadmin_user_dependency)
+):
+    """
+    Change a user's role. Superadmin only.
+    """
+    try:
+        success = await user_manager.update_user_role(username, request.role)
+        if success:
+            return {"message": f"User '{username}' role updated to '{request.role}'."}
+        else:
+            raise HTTPException(status_code=404, detail=f"User '{username}' not found or role unchanged.")
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
@@ -193,10 +235,10 @@ async def delete_user_route(
 
 @router.delete("")
 async def delete_all_users_route(
-    current_user: dict = Depends(session_manager.get_current_user_full_data_dependency)
+    current_user: dict = Depends(get_current_superadmin_user_dependency)
 ):
     """
-    Deletes all users.
+    Deletes all users. Superadmin only.
 
     Returns:
         A message indicating how many users were deleted.

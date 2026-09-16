@@ -379,13 +379,13 @@ async def admin_get_all_workspaces(
     include_inactive: bool = Query(False, description="Include inactive workspaces"),
     current_user_data: Dict = Depends(get_current_user_full_data_dependency)
 ):
-    """Get all workspaces (admin only)."""
-    if not workspace_service.is_system_admin(current_user_data):
+    """Get all workspaces (superadmin only)."""
+    if not workspace_service.is_superadmin(current_user_data):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This action requires system admin privileges."
+            detail="This action requires superadmin privileges."
         )
-    
+
     return await workspace_service.get_all_workspaces(include_inactive)
 
 
@@ -393,13 +393,13 @@ async def admin_get_all_workspaces(
 async def admin_get_all_users(
     current_user_data: Dict = Depends(get_current_user_full_data_dependency)
 ):
-    """Get all users (admin only)."""
-    if not workspace_service.is_system_admin(current_user_data):
+    """Get all users (superadmin only)."""
+    if not workspace_service.is_superadmin(current_user_data):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This action requires system admin privileges."
+            detail="This action requires superadmin privileges."
         )
-    
+
     try:
         all_users_data = await user_manager.get_all_users()
         response_users = []

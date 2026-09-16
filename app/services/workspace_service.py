@@ -20,6 +20,10 @@ class WorkspaceService:
         """Check if user has system admin role."""
         return user_data and user_data.get("role") == "admin"
 
+    def is_superadmin(self, user_data: Dict) -> bool:
+        """Check if user has the superadmin role."""
+        return bool(user_data and user_data.get("role") == "superadmin")
+
     async def get_workspace_by_id(self, workspace_id: UUID, check_active: bool = True) -> dict:
         """Retrieve workspace by ID with optional active status check."""
         query = """

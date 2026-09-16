@@ -5,6 +5,10 @@ from decimal import Decimal
 from datetime import datetime
 from uuid import UUID
 
+# Fixed set of detection model tags a camera can be assigned. Keep this in sync
+# with cameraModelTypesArr in the frontend's StaticVariables.js.
+DETECTION_MODEL_TYPES = ['fire_smoke', 'shoplifting', 'people_counting']
+
 class StreamQueryParams(BaseModel):
     frame_delay: Optional[float] = 0
     frame_skip: Optional[int] = 300
@@ -51,6 +55,16 @@ class StreamUpdate(BaseModel):
     count_threshold_less: Optional[int] = Field(None, ge=0)
     alert_enabled: bool = Field(default=True)
     is_shoplifting_camera: Optional[bool] = Field(default=None)
+    detection_models: Optional[List[str]] = Field(default=None)
+
+    @validator('detection_models')
+    def validate_detection_models(cls, v):
+        if v is None:
+            return v
+        invalid = [m for m in v if m not in DETECTION_MODEL_TYPES]
+        if invalid:
+            raise ValueError(f"Invalid detection model(s): {invalid}. Must be one of: {DETECTION_MODEL_TYPES}")
+        return v
 
 class StreamUpdateList(BaseModel):
     streams: List[StreamUpdate]

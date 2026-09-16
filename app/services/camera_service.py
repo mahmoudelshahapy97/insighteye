@@ -261,6 +261,11 @@ class CameraService:
                 params.append(stream_update.is_shoplifting_camera)
                 param_idx += 1
 
+            if getattr(stream_update, 'detection_models', None) is not None:
+                set_clauses.append(f"detection_models = ${param_idx}")
+                params.append(stream_update.detection_models)
+                param_idx += 1
+
             if not set_clauses:
                 return True, None  # Nothing to update
             

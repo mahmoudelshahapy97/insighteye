@@ -571,7 +571,7 @@ class UserManager:
         return rows_deleted
 
     async def update_user_role(self, username: str, role: str) -> bool:
-        valid_roles = ['user', 'admin'] 
+        valid_roles = ['user', 'admin', 'superadmin']
         if role not in valid_roles:
             logger.warning(f"Invalid role attempted: {role}")
             return False

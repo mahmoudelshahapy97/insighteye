@@ -7,7 +7,7 @@ class CreateUserRequest(BaseModel):
     username: str = Field(..., description="Username for the new user")
     password: str = Field(..., description="Password for the new user")
     email: EmailStr = Field(..., description="Email address for the new user")
-    role: str = Field("user", pattern="^(user|admin)$")
+    role: str = Field("user", pattern="^(user|admin|superadmin)$")
     count_of_camera: int = Field(5)
 
 class LoginRequest(BaseModel):
