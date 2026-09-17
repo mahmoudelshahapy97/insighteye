@@ -203,24 +203,32 @@ class Settings(BaseSettings):
     pt_gender_model_path: str = "models/gender.pt"
     pt_fire_model_path: str = "models/fire.pt"
     pt_shoplifting_model_path: str = "models/shoplifting.pt"
+    pt_blocked_exit_model_path: str = "models/yolo11n-seg.pt"
+    pt_no_entry_zone_model_path: str = "models/yolo26n.pt"
 
     # ONNX Model Paths
     onnx_people_model_path: str = "models/people.onnx"
     onnx_gender_model_path: str = "models/gender.onnx"
-    onnx_fire_model_path: str = "models/fire.onnx" 
+    onnx_fire_model_path: str = "models/fire.onnx"
     onnx_shoplifting_model_path: str = "models/shoplifting.onnx"
+    onnx_blocked_exit_model_path: str = "models/yolo11n-seg.onnx"
+    onnx_no_entry_zone_model_path: str = "models/yolo26n.onnx"
 
     # OpenVINO Model Paths
     openvino_people_model_path: str = "models/people_openvino"
     openvino_gender_model_path: str = "models/gender_openvino"
     openvino_fire_model_path: str = "models/fire_openvino"
     openvino_shoplifting_model_path: str = "models/shoplifting_openvino"
+    openvino_blocked_exit_model_path: str = "models/yolo11n-seg_openvino"
+    openvino_no_entry_zone_model_path: str = "models/yolo26n_openvino"
 
     # TensorRT Model Paths
     tensorrt_people_model_path: str = "models/people.engine"
     tensorrt_gender_model_path: str = "models/gender.engine"
     tensorrt_fire_model_path: str = "models/fire.engine"
     tensorrt_shoplifting_model_path: str = "models/shoplifting.engine"
+    tensorrt_blocked_exit_model_path: str = "models/yolo11n-seg.engine"
+    tensorrt_no_entry_zone_model_path: str = "models/yolo26n.engine"
 
     # Pose Model (for temporal sequence extraction)
     pt_pose_model_path: str = "models/yolo26m-pose.pt"
@@ -270,6 +278,26 @@ class Settings(BaseSettings):
         elif self.model_backend == "tensorrt":
             return self.tensorrt_shoplifting_model_path
         return self.pt_shoplifting_model_path
+
+    @property
+    def blocked_exit_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_blocked_exit_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_blocked_exit_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_blocked_exit_model_path
+        return self.pt_blocked_exit_model_path
+
+    @property
+    def no_entry_zone_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_no_entry_zone_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_no_entry_zone_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_no_entry_zone_model_path
+        return self.pt_no_entry_zone_model_path
 
     model_cache_dir: str = "./model_cache"
     model_device: Literal["cpu", "cuda"] = "cuda"
@@ -399,6 +427,26 @@ class Settings(BaseSettings):
     gender_confidence: float = 0.5
     fire_confidence: float = 0.5
     shoplifting_confidence: float = 0.5
+    blocked_exit_confidence: float = 0.4
+    no_entry_zone_confidence: float = 0.4
+
+    # Standard 80-class COCO label list, index == class_id, used to translate
+    # the ModelFactory loaders' bare class_id detections into readable labels
+    # for blocked-exit/no-entry-zone risk scoring and target-class matching.
+    coco_class_names: List[str] = [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+        "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+        "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+        "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+        "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+        "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+        "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+        "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+        "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+        "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+        "toothbrush",
+    ]
     people_device: Literal["cpu", "cuda"] = "cpu"
 
     enable_batch_inference: bool = True

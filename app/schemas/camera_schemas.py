@@ -7,7 +7,7 @@ from uuid import UUID
 
 # Fixed set of detection model tags a camera can be assigned. Keep this in sync
 # with cameraModelTypesArr in the frontend's StaticVariables.js.
-DETECTION_MODEL_TYPES = ['fire_smoke', 'shoplifting', 'people_counting']
+DETECTION_MODEL_TYPES = ['fire_smoke', 'shoplifting', 'people_counting', 'blocked_exit', 'no_entry_zone']
 
 class StreamQueryParams(BaseModel):
     frame_delay: Optional[float] = 0

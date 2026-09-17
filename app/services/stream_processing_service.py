@@ -31,6 +31,8 @@ from app.services.retry_service import retry_service
 from app.services.notification_service import notification_service
 from app.services.fire_detection_service import fire_detection_service
 from app.services.people_count_service import people_count_service
+from app.services.blocked_exit_inference import blocked_exit_engine
+from app.services.no_entry_zone_inference import no_entry_zone_engine
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +123,8 @@ class StreamProcessingService:
             
             from app.services.shoplifting_inference import shoplifting_engine
             self.shoplifting_engine = shoplifting_engine
+            self.blocked_exit_engine = blocked_exit_engine
+            self.no_entry_zone_engine = no_entry_zone_engine
 
             # Load models immediately to fail fast if there's an issue
             self.people_model.load_model()
@@ -1045,6 +1049,119 @@ class StreamProcessingService:
         except Exception as e:
             logger.error(f"Error handling Fire/smoke detection alert: {e}", exc_info=True)
 
+    async def _handle_blocked_exit_alert(
+        self,
+        stream_id: UUID,
+        stream_id_str: str,
+        result: Dict[str, Any],
+        camera_name: str,
+        workspace_id: UUID,
+        owner_id: UUID,
+    ):
+        """Persist a blocked-exit event and notify, mirroring _handle_fire_detection_alert."""
+        try:
+            from app.services.blocked_exit_service import blocked_exit_service
+
+            event_id = await blocked_exit_service.record_event(
+                stream_id=stream_id,
+                workspace_id=workspace_id,
+                state=result["state"],
+                accessibility_pct=result.get("accessibility_pct"),
+                blocking_objects=result.get("blocking_objects"),
+                risk_score=result.get("risk_score"),
+                risk_level=result.get("risk_level"),
+                recommended_action=result.get("recommended_action"),
+            )
+            if not event_id:
+                return  # deduplicated against a recent open event
+
+            message = f"🚪 EXIT BLOCKED: '{camera_name}' exit is {result['state'].replace('_', ' ')} ({result.get('accessibility_pct')}% accessible)"
+            notification = await notification_service.create_notification(
+                workspace_id=workspace_id,
+                user_id=owner_id,
+                status="urgent" if result.get("risk_level") in ("high", "critical") else "warning",
+                message=message,
+                stream_id=stream_id,
+                camera_name=camera_name,
+            )
+            if notification and self.stream_manager:
+                await self.stream_manager.broadcast_notification(
+                    str(owner_id),
+                    {
+                        "type": "new_notification",
+                        "notification": {
+                            "id": str(notification.get("notification_id")),
+                            "user_id": str(notification.get("user_id")),
+                            "workspace_id": str(notification.get("workspace_id")),
+                            "stream_id": stream_id_str,
+                            "camera_name": camera_name,
+                            "status": notification.get("status"),
+                            "message": message,
+                            "timestamp": notification.get("timestamp").timestamp() if notification.get("timestamp") else datetime.now(ZoneInfo("Africa/Cairo")).timestamp(),
+                            "read": False,
+                        },
+                    },
+                )
+            logger.warning(f"🚪 Blocked-exit alert recorded for {stream_id_str}: {result['state']} ({result.get('accessibility_pct')}%)")
+        except Exception as e:
+            logger.error(f"Error handling blocked-exit alert: {e}", exc_info=True)
+
+    async def _handle_no_entry_zone_alert(
+        self,
+        stream_id: UUID,
+        stream_id_str: str,
+        violation: Dict[str, Any],
+        camera_name: str,
+        workspace_id: UUID,
+        owner_id: UUID,
+    ):
+        """Persist a no-entry-zone violation and notify, mirroring _handle_fire_detection_alert."""
+        try:
+            from app.services.no_entry_zone_service import no_entry_zone_service
+
+            event = await no_entry_zone_service.record_event(
+                zone_id=violation["zone_id"],
+                stream_id=stream_id,
+                workspace_id=workspace_id,
+                camera_name=camera_name,
+                zone_name=violation.get("zone_name"),
+                target_class=violation.get("target_class") or "unknown",
+                dwell_seconds=violation.get("dwell_seconds"),
+            )
+            if not event:
+                return
+
+            message = f"⛔ NO-ENTRY VIOLATION: {violation.get('target_class') or 'object'} in '{violation.get('zone_name') or 'zone'}' on '{camera_name}'"
+            notification = await notification_service.create_notification(
+                workspace_id=workspace_id,
+                user_id=owner_id,
+                status="urgent",
+                message=message,
+                stream_id=stream_id,
+                camera_name=camera_name,
+            )
+            if notification and self.stream_manager:
+                await self.stream_manager.broadcast_notification(
+                    str(owner_id),
+                    {
+                        "type": "new_notification",
+                        "notification": {
+                            "id": str(notification.get("notification_id")),
+                            "user_id": str(notification.get("user_id")),
+                            "workspace_id": str(notification.get("workspace_id")),
+                            "stream_id": stream_id_str,
+                            "camera_name": camera_name,
+                            "status": notification.get("status"),
+                            "message": message,
+                            "timestamp": notification.get("timestamp").timestamp() if notification.get("timestamp") else datetime.now(ZoneInfo("Africa/Cairo")).timestamp(),
+                            "read": False,
+                        },
+                    },
+                )
+            logger.warning(f"⛔ No-entry-zone alert recorded for {stream_id_str}: zone={violation.get('zone_name')}")
+        except Exception as e:
+            logger.error(f"Error handling no-entry-zone alert: {e}", exc_info=True)
+
     async def process_stream_with_sharing(
         self,
         stream_id: UUID,
@@ -1072,6 +1189,8 @@ class StreamProcessingService:
         video_buffer = deque(maxlen=300)   # ~10 s at 30 fps
         last_shoplifting_save_time = None  # time-based dedup — save at most once per 5 min
         shoplifting_engine_load_attempted = False  # throttle: only retry once per stream session
+        blocked_exit_engine_load_attempted = False
+        no_entry_zone_engine_load_attempted = False
 
         last_db_update_activity = datetime.now(ZoneInfo("Africa/Cairo"))
         last_heartbeat = datetime.now(ZoneInfo("Africa/Cairo"))
@@ -1112,6 +1231,26 @@ class StreamProcessingService:
             _stream_db = await _vs_svc.get_video_stream_by_id(stream_id)
             is_shoplifting_camera = bool(_stream_db.get('is_shoplifting_camera', False)) if _stream_db else False
             logger.info(f"[shoplifting] stream={stream_id_str[:8]} is_shoplifting_camera={is_shoplifting_camera}")
+
+            detection_models = set(_stream_db.get('detection_models') or []) if _stream_db else set()
+            blocked_exit_enabled = 'blocked_exit' in detection_models
+            no_entry_zone_enabled = 'no_entry_zone' in detection_models
+
+            if blocked_exit_enabled:
+                try:
+                    from app.services.blocked_exit_service import blocked_exit_service
+                    zone_cfg = await blocked_exit_service.get_zone_config(stream_id)
+                    self.blocked_exit_engine.set_zone_config(stream_id_str, zone_cfg)
+                except Exception as e:
+                    logger.error(f"[blocked-exit] failed to load zone config for {stream_id_str}: {e}")
+
+            if no_entry_zone_enabled:
+                try:
+                    from app.services.no_entry_zone_service import no_entry_zone_service
+                    zones = await no_entry_zone_service.list_zones(workspace_id, stream_id=stream_id)
+                    self.no_entry_zone_engine.set_zones(stream_id_str, zones)
+                except Exception as e:
+                    logger.error(f"[no-entry-zone] failed to load zones for {stream_id_str}: {e}")
 
             # -------------------- SOURCE --------------------
             if not source.startswith("rtsp://"):
@@ -1238,6 +1377,46 @@ class StreamProcessingService:
                                 shoplifting_conf = shop_conf if shop_alert else 0.0
                         except Exception as e:
                             logger.error(f"Shoplifting detection error for stream {stream_id_str}: {e}")
+
+                    # ===== BLOCKED-EXIT DETECTION (independent rate, gated by detection_models) =====
+                    if blocked_exit_enabled and frame_count % shoplifting_frame_rate == 0 and self.blocked_exit_engine.has_config(stream_id_str):
+                        engine = self.blocked_exit_engine
+                        if not engine.is_loaded and not blocked_exit_engine_load_attempted:
+                            blocked_exit_engine_load_attempted = True
+                            try:
+                                await loop.run_in_executor(thread_pool, engine.load_models)
+                            except Exception as _le:
+                                logger.error(f"[blocked-exit] lazy load_models failed: {_le}")
+                        try:
+                            be_result = await loop.run_in_executor(
+                                thread_pool, engine.process_frame, stream_id_str, frame,
+                            )
+                            if be_result and be_result.get("alert"):
+                                await self._handle_blocked_exit_alert(
+                                    stream_id, stream_id_str, be_result, camera_name, workspace_id, owner_id,
+                                )
+                        except Exception as e:
+                            logger.error(f"Blocked-exit detection error for stream {stream_id_str}: {e}")
+
+                    # ===== NO-ENTRY-ZONE DETECTION (independent rate, gated by detection_models) =====
+                    if no_entry_zone_enabled and frame_count % shoplifting_frame_rate == 0 and self.no_entry_zone_engine.has_zones(stream_id_str):
+                        engine = self.no_entry_zone_engine
+                        if not engine.is_loaded and not no_entry_zone_engine_load_attempted:
+                            no_entry_zone_engine_load_attempted = True
+                            try:
+                                await loop.run_in_executor(thread_pool, engine.load_models)
+                            except Exception as _le:
+                                logger.error(f"[no-entry-zone] lazy load_models failed: {_le}")
+                        try:
+                            violations = await loop.run_in_executor(
+                                thread_pool, engine.process_frame, stream_id_str, frame,
+                            )
+                            for violation in violations:
+                                await self._handle_no_entry_zone_alert(
+                                    stream_id, stream_id_str, violation, camera_name, workspace_id, owner_id,
+                                )
+                        except Exception as e:
+                            logger.error(f"No-entry-zone detection error for stream {stream_id_str}: {e}")
 
                     # ---------- Shoplifting Event DB Insertion ----------
                     # Save at most once per 5 minutes per stream (matches DB dedup window)
