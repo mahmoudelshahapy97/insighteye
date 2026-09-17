@@ -171,11 +171,12 @@ class NoEntryZoneService:
     async def resolve_event(
         self, *, event_id: int, status: str, description: Optional[str] = None
     ) -> bool:
-        await self.db.execute_query(
-            "SELECT resolve_no_entry_event($1, $2, $3)",
+        row = await self.db.execute_query(
+            "SELECT resolve_no_entry_event($1, $2, $3) AS found",
             (event_id, status, description),
+            fetch_one=True,
         )
-        return True
+        return bool(row and row.get("found"))
 
     async def get_active_dashboard(self, workspace_id: UUID) -> List[Dict[str, Any]]:
         return await self.db.execute_query(
@@ -291,10 +292,12 @@ class NoEntryZoneService:
             p += 1
             fields.append(f"polygon = ${p}::jsonb")
             params.append(json.dumps(data["polygon"]))
-        if data.get("schedule") is not None:
+        if "schedule" in data:
+            # Explicit null in the request body clears the schedule (zone becomes
+            # always-active); omitting the field entirely leaves it untouched.
             p += 1
             fields.append(f"schedule = ${p}::jsonb")
-            params.append(json.dumps(data["schedule"]))
+            params.append(json.dumps(data["schedule"]) if data["schedule"] is not None else None)
         if not fields:
             row = await self.db.execute_query(
                 "SELECT * FROM no_entry_zones WHERE zone_id = $1 AND workspace_id = $2",
@@ -329,7 +332,15 @@ class NoEntryZoneService:
 
     async def delete_events(self, workspace_id: UUID, *, camera_id: Optional[str] = None, **filters) -> Dict[str, Any]:
         conditions, params, _ = self._build_event_conditions(workspace_id, camera_id=camera_id, **filters)
-        query = f"DELETE FROM no_entry_events ne WHERE {' AND '.join(conditions)}"
+        query = f"""
+            DELETE FROM no_entry_events
+            WHERE event_id IN (
+                SELECT ne.event_id
+                FROM no_entry_events ne
+                LEFT JOIN video_stream vs ON ne.stream_id = vs.stream_id
+                WHERE {' AND '.join(conditions)}
+            )
+        """
         affected = await self.db.execute_query(query, tuple(params), return_rowcount=True)
         return {"deleted": affected}
 

@@ -165,12 +165,12 @@ class BlockedExitService:
     async def resolve_event(
         self, *, event_id: int, status: str, description: Optional[str] = None
     ) -> bool:
-        rowcount = await self.db.execute_query(
-            "SELECT resolve_blocked_exit_event($1, $2, $3)",
+        row = await self.db.execute_query(
+            "SELECT resolve_blocked_exit_event($1, $2, $3) AS found",
             (event_id, status, description),
-            return_rowcount=False,
+            fetch_one=True,
         )
-        return True
+        return bool(row and row.get("found"))
 
     async def get_active_dashboard(self, workspace_id: UUID) -> List[Dict[str, Any]]:
         return await self.db.execute_query(
@@ -291,7 +291,15 @@ class BlockedExitService:
 
     async def delete_events(self, workspace_id: UUID, *, camera_id: Optional[str] = None, **filters) -> Dict[str, Any]:
         conditions, params, _ = self._build_event_conditions(workspace_id, camera_id=camera_id, **filters)
-        query = f"DELETE FROM blocked_exit_events be WHERE {' AND '.join(conditions)}"
+        query = f"""
+            DELETE FROM blocked_exit_events
+            WHERE event_id IN (
+                SELECT be.event_id
+                FROM blocked_exit_events be
+                LEFT JOIN video_stream vs ON be.stream_id = vs.stream_id
+                WHERE {' AND '.join(conditions)}
+            )
+        """
         affected = await self.db.execute_query(query, tuple(params), return_rowcount=True)
         return {"deleted": affected}
 

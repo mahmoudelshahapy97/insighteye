@@ -73,9 +73,9 @@ class CameraService:
                 (stream_id, user_id, workspace_id, name, path, type, status, is_streaming,
                  location, area, building, floor_level, zone, latitude, longitude,
                  count_threshold_greater, count_threshold_less, alert_enabled,
-                 is_shoplifting_camera,
+                 is_shoplifting_camera, detection_models,
                  created_at, updated_at, last_activity)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
             """
 
             await self.db_manager.execute_query(
@@ -89,6 +89,7 @@ class CameraService:
                     getattr(stream, 'longitude', None), getattr(stream, 'count_threshold_greater', None),
                     getattr(stream, 'count_threshold_less', None), getattr(stream, 'alert_enabled', True),
                     getattr(stream, 'is_shoplifting_camera', False),
+                    getattr(stream, 'detection_models', None) or [],
                     now_utc, now_utc, now_utc
                 )
             )

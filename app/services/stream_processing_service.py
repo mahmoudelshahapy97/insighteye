@@ -145,7 +145,8 @@ class StreamProcessingService:
         frame: np.ndarray,
         conf_threshold: float = 0.5,
         threshold_settings: Dict[str, Any] = None,
-        stream_id_str: str = None
+        stream_id_str: str = None,
+        detection_models: Optional[set] = None,
     ) -> Tuple[np.ndarray, int, bool, int, int, str, bool, float, List[str]]:
         """
         Detect objects in frame with threshold checking.
@@ -237,8 +238,9 @@ class StreamProcessingService:
                 except Exception as e:
                     logger.error(f"Gender detection error for stream {stream_id_str}: {e}")
 
-            # Fire detection (every 10th frame)
-            if frame_count % 10 == 0 and self.fire_model and self.fire_model.is_loaded:
+            # Fire detection (every 10th frame), gated by the camera's detection_models
+            fire_enabled = bool(detection_models and 'fire_smoke' in detection_models)
+            if fire_enabled and frame_count % 10 == 0 and self.fire_model and self.fire_model.is_loaded:
                 try:
                     raw_fire_results = self.fire_model.predict(input_frame)
                     fire_detections = self.fire_model.postprocess(
@@ -1229,10 +1231,13 @@ class StreamProcessingService:
 
             from app.services.video_stream_service import video_stream_service as _vs_svc
             _stream_db = await _vs_svc.get_video_stream_by_id(stream_id)
-            is_shoplifting_camera = bool(_stream_db.get('is_shoplifting_camera', False)) if _stream_db else False
-            logger.info(f"[shoplifting] stream={stream_id_str[:8]} is_shoplifting_camera={is_shoplifting_camera}")
 
             detection_models = set(_stream_db.get('detection_models') or []) if _stream_db else set()
+            # Gating is strictly by detection_models for every detector, including
+            # shoplifting: the legacy is_shoplifting_camera column is no longer consulted.
+            is_shoplifting_camera = 'shoplifting' in detection_models
+            logger.info(f"[shoplifting] stream={stream_id_str[:8]} is_shoplifting_camera={is_shoplifting_camera} (via detection_models)")
+
             blocked_exit_enabled = 'blocked_exit' in detection_models
             no_entry_zone_enabled = 'no_entry_zone' in detection_models
 
@@ -1619,6 +1624,7 @@ class StreamProcessingService:
                             conf_threshold,
                             threshold_settings,
                             stream_id_str,
+                            detection_models,
                         )
                     except Exception as detection_err:
                         logger.error(

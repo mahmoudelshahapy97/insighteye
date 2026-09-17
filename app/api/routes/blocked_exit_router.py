@@ -133,7 +133,7 @@ async def resolve_blocked_exit_event(
         event_id=event_id, status=request.status, description=request.description,
     )
     if not success:
-        raise HTTPException(status_code=500, detail="Failed to resolve event")
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
     return {"message": f"Event {event_id} updated to '{request.status}'"}
 
 

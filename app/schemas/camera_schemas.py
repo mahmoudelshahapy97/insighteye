@@ -36,6 +36,16 @@ class StreamCreate(BaseModel):
     count_threshold_less: Optional[int] = Field(None, ge=0)
     alert_enabled: bool = Field(default=True)
     is_shoplifting_camera: bool = Field(default=False)
+    detection_models: Optional[List[str]] = Field(default=None)
+
+    @validator('detection_models')
+    def validate_detection_models(cls, v):
+        if v is None:
+            return v
+        invalid = [m for m in v if m not in DETECTION_MODEL_TYPES]
+        if invalid:
+            raise ValueError(f"Invalid detection model(s): {invalid}. Must be one of: {DETECTION_MODEL_TYPES}")
+        return v
 
 class StreamUpdate(BaseModel):
     id: str = Field(...)
