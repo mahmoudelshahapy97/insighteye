@@ -1233,13 +1233,16 @@ class StreamProcessingService:
             _stream_db = await _vs_svc.get_video_stream_by_id(stream_id)
 
             detection_models = set(_stream_db.get('detection_models') or []) if _stream_db else set()
-            # Gating is strictly by detection_models for every detector, including
-            # shoplifting: the legacy is_shoplifting_camera column is no longer consulted.
+            # Fire and shoplifting are gated strictly by detection_models.
             is_shoplifting_camera = 'shoplifting' in detection_models
             logger.info(f"[shoplifting] stream={stream_id_str[:8]} is_shoplifting_camera={is_shoplifting_camera} (via detection_models)")
 
-            blocked_exit_enabled = 'blocked_exit' in detection_models
-            no_entry_zone_enabled = 'no_entry_zone' in detection_models
+            # Blocked-exit, no-entry-zone, and people-counting are gated by their own
+            # dedicated boolean columns (mirroring is_shoplifting_camera), independent
+            # of detection_models.
+            blocked_exit_enabled = bool(_stream_db.get('is_blocked_exit_camera', False)) if _stream_db else False
+            no_entry_zone_enabled = bool(_stream_db.get('is_no_entry_zone_camera', False)) if _stream_db else False
+            is_people_counting_camera = bool(_stream_db.get('is_people_counting_camera', False)) if _stream_db else False
 
             if blocked_exit_enabled:
                 try:
@@ -1680,7 +1683,7 @@ class StreamProcessingService:
 
                     # ---------- ALERTS (with error isolation) ----------
                     try:
-                        if alert_triggered and threshold_settings.get("alert_enabled"):
+                        if alert_triggered and threshold_settings.get("alert_enabled") and is_people_counting_camera:
                             await self._handle_people_count_alert(
                                 stream_id,
                                 stream_id_str,

@@ -36,6 +36,9 @@ class StreamCreate(BaseModel):
     count_threshold_less: Optional[int] = Field(None, ge=0)
     alert_enabled: bool = Field(default=True)
     is_shoplifting_camera: bool = Field(default=False)
+    is_blocked_exit_camera: bool = Field(default=False)
+    is_no_entry_zone_camera: bool = Field(default=False)
+    is_people_counting_camera: bool = Field(default=False)
     detection_models: Optional[List[str]] = Field(default=None)
 
     @validator('detection_models')
@@ -65,6 +68,9 @@ class StreamUpdate(BaseModel):
     count_threshold_less: Optional[int] = Field(None, ge=0)
     alert_enabled: bool = Field(default=True)
     is_shoplifting_camera: Optional[bool] = Field(default=None)
+    is_blocked_exit_camera: Optional[bool] = Field(default=None)
+    is_no_entry_zone_camera: Optional[bool] = Field(default=None)
+    is_people_counting_camera: Optional[bool] = Field(default=None)
     detection_models: Optional[List[str]] = Field(default=None)
 
     @validator('detection_models')
@@ -103,6 +109,9 @@ class StreamCreateWithLocation(BaseModel):
     status: str = Field("inactive", description="Status: active, inactive")
     is_streaming: bool = False
     is_shoplifting_camera: bool = False
+    is_blocked_exit_camera: bool = False
+    is_no_entry_zone_camera: bool = False
+    is_people_counting_camera: bool = False
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -119,6 +128,9 @@ class StreamUpdateWithLocation(BaseModel):
     status: Optional[str] = Field(None, description="Status: active, inactive")
     is_streaming: Optional[bool] = None
     is_shoplifting_camera: Optional[bool] = None
+    is_blocked_exit_camera: Optional[bool] = None
+    is_no_entry_zone_camera: Optional[bool] = None
+    is_people_counting_camera: Optional[bool] = None
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -189,6 +201,9 @@ class CameraDetailedResponse(BaseModel):
     count_threshold_less: Optional[int] = Field(None, description="Alert threshold for less count")
     alert_enabled: bool = Field(default=True, description="Whether alerts are enabled")
     is_shoplifting_camera: bool = Field(default=False, description="Whether shoplifting model is active for this camera")
+    is_blocked_exit_camera: bool = Field(default=False, description="Whether blocked-exit detection is active for this camera")
+    is_no_entry_zone_camera: bool = Field(default=False, description="Whether no-entry-zone detection is active for this camera")
+    is_people_counting_camera: bool = Field(default=False, description="Whether people-count threshold alerts are active for this camera")
     created_at: datetime = Field(..., description="Camera creation timestamp")
     updated_at: datetime = Field(..., description="Camera last update timestamp")
     last_activity: datetime = Field(..., description="Camera last activity timestamp")

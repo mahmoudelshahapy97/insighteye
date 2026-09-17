@@ -1,7 +1,7 @@
 # app/config/settings.py
-from typing import List, Optional, Literal
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from typing import Annotated, List, Optional, Literal
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic import Field, field_validator
 from dotenv import load_dotenv
 import uuid
 import platform
@@ -72,8 +72,10 @@ class Settings(BaseSettings):
     app_description: str = "Insighteye API with various ML capabilities"
     app_version: str = "1.0.0"
     app_api_prefix: str = "/api/v2"
-    app_debug: bool = True
-    app_reload: bool = True
+    # Currently read by nothing. Defaulted off so that wiring them up later
+    # (e.g. FastAPI(debug=config.app_debug)) cannot enable debug in production.
+    app_debug: bool = False
+    app_reload: bool = False
     app_host: str = "127.0.0.1"
     app_port: int = 8000
     app_log_level: str = "info"
@@ -92,21 +94,28 @@ class Settings(BaseSettings):
     # =============================================================================
     # CORS & HOSTS
     # =============================================================================
+    # A CORS origin must be scheme://host[:port]. Bare hosts such as "localhost" or
+    # "13.61.228.251" can never match a browser Origin header, so they are dropped
+    # by the validator below rather than silently doing nothing.
     cors_origins: List[str] = [
-        "13.61.228.251",
+        "https://te-s.xyz",
         "http://13.61.228.251",
         "http://localhost:8000",
         "http://localhost:3000",
-        "localhost",
     ]
 
-    allow_origins: List[str] = [
-        "13.61.228.251",
-        "http://13.61.228.251",
-        "http://localhost:8000",
-        "http://localhost:3000",
-        "localhost",
-    ]
+    @field_validator("cors_origins", mode="after")
+    @classmethod
+    def _drop_invalid_origins(cls, v: List[str]) -> List[str]:
+        valid = [o for o in v if "://" in o]
+        dropped = [o for o in v if "://" not in o]
+        if dropped:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Ignoring CORS origins without a scheme (they can never match an "
+                "Origin header): %s", ", ".join(dropped)
+            )
+        return valid
 
     trusted_hosts: List[str] = [
         "127.0.0.1",
@@ -116,7 +125,26 @@ class Settings(BaseSettings):
     cors_allow_credentials: bool = True
     cors_allow_methods: List[str] = ["GET", "POST", "PUT", "DELETE"]
     cors_allow_headers: List[str] = ["Content-Type", "Authorization", "X-Request-ID"]
-    cors_expose_headers: str = "X-Request-ID"
+    # Must be a sequence: Starlette does ", ".join(expose_headers), so a plain str
+    # would be joined character by character ("X, -, R, e, q, ...").
+    # NoDecode: pydantic-settings JSON-decodes complex types in the env source before
+    # field validators run. This field has historically been a bare string in .env
+    # ("X-Request-ID"), so parsing is handed to the validator below instead.
+    cors_expose_headers: Annotated[List[str], NoDecode] = ["X-Request-ID"]
+
+    @field_validator("cors_expose_headers", mode="before")
+    @classmethod
+    def _split_expose_headers(cls, v):
+        """Accept a JSON array, or a plain/comma-separated string, from .env."""
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            if v.startswith("["):
+                import json
+                return json.loads(v)
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
 
     force_hsts: bool = False
 
@@ -380,7 +408,9 @@ class Settings(BaseSettings):
     rtsp_reconnect_attempts: int = 10
     rtsp_buffer_size: int = 1
     max_reconnect_attempts: int = 5
-    min_reconnect_interval: float = 3.0
+    # 2.0, not 3.0: a second, unannotated `min_reconnect_interval = 2.0` further down
+    # used to shadow this one. Consolidated here keeping the value that was in effect.
+    min_reconnect_interval: float = 2.0
     
     # Frame processing
     target_fps: float = 15.0
@@ -400,8 +430,6 @@ class Settings(BaseSettings):
     
     # Transport settings
     prefer_tcp: bool = True
-    min_reconnect_interval = 2.0
-    use_hw_accel: bool = False
 
     # =============================================================================
     # GPU / HARDWARE ACCELERATION

@@ -120,10 +120,12 @@ async def get_all_streams(
     try:
         # Build query based on workspace filter
         query_base = """
-            SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path, vs.type, vs.status, vs.is_streaming, 
+            SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path, vs.type, vs.status, vs.is_streaming,
                    vs.created_at, vs.updated_at, vs.workspace_id, w.name as workspace_name,
                    vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
-                   vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled
+                   vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
+                   vs.is_shoplifting_camera, vs.is_blocked_exit_camera, vs.is_no_entry_zone_camera,
+                   vs.is_people_counting_camera, vs.detection_models
             FROM video_stream vs
             JOIN users u ON vs.user_id = u.user_id
             LEFT JOIN workspaces w ON vs.workspace_id = w.workspace_id
@@ -171,6 +173,11 @@ async def get_all_streams(
                 "count_threshold_greater": s["count_threshold_greater"],
                 "count_threshold_less": s["count_threshold_less"],
                 "alert_enabled": s["alert_enabled"],
+                "is_shoplifting_camera": s["is_shoplifting_camera"],
+                "is_blocked_exit_camera": s["is_blocked_exit_camera"],
+                "is_no_entry_zone_camera": s["is_no_entry_zone_camera"],
+                "is_people_counting_camera": s["is_people_counting_camera"],
+                "detection_models": s["detection_models"],
                 "created_at": s["created_at"].isoformat() if s["created_at"] else None,
                 "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
                 "workspace_id": str(s["workspace_id"]) if s["workspace_id"] else None,

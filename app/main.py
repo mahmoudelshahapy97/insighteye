@@ -11,7 +11,10 @@ from app.utils.logging_config import setup_logging
 from app.api.routes import router
 from app.services.stream_service import stream_manager, initialize_stream_manager
 from app.services.stream_processing_service import stream_processing_service
-from app.services.distributed_stream_manager import initialize_distributed_stream_manager
+from app.services.distributed_stream_manager import (
+    distributed_stream_manager,
+    initialize_distributed_stream_manager,
+)
 from app.services.redis_batch_service import redis_batch_service
 
 from zoneinfo import ZoneInfo
@@ -40,10 +43,13 @@ async def lifespan(app: FastAPI):
 
     try:
         healthy = await check_postgres_health()
-        if not healthy:
-            raise RuntimeError("DB health check failed after pool init")
     except Exception as e:
-        logger.warning("Index/health check failed: %s", e)
+        logger.critical("CRITICAL: DB health check errored after pool init: %s", e, exc_info=True)
+        raise RuntimeError("Database health check failed after pool init.") from e
+
+    if not healthy:
+        logger.critical("CRITICAL: DB health check reported unhealthy after pool init.")
+        raise RuntimeError("Database health check failed after pool init.")
 
     try:
         from app.services.database import db_manager as _db
@@ -124,12 +130,16 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Application shutdown sequence initiated (async)...")
 
+    # Stop the distributed manager first. Kept in its own try block so a failure
+    # here cannot skip the stream_manager shutdown below.
+    try:
+        await distributed_stream_manager.stop_management_loop()
+        logger.info("Distributed stream manager stopped.")
+    except Exception as e:
+        logger.error(f"Error stopping distributed stream manager: {e}", exc_info=True)
+
     if stream_manager:
         try:
-
-            # Stop distributed manager first
-            await distributed_stream_manager.stop_management_loop()
-
             await stream_manager.shutdown() # Already async
             logger.info("Stream manager shutdown complete.")
         except Exception as e:
@@ -171,14 +181,19 @@ app = FastAPI(
     title=config.app_name,
     description=config.app_description,
     version=config.app_version,
-    # openapi_url=f"{config.fastapi_root_path}/openapi.json",
-    # docs_url=f"{config.fastapi_root_path}/docs",
-    # redoc_url=f"{config.fastapi_root_path}/redoc",
+    # NOTE: these must be explicitly None to disable. Commenting them out does not
+    # disable the docs, it restores FastAPI's defaults (/docs, /redoc, /openapi.json).
+    # root_path is applied automatically, so these are declared unprefixed.
+    openapi_url=None if config.environment == "production" else "/openapi.json",
+    docs_url=None if config.environment == "production" else "/docs",
+    redoc_url=None if config.environment == "production" else "/redoc",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    # A wildcard here combined with allow_credentials=True lets any origin make
+    # authenticated cross-origin calls and read the responses. Use the allowlist.
+    allow_origins=config.cors_origins,
     allow_credentials=config.cors_allow_credentials,
     allow_methods=config.cors_allow_methods,
     allow_headers=config.cors_allow_headers,
