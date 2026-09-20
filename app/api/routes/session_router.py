@@ -16,6 +16,7 @@ from app.schemas import (LogListResponse, # LogEntry not used directly here
 from app.services.workspace_service import workspace_service 
 from app.services.user_service import user_manager
 from app.services.session_service import session_manager
+from app.utils.permission_utils import is_system_admin_role
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -41,7 +42,7 @@ async def get_logs_endpoint( # Renamed from get_logs from original, matching use
     filters: Dict[str, Any] = {} # Matched original variable name
     log_action_description = ""
 
-    if requesting_user_role == "admin":
+    if is_system_admin_role(requesting_user_role):
         if user_id_filter:
             filters["user_id"] = user_id_filter # Pass as string, like original
             log_action_description = f"Retrieved logs for user {user_id_filter}"
@@ -92,7 +93,7 @@ async def filter_logs_advanced_endpoint( # Renamed from filter_logs_advanced
     requesting_user_role = current_user_data["role"]
 
     # Logic for admin vs non-admin for username filter from original
-    if requesting_user_role != "admin":
+    if not is_system_admin_role(requesting_user_role):
         if request.username and request.username != current_user_data["username"]:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to filter logs for other users.")
         # No 'else if not request.username:' here, handled by user_id filter below
@@ -104,7 +105,7 @@ async def filter_logs_advanced_endpoint( # Renamed from filter_logs_advanced
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User '{request.username}' not found for filtering.")
         # Original passes str(user_to_filter["user_id"])
         filters["user_id"] = str(user_to_filter["user_id"]) # user_to_filter["user_id"] is likely UUID
-    elif requesting_user_role != "admin": # If no username specified and not admin, filter by self
+    elif not is_system_admin_role(requesting_user_role): # If no username specified and not admin, filter by self
         filters["user_id"] = requesting_user_id # String
 
     # Original checks request.workspace_id (from LogFilterRequest)
@@ -132,6 +133,6 @@ async def filter_logs_advanced_endpoint( # Renamed from filter_logs_advanced
     await session_manager.log_action(
         content=f"Performed advanced log filtering, found {len(logs_data)} logs. Filters: {request.model_dump(exclude_none=True)}",
         user_id=requesting_user_id, # String
-        action_type="Admin_Logs_Filtering" if requesting_user_role == "admin" else "User_Logs_Filtering"
+        action_type="Admin_Logs_Filtering" if is_system_admin_role(requesting_user_role) else "User_Logs_Filtering"
     )
     return LogListResponse(logs=logs_data)

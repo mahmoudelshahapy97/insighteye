@@ -15,6 +15,7 @@ from app.utils import (
     ensure_uuid_str,
     check_workspace_access
 )
+from app.utils.permission_utils import is_system_admin_role
 from app.schemas import (
     StreamCreate, StreamUpdate,
     CameraState, CamerasStateResponse,
@@ -39,7 +40,7 @@ class CameraService:
 
     async def check_camera_limit(self, user_id: UUID, workspace_id: UUID, user_system_role: str, allowed_count: int) -> None:
         """Check if user has reached their camera limit."""
-        if user_system_role != 'admin':
+        if not is_system_admin_role(user_system_role):
             count_query = "SELECT COUNT(*) as stream_count FROM video_stream WHERE user_id = $1 AND workspace_id = $2"
             count_result = await self.db_manager.execute_query(count_query, params=(user_id, workspace_id), fetch_one=True)
             current_stream_count = count_result['stream_count'] if count_result else 0
@@ -215,7 +216,7 @@ class CameraService:
                 except HTTPException:
                     pass
             
-            if not can_update and current_user_role == "admin":
+            if not can_update and is_system_admin_role(current_user_role):
                 can_update = True
 
             if not can_update:
@@ -384,7 +385,7 @@ class CameraService:
                 except HTTPException:
                     pass
             
-            if not can_delete and current_user_role == "admin":
+            if not can_delete and is_system_admin_role(current_user_role):
                 can_delete = True
 
             if can_delete:
@@ -1062,8 +1063,10 @@ class CameraService:
         params = []
         param_count = 1
         
-        update_dict = updates.model_dump(exclude_none=True)
-        
+        # id identifies the row (WHERE stream_id = ...); it is not a column to SET,
+        # and video_stream has no "id" column.
+        update_dict = updates.model_dump(exclude_none=True, exclude={"id"})
+
         for field, value in update_dict.items():
             if field in ['latitude', 'longitude'] and value is not None:
                 value = float(value)

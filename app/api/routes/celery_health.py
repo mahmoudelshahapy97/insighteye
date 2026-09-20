@@ -1,11 +1,20 @@
 # app/routers/celery_health.py
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-router = APIRouter(prefix="/system", tags=["System"])
+from app.api.dependencies import require_system_admin
+
+# System admins only, for every route on this router. These were previously
+# unauthenticated, and /celery/tasks/{task_id}/revoke SIGKILLs the task, so
+# anyone could kill stream-processing workers.
+router = APIRouter(
+    prefix="/system",
+    tags=["System"],
+    dependencies=[Depends(require_system_admin)],
+)
 logger = logging.getLogger(__name__)
 
 
@@ -150,7 +159,7 @@ async def celery_health():
         logger.error(f"Health check error: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Health check failed: {str(e)}"
+            detail="Health check failed."
         )
 
 
@@ -226,7 +235,7 @@ async def celery_task_stats():
         logger.error(f"Task stats error: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get task stats: {str(e)}"
+            detail="Failed to get task stats."
         )
 
 
@@ -260,5 +269,5 @@ async def revoke_task(task_id: str):
         logger.error(f"Task revoke error: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to revoke task: {str(e)}"
+            detail="Failed to revoke task."
         )

@@ -106,7 +106,7 @@ class DistributedStreamManager:
                     vs.is_streaming = TRUE
                     AND u.is_active = TRUE
                     AND w.is_active = TRUE
-                    AND (u.is_subscribed = TRUE OR u.role = 'admin')
+                    AND (u.is_subscribed = TRUE OR u.role IN ('admin', 'superadmin'))
                     AND (vs.stop_reason IS NULL OR vs.stop_reason NOT IN ('user_action', 'user_stop', 'manual_stop', 'admin_stop'))
                     AND vs.auto_retry_enabled = TRUE
                     AND (vs.next_retry_at IS NULL OR vs.next_retry_at <= NOW())
@@ -796,7 +796,7 @@ class DistributedStreamManager:
                 AND vs.auto_retry_enabled = TRUE
                 AND u.is_active = TRUE
                 AND w.is_active = TRUE
-                AND (u.is_subscribed = TRUE OR u.role = 'admin')
+                AND (u.is_subscribed = TRUE OR u.role IN ('admin', 'superadmin'))
             """
             
             cameras_to_reclaim = await self._safe_operation(

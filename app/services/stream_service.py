@@ -27,6 +27,7 @@ from app.services.stream_processing_service import stream_processing_service
 from app.services.retry_service import retry_service
 from app.config.settings import config
 from app.utils import check_workspace_access
+from app.utils.permission_utils import is_system_admin_role
 
 logger = logging.getLogger(__name__)
 
@@ -395,7 +396,7 @@ class StreamManager:
             SELECT 
                 SUM(u.count_of_camera) as total_camera_limit,
                 COUNT(DISTINCT u.user_id) as active_members,
-                COUNT(DISTINCT CASE WHEN u.is_subscribed = TRUE OR u.role = 'admin' 
+                COUNT(DISTINCT CASE WHEN u.is_subscribed = TRUE OR u.role IN ('admin', 'superadmin') 
                     THEN u.user_id END) as subscribed_members
             FROM workspace_members wm
             JOIN users u ON wm.user_id = u.user_id
@@ -480,7 +481,7 @@ class StreamManager:
         if not user_info['is_active']:
             return False, "User account is inactive"
         
-        if not user_info['is_subscribed'] and user_info['role'] != 'admin':
+        if not user_info['is_subscribed'] and not is_system_admin_role(user_info['role']):
             return False, "Subscription expired. Please renew to start streams."
         
         # Check user's personal limit within workspace
@@ -495,7 +496,7 @@ class StreamManager:
         user_active_count = user_active['count'] if user_active else 0
         user_limit = user_info['count_of_camera']
         
-        if user_info['role'] != 'admin' and user_active_count >= user_limit:
+        if not is_system_admin_role(user_info['role']) and user_active_count >= user_limit:
             return False, (
                 f"Personal camera limit reached ({user_active_count}/{user_limit}). "
                 f"Stop other cameras or upgrade subscription."
@@ -1980,7 +1981,7 @@ class StreamManager:
                     WHERE vs.is_streaming = TRUE 
                         AND u.is_active = TRUE
                         AND w.is_active = TRUE
-                        AND (u.is_subscribed = TRUE OR u.role = 'admin')
+                        AND (u.is_subscribed = TRUE OR u.role IN ('admin', 'superadmin'))
                         AND (vs.stop_reason IS NULL OR vs.stop_reason != 'user_action')
                         AND (
                             vs.next_retry_at IS NULL 
@@ -2070,9 +2071,10 @@ class StreamManager:
                         
                         # Process each file path in workspace
                         for file_path, streams_for_path in paths_map.items():
-                            # Sort by priority (admin first, then by stream_id)
+                            # Sort by priority (system admins first, then by stream_id).
+                            # 'user_role' is users.role, aliased in the query above.
                             streams_for_path.sort(key=lambda x: (
-                                x.get('user_role') != 'admin',
+                                not is_system_admin_role(x.get('user_role')),
                                 x['stream_id']
                             ))
                             

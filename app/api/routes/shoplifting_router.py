@@ -29,6 +29,8 @@ from app.services.shoplifting_service import shoplifting_service
 from app.services.s3_service import s3_service
 from app.services.user_service import user_manager
 from app.services.database import db_manager
+from app.utils.permission_utils import is_system_admin_role
+from app.api.dependencies import require_system_admin
 from app.schemas.shoplifting_schema import (
     ShopliftingEventResponse,
     ShopliftingEventListResponse,
@@ -174,8 +176,13 @@ async def resolve_shoplifting_event(
 
 
 @router.post("/test-alert/{camera_id}")
-async def trigger_test_alert(camera_id: str):
-    """Test Endpoint: Force a shoplifting alert on the specified camera stream."""
+async def trigger_test_alert(
+    camera_id: str,
+    # Was unauthenticated: anyone could fire a fake shoplifting alert on any
+    # camera, notifying staff and writing a clip to S3.
+    current_user: Dict = Depends(require_system_admin),
+):
+    """Test Endpoint: Force a shoplifting alert on the specified camera stream. System admins only."""
     from app.services.shoplifting_inference import shoplifting_engine
     shoplifting_engine.force_alert(camera_id)
     return {"message": f"Simulated shoplifting alert triggered on camera {camera_id}. Please wait ~10 seconds for the buffer to save to S3."}
@@ -712,7 +719,7 @@ async def _require_admin_or_owner(current_user: Dict) -> tuple:
         raise HTTPException(status_code=401, detail="User not found")
 
     system_role = user_db_info.get("role")
-    is_system_admin = system_role == "admin"
+    is_system_admin = is_system_admin_role(system_role)
 
     workspace_id = await get_workspace_id_for_user(username)
 

@@ -28,6 +28,7 @@ from app.services.location_service import location_service
 from app.services.database import db_manager
 from app.services.postgres_service import  postgres_service
 from app.utils import ensure_uuid_str, check_workspace_access, parse_string_or_list, encoded_string
+from app.utils.permission_utils import is_system_admin_role
 
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ async def get_all_streams(
             target_workspace_id = ensure_uuid_str(workspace_id_str)
             
             # Check permissions for workspace
-            if user_system_role != "admin":
+            if not is_system_admin_role(user_system_role):
                 membership_details = await check_workspace_access(
                     db_manager,
                     user_id_obj,
@@ -150,7 +151,7 @@ async def get_all_streams(
             order_by = " ORDER BY u.username, vs.created_at DESC"
         else:
             # No workspace filter - system admin only
-            if user_system_role != "admin":
+            if not is_system_admin_role(user_system_role):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin role required.")
             order_by = " ORDER BY w.name, u.username, vs.created_at DESC"
         
@@ -565,7 +566,7 @@ async def create_or_update_workspace_camera_params_post(
         if not workspace_id_obj:
             raise HTTPException(status_code=400, detail="No active workspace. Cannot save parameters.")
 
-        is_sys_admin = current_user_data.get("role") == "admin"
+        is_sys_admin = is_system_admin_role(current_user_data.get("role"))
         if not is_sys_admin:
             membership_details = await check_workspace_access(
                 db_manager,
@@ -648,7 +649,7 @@ async def delete_workspace_params(
         if not workspace_id_obj:
             raise HTTPException(status_code=400, detail="No active workspace found to delete parameters for.")
 
-        is_sys_admin = current_user_data.get("role") == "admin"
+        is_sys_admin = is_system_admin_role(current_user_data.get("role"))
         if not is_sys_admin:
             membership_details = await check_workspace_access(
                 db_manager,
@@ -684,7 +685,7 @@ async def get_all_workspace_params(
 ):
     """Get parameters for all workspaces (admin only)."""
     try:
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin role required.")
         
         return await parameter_service.get_all_workspace_params()
@@ -703,7 +704,7 @@ async def update_all_workspace_params(
 ):
     """Update parameters for all workspaces (admin only)."""
     try:
-        if current_admin_data.get("role") != 'admin':
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin privileges required.")
         
         user_id_obj = current_admin_data["user_id"]
@@ -758,7 +759,7 @@ async def delete_all_workspaces_params(
 ):
     """Delete all workspace stream parameters (admin only)."""
     try:
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin role required.")
 
         user_id_obj = current_admin_data["user_id"]
@@ -1540,7 +1541,7 @@ async def bulk_upload_cameras_with_location(
         user_system_role = user_db_details.get("role", "user")
 
         current_stream_count = 0
-        if user_system_role != 'admin':
+        if not is_system_admin_role(user_system_role):
             count_query = "SELECT COUNT(*) as stream_count FROM video_stream WHERE user_id = $1 AND workspace_id = $2"
             count_result = await db_manager.execute_query(count_query, params=(user_id_obj, workspace_id_obj), fetch_one=True)
             current_stream_count = count_result['stream_count'] if count_result else 0
@@ -1612,7 +1613,7 @@ async def bulk_upload_cameras_with_location(
                     continue
 
                 # Check camera limit
-                if user_system_role != 'admin':
+                if not is_system_admin_role(user_system_role):
                     if current_stream_count + len(successful_cameras) >= allowed_camera_count:
                         failed_cameras.append({
                             "row": row_idx,
@@ -1729,7 +1730,7 @@ async def update_user_camera_limit(
         admin_user_id = current_admin_data["user_id"]
         admin_username = current_admin_data["username"]
         
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="System admin privileges required to update camera limits."
@@ -1760,7 +1761,7 @@ async def update_user_camera_limit(
         target_username = user_info["username"]
         
         # Prevent modifying another admin's camera count (optional security check)
-        if user_info["role"] == "admin" and str(admin_user_id) != target_user_id:
+        if is_system_admin_role(user_info["role"]) and str(admin_user_id) != target_user_id:
             logger.warning(
                 f"Admin {admin_username} attempted to modify camera limit for another admin {target_username}"
             )
@@ -1853,7 +1854,7 @@ async def batch_update_user_camera_limits(
         admin_user_id = current_admin_data["user_id"]
         admin_username = current_admin_data["username"]
         
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="System admin privileges required to update camera limits."
@@ -1999,7 +2000,7 @@ async def get_user_camera_limit(
         target_user_id = ensure_uuid_str(user_id)
         
         # Check permissions
-        if requesting_user_role != "admin" and str(requesting_user_id) != target_user_id:
+        if not is_system_admin_role(requesting_user_role) and str(requesting_user_id) != target_user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You can only view your own camera limit."
@@ -2111,7 +2112,7 @@ async def get_all_users_camera_limits(
     """
     try:
         # Verify admin privileges
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="System admin privileges required."

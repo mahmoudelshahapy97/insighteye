@@ -26,6 +26,7 @@ from app.schemas import (
 )
 from app.config.settings import config
 from app.utils import make_prediction
+from app.utils.permission_utils import is_system_admin_role
 
 logger = logging.getLogger(__name__)
 
@@ -556,7 +557,7 @@ class PostgresService:
                     params.append(end_datetime)
                 
                 # User access control
-                if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+                if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                     param_count += 1
                     conditions.append(f"username = ${param_count}")
                     params.append(requesting_username)
@@ -633,7 +634,7 @@ class PostgresService:
             params = [workspace_id]
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 if requesting_username:
                     conditions.append("sr.username = $2")
                     params.append(requesting_username)
@@ -716,7 +717,7 @@ class PostgresService:
             params = [workspace_id]
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 if requesting_username:
                     conditions.append("username = $2")
                     params.append(requesting_username)
@@ -816,7 +817,7 @@ class PostgresService:
                     params.append([str(c) for c in search_query.camera_id])
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 param_count += 1
                 conditions.append(f"sr.username = ${param_count}")
                 params.append(requesting_username)
@@ -954,7 +955,7 @@ class PostgresService:
                 params.append(camera_ids)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 param_count += 1
                 conditions.append(f"username = ${param_count}")
                 params.append(requesting_username)
@@ -1037,7 +1038,7 @@ class PostgresService:
                 params.append(zone)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 if requesting_username:
                     param_count += 1
                     conditions.append(f"username = ${param_count}")
@@ -1123,7 +1124,7 @@ class PostgresService:
                 params.append(location)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 if requesting_username:
                     param_count += 1
                     conditions.append(f"username = ${param_count}")
@@ -1209,7 +1210,7 @@ class PostgresService:
                 params.append(location)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 if requesting_username:
                     param_count += 1
                     conditions.append(f"username = ${param_count}")
@@ -1290,7 +1291,7 @@ class PostgresService:
                 params.append(building)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 if requesting_username:
                     param_count += 1
                     conditions.append(f"username = ${param_count}")
@@ -1359,7 +1360,7 @@ class PostgresService:
                 params.append(floor_levels)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 if requesting_username:
                     param_count += 1
                     conditions.append(f"username = ${param_count}")
@@ -1451,7 +1452,7 @@ class PostgresService:
                 params.append(end_datetime)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 param_count += 1
                 conditions.append(f"username = ${param_count}")
                 params.append(requesting_username)
@@ -1502,7 +1503,7 @@ class PostgresService:
             params = [workspace_id]
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 conditions.append("username = $2")
                 params.append(requesting_username)
             
@@ -1586,7 +1587,7 @@ class PostgresService:
                 params.append(camera_ids)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 param_count += 1
                 conditions.append(f"username = ${param_count}")
                 params.append(requesting_username)
@@ -1681,7 +1682,7 @@ class PostgresService:
             conditions = ["workspace_id = $1", "camera_id = $2"]
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 param_count += 1
                 conditions.append(f"username = ${param_count}")
                 params.append(requesting_username)
@@ -1815,7 +1816,7 @@ class PostgresService:
                 params.append(camera_ids)
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 param_count += 1
                 conditions.append(f"username = ${param_count}")
                 params.append(requesting_username)
@@ -1941,7 +1942,7 @@ class PostgresService:
             param_count = 1
             
             # User access control
-            if user_system_role != 'admin' and user_workspace_role not in ['admin', 'owner']:
+            if not is_system_admin_role(user_system_role) and user_workspace_role not in ['admin', 'owner']:
                 if requesting_username:
                     param_count += 1
                     conditions.append(f"username = ${param_count}")

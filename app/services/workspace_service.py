@@ -9,6 +9,7 @@ from fastapi import HTTPException, status
 from app.services.database import db_manager
 from app.schemas import WorkspaceCreate, WorkspaceUpdate, WorkspaceMemberCreate, WorkspaceMemberUpdate
 from app.utils import check_workspace_access
+from app.utils.permission_utils import is_system_admin_role
 
 logger = logging.getLogger(__name__)
 
@@ -17,8 +18,8 @@ class WorkspaceService:
         self.db_manager = db_manager
 
     def is_system_admin(self, user_data: Dict) -> bool:
-        """Check if user has system admin role."""
-        return user_data and user_data.get("role") == "admin"
+        """Check if user has system admin privileges (admin or superadmin)."""
+        return bool(user_data and is_system_admin_role(user_data.get("role")))
 
     def is_superadmin(self, user_data: Dict) -> bool:
         """Check if user has the superadmin role."""

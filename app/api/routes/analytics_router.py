@@ -143,7 +143,7 @@ async def get_unique_cameras(
         raise
     except Exception as e:
         logger.error(f"Error fetching unique cameras: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 @router.get("/cameras/frame-counts")
 async def get_frame_counts_per_camera(
@@ -233,7 +233,7 @@ async def get_frame_counts_per_camera(
         raise
     except Exception as e:
         logger.error(f"Error fetching frame counts: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 @router.get("/cameras/average-people")
 async def get_average_people_per_camera(
@@ -328,7 +328,7 @@ async def get_average_people_per_camera(
         raise
     except Exception as e:
         logger.error(f"Error fetching average people: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 @router.get("/cameras/average-gender")
 async def get_average_gender_per_camera(
@@ -427,7 +427,7 @@ async def get_average_gender_per_camera(
         raise
     except Exception as e:
         logger.error(f"Error fetching average gender: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/zones/gender-by-weekday")
@@ -520,7 +520,7 @@ async def get_gender_by_zone_and_weekday(
         raise
     except Exception as e:
         logger.error(f"Error fetching gender by zone/weekday: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/busiest-hours/by-weekday")
@@ -627,7 +627,7 @@ async def get_busiest_hour_per_weekday(
         raise
     except Exception as e:
         logger.error(f"Error fetching busiest hours: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/floors/average-people")
@@ -714,7 +714,7 @@ async def get_average_people_by_floor(
         raise
     except Exception as e:
         logger.error(f"Error fetching floor averages: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 @router.get("/floors/people-by-weekday")
 async def get_people_by_floor_and_weekday(
@@ -802,7 +802,7 @@ async def get_people_by_floor_and_weekday(
         raise
     except Exception as e:
         logger.error(f"Error fetching floor/weekday data: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/floors/people-by-hour")
@@ -889,7 +889,7 @@ async def get_people_by_floor_and_hour(
         raise
     except Exception as e:
         logger.error(f"Error fetching floor/hour data: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/cameras/frame-comparison")
@@ -1013,7 +1013,7 @@ async def get_camera_frame_comparison(
         raise
     except Exception as e:
         logger.error(f"Error fetching frame comparison: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/timeseries/camera-data")
@@ -1151,7 +1151,7 @@ async def get_camera_timeseries(
         raise
     except Exception as e:
         logger.error(f"Error fetching timeseries data: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/fire/detections-by-camera")
@@ -1291,7 +1291,7 @@ async def get_fire_detections_by_camera(
         raise
     except Exception as e:
         logger.error(f"Error fetching fire detections by camera: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 @router.get("/fire/detection-summary")
 async def get_fire_detection_summary(
@@ -1388,7 +1388,7 @@ async def get_fire_detection_summary(
         raise
     except Exception as e:
         logger.error(f"Error fetching fire detection summary: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/fire/detections-by-location")
@@ -1493,7 +1493,7 @@ async def get_fire_detections_by_location(
         raise
     except Exception as e:
         logger.error(f"Error fetching fire detections by location: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/fire/detections-timeline")
@@ -1602,7 +1602,7 @@ async def get_fire_detections_timeline(
         raise
     except Exception as e:
         logger.error(f"Error fetching fire detections timeline: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/fire/detections-by-weekday")
@@ -1700,7 +1700,7 @@ async def get_fire_detections_by_weekday(
         raise
     except Exception as e:
         logger.error(f"Error fetching fire detections by weekday: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/fire/detections-by-hour")
@@ -1805,7 +1805,7 @@ async def get_fire_detections_by_hour(
         raise
     except Exception as e:
         logger.error(f"Error fetching fire detections by hour: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 @router.get("/fire/high-risk-cameras")
 async def get_high_risk_cameras(
@@ -1970,7 +1970,7 @@ async def get_high_risk_cameras(
         raise
     except Exception as e:
         logger.error(f"Error fetching high risk cameras: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 @router.get("/fire/recent-detections")
 async def get_recent_fire_detections(
@@ -2063,7 +2063,7 @@ async def get_recent_fire_detections(
         raise
     except Exception as e:
         logger.error(f"Error fetching recent fire detections: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/fire/status-by-camera")
@@ -2199,7 +2199,7 @@ async def get_fire_status_by_camera(
         raise
     except Exception as e:
         logger.error(f"Error fetching threshold violations: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 @router.get("/fire/threshold-violations-by-camera")
 async def get_threshold_violations_by_camera(
@@ -2454,7 +2454,7 @@ async def get_threshold_violations_by_camera(
         raise
     except Exception as e:
         logger.error(f"Error fetching threshold violations: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 @router.get("/fire/threshold-violations-config-check")
@@ -2599,7 +2599,7 @@ async def check_threshold_violations_config(
         raise
     except Exception as e:
         logger.error(f"Error in config check: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
 def generate_recommendations(config_summary: dict, violations_analysis: list) -> list:

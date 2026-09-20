@@ -1118,7 +1118,7 @@ async def start_stream(
         logger.error(f"Error starting stream: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to start stream: {str(e)}"
+            detail="Failed to start stream."
         )
 
 @router.post("/stop", status_code=status.HTTP_200_OK)
@@ -1170,7 +1170,7 @@ async def stop_stream(
         logger.error(f"Error stopping stream: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to stop stream: {str(e)}"
+            detail="Failed to stop stream."
         )
 
 
@@ -1221,7 +1221,7 @@ async def restart_stream(
         logger.error(f"Error restarting stream: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to restart stream: {str(e)}"
+            detail="Failed to restart stream."
         )
 
 # ==================== Stream Status and Information ====================
@@ -1276,7 +1276,7 @@ async def list_user_streams(
         logger.error(f"Error listing streams: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list streams: {str(e)}"
+            detail="Failed to list streams."
         )
 
 # ==================== Workspace Stream Management ====================
@@ -1341,7 +1341,7 @@ async def start_all_workspace_streams(
             WHERE vs.workspace_id = $1 
                 AND vs.is_streaming = FALSE
                 AND u.is_active = TRUE
-                AND (u.is_subscribed = TRUE OR u.role = 'admin')
+                AND (u.is_subscribed = TRUE OR u.role IN ('admin', 'superadmin'))
             ORDER BY vs.created_at ASC
         """
         db_streams = await stream_manager.db_manager.execute_query(
@@ -1448,7 +1448,7 @@ async def start_all_workspace_streams(
         logger.error(f"Error starting workspace streams: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to start workspace streams: {str(e)}"
+            detail="Failed to start workspace streams."
         )
 
 @router.post("/workspace/stop-all")
@@ -1557,7 +1557,7 @@ async def stop_all_workspace_streams(
         logger.error(f"Error stopping workspace streams: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to stop workspace streams: {str(e)}"
+            detail="Failed to stop workspace streams."
         )
 
 # ==================== WebSocket Endpoints ====================
@@ -1827,7 +1827,7 @@ async def batch_start_streams(
         logger.error(f"Error in batch start: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Batch start failed: {str(e)}"
+            detail="Batch start failed."
         )
 
 @router.post("/batch/stop")
@@ -1900,7 +1900,7 @@ async def batch_stop_streams(
         logger.error(f"Error in batch stop: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Batch stop failed: {str(e)}"
+            detail="Batch stop failed."
         )
 
 # ==================== Stream Control Endpoints ====================
@@ -2512,7 +2512,7 @@ async def get_http_notifications(
         
     except Exception as e:
         logger.error(f"Error getting HTTP notifications for user {username_for_log}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to get notifications: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get notifications.")
 
 @router.post("/notify/{notification_id_str}/read")
 async def mark_notification_read_endpoint(
@@ -2544,4 +2544,4 @@ async def mark_notification_read_endpoint(
         raise
     except Exception as e:
         logger.error(f"Error marking notification {notification_id_str} as read for {username_for_log}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to mark notification as read: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to mark notification as read.")

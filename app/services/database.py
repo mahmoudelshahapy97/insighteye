@@ -471,9 +471,10 @@ class DatabaseManager:
                     return await _execute(conn)
         except RuntimeError as e:
             # Convert connection errors to 503
+            logger.error(f"Database unavailable during query: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e)
+                detail="Database temporarily unavailable."
             )
 
     async def execute_batch(
@@ -507,9 +508,10 @@ class DatabaseManager:
             return total_affected
 
         except RuntimeError as e:
+            logger.error(f"Database unavailable during batch execution: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e)
+                detail="Database temporarily unavailable."
             )
 
 # Global database manager instance

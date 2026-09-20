@@ -51,12 +51,16 @@ class StreamCreate(BaseModel):
         return v
 
 class StreamUpdate(BaseModel):
+    # Every field except id must default to None: the update paths only write
+    # fields that are not None, so a non-None default would silently overwrite
+    # the stored value on every partial update (e.g. a rename resetting type,
+    # status, is_streaming and alert_enabled).
     id: str = Field(...)
     name: Optional[str] = Field(None, max_length=50)
     path: Optional[str] = Field(None, max_length=255)
-    type: Optional[str] = Field(default='local', pattern='^(rtsp|http|local|other|video file)$')
-    status: Optional[str] = Field(default='inactive', pattern='^(active|inactive|error|processing)$')
-    is_streaming: Optional[bool] = Field(default=False)
+    type: Optional[str] = Field(default=None, pattern='^(rtsp|http|local|other|video file)$')
+    status: Optional[str] = Field(default=None, pattern='^(active|inactive|error|processing)$')
+    is_streaming: Optional[bool] = Field(default=None)
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -66,7 +70,7 @@ class StreamUpdate(BaseModel):
     longitude: Optional[Decimal] = Field(None, ge=-180, le=180, decimal_places=8)
     count_threshold_greater: Optional[int] = Field(None, ge=0)
     count_threshold_less: Optional[int] = Field(None, ge=0)
-    alert_enabled: bool = Field(default=True)
+    alert_enabled: Optional[bool] = Field(default=None)
     is_shoplifting_camera: Optional[bool] = Field(default=None)
     is_blocked_exit_camera: Optional[bool] = Field(default=None)
     is_no_entry_zone_camera: Optional[bool] = Field(default=None)

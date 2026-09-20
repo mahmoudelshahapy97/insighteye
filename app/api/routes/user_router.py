@@ -10,6 +10,7 @@ from app.services.workspace_service import workspace_service
 from app.schemas import SQLQueryRequest, SQLQueryResponse, CreateUserRequest, VerifyPasswordRequest, ResetPasswordRequest, EmailRequest, UserRequest
 import logging
 import asyncpg
+from app.utils.permission_utils import is_system_admin_role
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +36,16 @@ async def get_current_superadmin_user_dependency(
     return current_user_full_data
 
 @router.post("", status_code=status.HTTP_201_CREATED)  # Use 201 Created for successful creation
-async def create_user_route(request: CreateUserRequest):
+async def create_user_route(
+    request: CreateUserRequest,
+    # Superadmin only. This endpoint accepts an arbitrary role (up to
+    # "superadmin"), so leaving it unauthenticated let anyone create a
+    # superadmin account. Public self-registration goes through /signup,
+    # which assigns the role server-side.
+    current_user: dict = Depends(get_current_superadmin_user_dependency),
+):
     """
-    Creates a new user.
+    Creates a new user. Superadmin only.
 
     Args:
         username: The username for the new user.
@@ -57,11 +65,10 @@ async def create_user_route(request: CreateUserRequest):
         else:
             raise HTTPException(status_code=409, detail="Username already exists")  # Conflict
     except HTTPException as http_exc:
-        print(f"create_user_route: HTTPException caught - Status Code: {http_exc.status_code}") # Add print here
         raise http_exc
     except Exception as e:
-        print(f"create_user_route: Unexpected Exception - Raising 500: {e}") # Add print here
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        logger.exception("Unhandled error in user route")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 @router.post("/verify_password")
 async def verify_password_route(
@@ -90,7 +97,8 @@ async def verify_password_route(
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        logger.exception("Unhandled error in user route")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 @router.post("/by_email")
 async def get_user_by_email_route(
@@ -118,7 +126,8 @@ async def get_user_by_email_route(
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        logger.exception("Unhandled error in user route")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 @router.put("/reset_password")
 async def reset_password_route(
@@ -161,7 +170,8 @@ async def reset_password_route(
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+         logger.exception("Unhandled error in user route")
+         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 @router.get("")
 async def get_all_users_route(
@@ -182,7 +192,8 @@ async def get_all_users_route(
     except HTTPException as http_exc:
          raise http_exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        logger.exception("Unhandled error in user route")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 
 @router.put("/{username}/role")
@@ -203,7 +214,8 @@ async def update_user_role_route(
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        logger.exception("Unhandled error in user route")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 @router.delete("/user")
 async def delete_user_route(
@@ -231,7 +243,8 @@ async def delete_user_route(
     except HTTPException as e:  # Catch HTTPExceptions raised by delete_user
         raise e
     except Exception as e: #catch the other exceptions
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        logger.exception("Unhandled error in user route")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 @router.delete("")
 async def delete_all_users_route(
@@ -252,7 +265,8 @@ async def delete_all_users_route(
     except HTTPException as e:
         raise e
     except Exception as e: #catch the other exceptions
-         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+         logger.exception("Unhandled error in user route")
+         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 @router.delete("/{username}/complete", response_model=Dict)
 async def delete_user_completely(
@@ -273,7 +287,7 @@ async def delete_user_completely(
     """
     current_username = current_user.get("username")
     current_user_id = current_user.get("user_id")
-    is_admin = current_user.get("role") == "admin"
+    is_admin = is_system_admin_role(current_user.get("role"))
     
     # Check if user can perform deletion
     if not is_admin and current_username != username:
@@ -309,7 +323,7 @@ async def preview_user_deletion(
     Use this before actual deletion to understand the impact.
     """
     current_username = current_user.get("username")
-    is_admin = current_user.get("role") == "admin"
+    is_admin = is_system_admin_role(current_user.get("role"))
     
     # Check if user can view deletion preview
     if not is_admin and current_username != username:
@@ -367,7 +381,7 @@ async def bulk_delete_users(
     Will skip users who are the only admin in workspaces.
     Returns detailed results for each user.
     """
-    if current_user.get("role") != "admin":
+    if not is_system_admin_role(current_user.get("role")):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -432,7 +446,7 @@ async def get_current_admin_user_dependency(
     user_id_obj = current_user_full_data.get("user_id") # Expected to be UUID by now
     workspace_id_obj = current_user_full_data.get("workspace_id") # Expected to be UUID or None
 
-    if user_role != "admin":
+    if not is_system_admin_role(user_role):
         logger.warning(
             f"Non-admin user '{username}' (ID: {str(user_id_obj)}) attempted to access admin route: {request_obj.url.path}"
         )
@@ -572,4 +586,5 @@ async def execute_sql_query_route(
             user_agent=request_obj.headers.get("user-agent"),
             status="failure"
         )
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {str(e)}")
+        logger.exception("Unhandled error in execute-sql route")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred.")

@@ -17,6 +17,7 @@ import hashlib
 import requests
 import asyncpg
 from collections import defaultdict
+from app.utils.permission_utils import is_system_admin_role
 
 logger = logging.getLogger(__name__)
 
@@ -367,7 +368,7 @@ class UserManager:
             logger.error(f"Database deletion failed for user {username}: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Database deletion failed: {str(e)}"
+                detail="Database deletion failed."
             )
         
         return result
@@ -450,7 +451,7 @@ class UserManager:
             deletion_results["errors"].append(str(e))
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to completely delete user: {str(e)}"
+                detail="Failed to completely delete user."
             )
 
     async def get_user_deletion_preview(self, username: str) -> Dict:
@@ -700,7 +701,8 @@ class UserManager:
                 
                 # Add workspace membership
                 membership_id_obj = uuid.uuid4()
-                member_role = "admin" if role == "admin" else "member"
+                # Maps the new user's *system* role to their initial *workspace* role.
+                member_role = "admin" if is_system_admin_role(role) else "member"
                 membership_query = """
                     INSERT INTO workspace_members 
                     (membership_id, workspace_id, user_id, role, created_at, updated_at) 
