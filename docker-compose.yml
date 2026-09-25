@@ -95,5 +95,7 @@ volumes:
     driver: local
 
 networks:
+  default:
   insighteye_network:
-    driver: bridge
+    external: true
+    name: insighteye_network
