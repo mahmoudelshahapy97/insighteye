@@ -184,9 +184,9 @@ app = FastAPI(
     # NOTE: these must be explicitly None to disable. Commenting them out does not
     # disable the docs, it restores FastAPI's defaults (/docs, /redoc, /openapi.json).
     # root_path is applied automatically, so these are declared unprefixed.
-    openapi_url=None if config.environment == "production" else "/openapi.json",
-    docs_url=None if config.environment == "production" else "/docs",
-    redoc_url=None if config.environment == "production" else "/redoc",
+    # openapi_url=None if config.environment == "production" else "/openapi.json",
+    # docs_url=None if config.environment == "production" else "/docs",
+    # redoc_url=None if config.environment == "production" else "/redoc",
 )
 
 app.add_middleware(
