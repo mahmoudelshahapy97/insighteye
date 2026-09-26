@@ -458,6 +458,20 @@ class Settings(BaseSettings):
     blocked_exit_confidence: float = 0.4
     no_entry_zone_confidence: float = 0.4
 
+    # No-entry-zone violation rules (ported from features/no-entry-zone). Each zone
+    # may override consecutive_frames / min_dwell / cooldown / anchor; these are the
+    # defaults. See app/services/nez/zone_logic.py for what each rule suppresses.
+    no_entry_zone_consecutive_frames: int = 3        # frames inside before alerting
+    no_entry_zone_cooldown_seconds: float = 45.0     # per-track re-alert cooldown
+    no_entry_zone_dedup_radius_frac: float = 0.06    # neighbour suppression, fraction of frame diagonal
+    no_entry_zone_incident_gap_seconds: float = 15.0 # zone empty this long -> next alert is a new incident
+    no_entry_zone_track_ttl_seconds: float = 3.0     # drop tracks unseen this long (closes their event)
+    no_entry_zone_anchor: str = "bottom_center"      # bottom_center | center
+    no_entry_zone_timezone: str = "Africa/Cairo"     # zone schedules are evaluated in this zone
+    no_entry_zone_clip_pre_seconds: float = 3.0
+    no_entry_zone_clip_post_seconds: float = 4.0
+    no_entry_zone_zone_refresh_seconds: float = 10.0 # re-read camera flag + zones while streaming
+
     # Standard 80-class COCO label list, index == class_id, used to translate
     # the ModelFactory loaders' bare class_id detections into readable labels
     # for blocked-exit/no-entry-zone risk scoring and target-class matching.

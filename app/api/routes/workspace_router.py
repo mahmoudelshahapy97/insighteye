@@ -1,11 +1,15 @@
 # app/routes/workspace_router.py
 from fastapi import APIRouter, HTTPException, Depends, status, Request, Query
-from typing import List, Dict
+from typing import List, Dict, Literal
 from uuid import UUID
 import logging
+from pydantic import BaseModel
 from app.services.session_service import session_manager
 from app.services.user_service import user_manager
 from app.services.workspace_service import workspace_service
+from app.services.feature_service import (
+    FEATURES, feature_service, current_workspace_id,
+)
 from app.schemas import (
     WorkspaceCreate, 
     WorkspaceUpdate, 
@@ -17,6 +21,12 @@ from app.schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["workspaces"])
+
+FeatureKey = Literal[FEATURES]
+
+
+class FeaturesUpdate(BaseModel):
+    features: List[FeatureKey]
 
 # Helper dependencies
 async def get_current_user_full_data_dependency(
@@ -123,9 +133,39 @@ async def get_user_workspaces(
     include_inactive: bool = Query(False, description="Include inactive workspaces"),
     current_user_data: Dict = Depends(get_current_user_id_dependency)
 ):
-    """Get all workspaces for the current user."""
+    """Get all workspaces for the current user (superadmin: every workspace)."""
+    if workspace_service.is_superadmin(current_user_data):
+        return await workspace_service.get_all_workspaces(include_inactive)
     current_user_id = current_user_data['user_id']
     return await workspace_service.get_user_workspaces(current_user_id, include_inactive)
+
+
+@router.get("/workspaces/active")
+async def get_active_workspace(
+    current_user_data: Dict = Depends(get_current_user_id_dependency)
+):
+    """The workspace the current user is working in, or null."""
+    ws = await workspace_service.get_active_workspace(current_user_data['user_id'])
+    if not ws:
+        return None
+    return {
+        "workspace_id": str(ws["workspace_id"]),
+        "name": ws["name"],
+        "member_role": ws["member_role"],
+    }
+
+
+@router.get("/features/me")
+async def get_my_features(
+    current_user_data: Dict = Depends(get_current_user_full_data_dependency)
+):
+    """Features the current user may use in their active workspace."""
+    workspace_id = await current_workspace_id(current_user_data)
+    features = await feature_service.effective_features(current_user_data, workspace_id)
+    return {
+        "workspace_id": str(workspace_id) if workspace_id else None,
+        "features": [f for f in FEATURES if f in features],
+    }
 
 
 @router.get("/workspaces/{workspace_id_str}", response_model=dict)
@@ -354,7 +394,8 @@ async def activate_workspace(
         
         result = await workspace_service.activate_workspace(
             workspace_id,
-            current_user_id
+            current_user_id,
+            current_user_data.get('role')
         )
         
         await session_manager.log_action(
@@ -416,4 +457,58 @@ async def admin_get_all_users(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve all users."
         )
-    
+
+
+def _require_superadmin(current_user_data: Dict) -> None:
+    if not workspace_service.is_superadmin(current_user_data):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action requires superadmin privileges."
+        )
+
+
+@router.put("/admin/users/{user_id}/features", response_model=dict)
+async def admin_set_user_features(
+    user_id: UUID,
+    body: FeaturesUpdate,
+    request: Request,
+    current_user_data: Dict = Depends(get_current_user_full_data_dependency)
+):
+    """Open/close features for a user (superadmin only)."""
+    _require_superadmin(current_user_data)
+    username = await feature_service.set_user_features(user_id, body.features)
+    if username is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    await session_manager.log_action(
+        content=f"User '{current_user_data['username']}' set features of user '{username}' to {sorted(set(body.features))}.",
+        user_id=str(current_user_data['user_id']),
+        action_type="User_Features_Updated",
+        ip_address=request.client.host if request.client else "N/A",
+        user_agent=request.headers.get("user-agent")
+    )
+    return {"message": "User features updated.", "features": sorted(set(body.features))}
+
+
+@router.put("/admin/workspaces/{workspace_id}/features", response_model=dict)
+async def admin_set_workspace_features(
+    workspace_id: UUID,
+    body: FeaturesUpdate,
+    request: Request,
+    current_user_data: Dict = Depends(get_current_user_full_data_dependency)
+):
+    """Open/close features for a workspace (superadmin only)."""
+    _require_superadmin(current_user_data)
+    name = await feature_service.set_workspace_features(workspace_id, body.features)
+    if name is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
+
+    await session_manager.log_action(
+        content=f"User '{current_user_data['username']}' set features of workspace '{name}' to {sorted(set(body.features))}.",
+        user_id=str(current_user_data['user_id']),
+        workspace_id=str(workspace_id),
+        action_type="Workspace_Features_Updated",
+        ip_address=request.client.host if request.client else "N/A",
+        user_agent=request.headers.get("user-agent")
+    )
+    return {"message": "Workspace features updated.", "features": sorted(set(body.features))}

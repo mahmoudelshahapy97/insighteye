@@ -24,6 +24,7 @@ from typing import Dict, Any, List, Optional
 from uuid import UUID
 
 from app.services.session_service import session_manager
+from app.services.feature_service import require_feature
 from app.services.workspace_service import workspace_service
 from app.services.shoplifting_service import shoplifting_service
 from app.services.s3_service import s3_service
@@ -41,7 +42,8 @@ from app.schemas.shoplifting_schema import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/shoplifting", tags=["Shoplifting"])
+router = APIRouter(prefix="/shoplifting", tags=["Shoplifting"],
+                   dependencies=[Depends(require_feature("shoplifting"))])
 
 
 # ─────────────────────────────────────────────

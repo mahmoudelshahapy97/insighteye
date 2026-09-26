@@ -590,9 +590,15 @@ class UserManager:
 
     async def get_all_users(self) -> List[Dict]:
         query = """
-            SELECT user_id, username, email, created_at, is_active, last_login, role, 
-                is_subscribed, subscription_date, count_of_camera
-            FROM users
+            SELECT u.user_id, u.username, u.email, u.created_at, u.is_active, u.last_login, u.role, 
+                u.is_subscribed, u.subscription_date, u.count_of_camera, u.enabled_features,
+                COALESCE(ARRAY(
+                    SELECT w.name FROM workspace_members wm
+                    JOIN workspaces w ON w.workspace_id = wm.workspace_id
+                    WHERE wm.user_id = u.user_id ORDER BY w.name
+                ), '{}') AS workspaces
+            FROM users u
+            ORDER BY u.username
         """
         users_data = await self.db_manager.execute_query(query, fetch_all=True)
         return [dict(user) for user in users_data] if users_data else [] 
@@ -743,4 +749,4 @@ class UserManager:
                 detail="Failed to create user and workspace."
             )
 
-user_manager = UserManager()
+user_manager = UserManager()

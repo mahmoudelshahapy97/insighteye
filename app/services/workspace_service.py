@@ -120,9 +120,17 @@ class WorkspaceService:
             # Simplified workspace lookup with single query using COALESCE
             workspace_query = """
                 WITH session_workspace AS (
+                    -- The token's workspace only counts while the user is still a
+                    -- member of it (superadmins may use any workspace), so removing
+                    -- a member takes effect immediately instead of at next login.
                     SELECT ut.workspace_id, ut.updated_at as last_used
                     FROM user_tokens ut
+                    JOIN workspaces w ON w.workspace_id = ut.workspace_id AND w.is_active = TRUE
+                    JOIN users u ON u.user_id = ut.user_id
                     WHERE ut.user_id = $1 AND ut.is_active = TRUE
+                      AND (u.role = 'superadmin' OR EXISTS (
+                          SELECT 1 FROM workspace_members wm
+                          WHERE wm.user_id = ut.user_id AND wm.workspace_id = ut.workspace_id))
                     ORDER BY ut.updated_at DESC
                     LIMIT 1
                 ),
@@ -172,12 +180,14 @@ class WorkspaceService:
         # Try to get from active session/token
         query_session_ws = """
             SELECT w.workspace_id, w.name, w.description, w.created_at, w.updated_at, 
-                w.is_active, wm.role as member_role
+                w.is_active, COALESCE(wm.role, 'admin') as member_role
             FROM workspaces w
             JOIN user_tokens ut ON w.workspace_id = ut.workspace_id 
-            JOIN workspace_members wm ON w.workspace_id = wm.workspace_id 
+            JOIN users u ON u.user_id = ut.user_id
+            LEFT JOIN workspace_members wm ON w.workspace_id = wm.workspace_id 
                 AND ut.user_id = wm.user_id
             WHERE ut.user_id = $1 AND ut.is_active = TRUE AND w.is_active = TRUE
+              AND (wm.user_id IS NOT NULL OR u.role = 'superadmin')
             ORDER BY ut.updated_at DESC LIMIT 1 
         """
         workspace_data = await self.db_manager.execute_query(
@@ -495,7 +505,7 @@ class WorkspaceService:
             await self.get_workspace_by_id(workspace_id, check_active=False)
 
             query = """
-                SELECT wm.membership_id, wm.workspace_id, wm.user_id, u.username, wm.role, 
+                SELECT wm.membership_id, wm.workspace_id, wm.user_id, u.username, u.email, wm.role, 
                        wm.created_at, wm.updated_at
                 FROM workspace_members wm
                 JOIN users u ON wm.user_id = u.user_id
@@ -508,11 +518,14 @@ class WorkspaceService:
                     "workspace_id": str(m_row["workspace_id"]),
                     "user_id": str(m_row["user_id"]),
                     "username": m_row["username"],
+                    "email": m_row["email"],
                     "role": m_row["role"],
                     "created_at": m_row["created_at"].isoformat() if m_row["created_at"] else None,
                     "updated_at": m_row["updated_at"].isoformat() if m_row["updated_at"] else None
                 } for m_row in members_rows
             ] if members_rows else []
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error retrieving members for workspace {workspace_id}: {e}", exc_info=True)
             raise HTTPException(
@@ -569,7 +582,7 @@ class WorkspaceService:
                     )
                 
                 # Validate role
-                valid_roles = ['member', 'admin', 'owner']
+                valid_roles = ['member', 'admin', 'viewer']
                 if member_data.role not in valid_roles:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
@@ -787,15 +800,19 @@ class WorkspaceService:
     async def activate_workspace(
         self,
         workspace_id: UUID,
-        current_user_id: UUID
+        current_user_id: UUID,
+        system_role: Optional[str] = None
     ) -> Dict:
-        """Set a workspace as active for the current user."""
+        """Set a workspace as active for the current user (all their active sessions)."""
         try:
-            await check_workspace_access(
-                self.db_manager,
-                current_user_id,
-                workspace_id,
-            )
+            if system_role == "superadmin":
+                pass  # superadmins may work in any workspace
+            else:
+                await check_workspace_access(
+                    self.db_manager,
+                    current_user_id,
+                    workspace_id,
+                )
             workspace_details = await self.get_workspace_by_id(workspace_id, check_active=True)
 
             await self.db_manager.execute_query(
@@ -805,6 +822,8 @@ class WorkspaceService:
             )
 
             return {"workspace_name": workspace_details['name']}
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error activating workspace {workspace_id}: {e}", exc_info=True)
             raise HTTPException(
@@ -816,6 +835,7 @@ class WorkspaceService:
         """Get all workspaces (admin only)."""
         query = """
             SELECT w.workspace_id, w.name, w.description, w.created_at, w.updated_at, w.is_active,
+                   w.enabled_features,
                    (SELECT COUNT(*) FROM workspace_members wm WHERE wm.workspace_id = w.workspace_id) as member_count
             FROM workspaces w
         """
@@ -833,7 +853,8 @@ class WorkspaceService:
                     "created_at": ws_row["created_at"].isoformat() if ws_row["created_at"] else None,
                     "updated_at": ws_row["updated_at"].isoformat() if ws_row["updated_at"] else None,
                     "is_active": ws_row["is_active"],
-                    "member_count": ws_row["member_count"]
+                    "member_count": ws_row["member_count"],
+                    "enabled_features": list(ws_row["enabled_features"] or [])
                 } for ws_row in workspaces_rows
             ] if workspaces_rows else []
         except Exception as e:

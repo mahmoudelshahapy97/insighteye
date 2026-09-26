@@ -6,6 +6,7 @@ from uuid import UUID
 import logging
 
 from app.services.session_service import session_manager
+from app.services.feature_service import require_feature
 from app.services.workspace_service import workspace_service
 from app.services.database import db_manager
 from app.utils import check_workspace_access, parse_string_or_list
@@ -235,7 +236,7 @@ async def get_frame_counts_per_camera(
         logger.error(f"Error fetching frame counts: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
-@router.get("/cameras/average-people")
+@router.get("/cameras/average-people", dependencies=[Depends(require_feature("people_counting"))])
 async def get_average_people_per_camera(
     request: Request,
     start_date: Optional[date] = None,
@@ -330,7 +331,7 @@ async def get_average_people_per_camera(
         logger.error(f"Error fetching average people: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
-@router.get("/cameras/average-gender")
+@router.get("/cameras/average-gender", dependencies=[Depends(require_feature("gender"))])
 async def get_average_gender_per_camera(
     request: Request,
     gender: str = Query("male", pattern="^(male|female)$"),
@@ -430,7 +431,7 @@ async def get_average_gender_per_camera(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/zones/gender-by-weekday")
+@router.get("/zones/gender-by-weekday", dependencies=[Depends(require_feature("gender"))])
 async def get_gender_by_zone_and_weekday(
     request: Request,
     gender: str = Query("male", pattern="^(male|female)$"),
@@ -523,7 +524,7 @@ async def get_gender_by_zone_and_weekday(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/busiest-hours/by-weekday")
+@router.get("/busiest-hours/by-weekday", dependencies=[Depends(require_feature("people_counting"))])
 async def get_busiest_hour_per_weekday(
     request: Request,
     start_date: Optional[date] = None,
@@ -630,7 +631,7 @@ async def get_busiest_hour_per_weekday(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/floors/average-people")
+@router.get("/floors/average-people", dependencies=[Depends(require_feature("people_counting"))])
 async def get_average_people_by_floor(
     request: Request,
     start_date: Optional[date] = None,
@@ -716,7 +717,7 @@ async def get_average_people_by_floor(
         logger.error(f"Error fetching floor averages: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
-@router.get("/floors/people-by-weekday")
+@router.get("/floors/people-by-weekday", dependencies=[Depends(require_feature("people_counting"))])
 async def get_people_by_floor_and_weekday(
     request: Request,
     start_date: Optional[date] = None,
@@ -805,7 +806,7 @@ async def get_people_by_floor_and_weekday(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/floors/people-by-hour")
+@router.get("/floors/people-by-hour", dependencies=[Depends(require_feature("people_counting"))])
 async def get_people_by_floor_and_hour(
     request: Request,
     start_date: Optional[date] = None,
@@ -1154,7 +1155,7 @@ async def get_camera_timeseries(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/fire/detections-by-camera")
+@router.get("/fire/detections-by-camera", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_fire_detections_by_camera(
     request: Request,
     start_date: Optional[date] = None,
@@ -1293,7 +1294,7 @@ async def get_fire_detections_by_camera(
         logger.error(f"Error fetching fire detections by camera: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
-@router.get("/fire/detection-summary")
+@router.get("/fire/detection-summary", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_fire_detection_summary(
     request: Request,
     start_date: Optional[date] = None,
@@ -1391,7 +1392,7 @@ async def get_fire_detection_summary(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/fire/detections-by-location")
+@router.get("/fire/detections-by-location", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_fire_detections_by_location(
     request: Request,
     start_date: Optional[date] = None,
@@ -1496,7 +1497,7 @@ async def get_fire_detections_by_location(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/fire/detections-timeline")
+@router.get("/fire/detections-timeline", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_fire_detections_timeline(
     request: Request,
     start_date: Optional[date] = None,
@@ -1605,7 +1606,7 @@ async def get_fire_detections_timeline(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/fire/detections-by-weekday")
+@router.get("/fire/detections-by-weekday", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_fire_detections_by_weekday(
     request: Request,
     start_date: Optional[date] = None,
@@ -1703,7 +1704,7 @@ async def get_fire_detections_by_weekday(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/fire/detections-by-hour")
+@router.get("/fire/detections-by-hour", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_fire_detections_by_hour(
     request: Request,
     start_date: Optional[date] = None,
@@ -1807,7 +1808,7 @@ async def get_fire_detections_by_hour(
         logger.error(f"Error fetching fire detections by hour: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
-@router.get("/fire/high-risk-cameras")
+@router.get("/fire/high-risk-cameras", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_high_risk_cameras(
     request: Request,
     start_date: Optional[date] = None,
@@ -1972,7 +1973,7 @@ async def get_high_risk_cameras(
         logger.error(f"Error fetching high risk cameras: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
-@router.get("/fire/recent-detections")
+@router.get("/fire/recent-detections", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_recent_fire_detections(
     request: Request,
     limit: int = Query(50, le=500, description="Max number of recent detections"),
@@ -2066,7 +2067,7 @@ async def get_recent_fire_detections(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/fire/status-by-camera")
+@router.get("/fire/status-by-camera", dependencies=[Depends(require_feature("fire_smoke"))])
 async def get_fire_status_by_camera(
     request: Request,
     start_date: Optional[date] = None,
@@ -2201,7 +2202,7 @@ async def get_fire_status_by_camera(
         logger.error(f"Error fetching threshold violations: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
-@router.get("/fire/threshold-violations-by-camera")
+@router.get("/fire/threshold-violations-by-camera", dependencies=[Depends(require_feature("people_counting"))])
 async def get_threshold_violations_by_camera(
     request: Request,
     start_date: Optional[date] = None,
@@ -2457,7 +2458,7 @@ async def get_threshold_violations_by_camera(
         raise HTTPException(status_code=500, detail="An error occurred while computing analytics.")
 
 
-@router.get("/fire/threshold-violations-config-check")
+@router.get("/fire/threshold-violations-config-check", dependencies=[Depends(require_feature("people_counting"))])
 async def check_threshold_violations_config(
     request: Request,
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)

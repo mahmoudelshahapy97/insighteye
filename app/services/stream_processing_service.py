@@ -4,6 +4,7 @@ Stream Processing Service - Handles video frame processing, object detection, an
 Stream Processing Service - Handles video frame processing, object detection, and alerts.
 """
 import asyncio
+import base64
 import logging
 import time
 import cv2
@@ -147,6 +148,7 @@ class StreamProcessingService:
         threshold_settings: Dict[str, Any] = None,
         stream_id_str: str = None,
         detection_models: Optional[set] = None,
+        gender_enabled: bool = True,
     ) -> Tuple[np.ndarray, int, bool, int, int, str, bool, float, List[str]]:
         """
         Detect objects in frame with threshold checking.
@@ -220,7 +222,7 @@ class StreamProcessingService:
             person_count = len(person_detections)
 
             # Gender detection (every 3rd frame when people detected)
-            if person_count > 0 and frame_count % 3 == 0 and self.gender_model and self.gender_model.is_loaded:
+            if gender_enabled and person_count > 0 and frame_count % 3 == 0 and self.gender_model and self.gender_model.is_loaded:
                 try:
                     raw_gender_results = self.gender_model.predict(input_frame)
                     gender_detections = self.gender_model.postprocess(
@@ -789,6 +791,12 @@ class StreamProcessingService:
                                 is_admin=True
                             )
                             
+                            # Only members who have this feature open get its alerts.
+                            from app.services.feature_service import feature_service
+                            allowed_ids = await feature_service.recipients_with_feature(
+                                [mm['user_id'] for mm in workspace_members], workspace_id, 'people_counting'
+                            )
+                            workspace_members = [mm for mm in workspace_members if str(mm['user_id']) in allowed_ids]
                             broadcast_count = 0
                             for member in workspace_members:
                                 member_id = str(member['user_id'])
@@ -1002,6 +1010,12 @@ class StreamProcessingService:
                             is_admin=True
                         )
                         
+                        # Only members who have this feature open get its alerts.
+                        from app.services.feature_service import feature_service
+                        allowed_ids = await feature_service.recipients_with_feature(
+                            [mm['user_id'] for mm in workspace_members], workspace_id, 'fire_smoke'
+                        )
+                        workspace_members = [mm for mm in workspace_members if str(mm['user_id']) in allowed_ids]
                         broadcast_count = 0
                         for member in workspace_members:
                             member_id = str(member['user_id'])
@@ -1060,13 +1074,25 @@ class StreamProcessingService:
         workspace_id: UUID,
         owner_id: UUID,
     ):
-        """Persist a blocked-exit event and notify, mirroring _handle_fire_detection_alert."""
+        """Apply one engine transition to the stream's blockage episode.
+
+        open     -> insert the episode (with an evidence snapshot) and notify
+        escalate -> update it and notify again (partially blocked became blocked)
+        update   -> refresh accessibility / risk on the open episode
+        close    -> set ended_at + duration
+        """
+        transition = result.get("transition")
+        if not transition:
+            return
         try:
             from app.services.blocked_exit_service import blocked_exit_service
 
-            event_id = await blocked_exit_service.record_event(
-                stream_id=stream_id,
-                workspace_id=workspace_id,
+            if transition == "close":
+                await blocked_exit_service.close_open_episodes(stream_id)
+                logger.info(f"🚪 Blocked-exit episode closed for {stream_id_str}")
+                return
+
+            reading = dict(
                 state=result["state"],
                 accessibility_pct=result.get("accessibility_pct"),
                 blocking_objects=result.get("blocking_objects"),
@@ -1074,10 +1100,40 @@ class StreamProcessingService:
                 risk_level=result.get("risk_level"),
                 recommended_action=result.get("recommended_action"),
             )
-            if not event_id:
-                return  # deduplicated against a recent open event
 
-            message = f"🚪 EXIT BLOCKED: '{camera_name}' exit is {result['state'].replace('_', ' ')} ({result.get('accessibility_pct')}% accessible)"
+            if transition == "open":
+                evidence_paths = None
+                jpeg = result.get("evidence_jpeg")
+                if jpeg:
+                    try:
+                        from app.services.s3_service import s3_service
+                        path = await s3_service.upload_image_base64_to_s3(
+                            base64.b64encode(jpeg).decode("ascii"),
+                            f"blocked-exit/{workspace_id}/{stream_id_str}/{uuid.uuid4()}.jpg",
+                        )
+                        evidence_paths = [path] if path else None
+                    except Exception as e:
+                        logger.warning(f"[blocked-exit] evidence upload failed for {stream_id_str}: {e}")
+                _, created = await blocked_exit_service.open_episode(
+                    stream_id=stream_id, workspace_id=workspace_id, camera_name=camera_name,
+                    evidence_paths=evidence_paths, **reading,
+                )
+                if not created:
+                    return  # continued an episode that was already open; already notified
+            else:
+                event_id = await blocked_exit_service.get_open_episode_id(stream_id)
+                if event_id is None:
+                    # Episode was closed underneath us (config deleted/disabled); start fresh.
+                    await blocked_exit_service.open_episode(
+                        stream_id=stream_id, workspace_id=workspace_id, camera_name=camera_name, **reading,
+                    )
+                else:
+                    await blocked_exit_service.update_episode(event_id=event_id, **reading)
+                if transition != "escalate":
+                    return
+
+            verb = "now FULLY BLOCKED" if transition == "escalate" else f"{result['state'].replace('_', ' ')}"
+            message = f"🚪 EXIT BLOCKED: '{camera_name}' exit is {verb} ({result.get('accessibility_pct')}% accessible)"
             notification = await notification_service.create_notification(
                 workspace_id=workspace_id,
                 user_id=owner_id,
@@ -1104,65 +1160,224 @@ class StreamProcessingService:
                         },
                     },
                 )
-            logger.warning(f"🚪 Blocked-exit alert recorded for {stream_id_str}: {result['state']} ({result.get('accessibility_pct')}%)")
+            logger.warning(f"🚪 Blocked-exit {transition} for {stream_id_str}: {result['state']} ({result.get('accessibility_pct')}%)")
         except Exception as e:
             logger.error(f"Error handling blocked-exit alert: {e}", exc_info=True)
 
-    async def _handle_no_entry_zone_alert(
+    async def _broadcast_to_workspace(
+        self, owner_id: UUID, workspace_id: UUID, payload: Dict[str, Any], feature: str = "no_entry_zone",
+    ):
+        """Send a WS notification to the camera owner and every workspace member with `feature` open."""
+        if not self.stream_manager:
+            return
+        recipients = {str(owner_id)}
+        try:
+            from app.services.feature_service import feature_service
+            members = await self.stream_manager.workspace_service.get_workspace_members(
+                workspace_id=workspace_id, current_user_id=workspace_id, is_admin=True,
+            )
+            recipients.update(await feature_service.recipients_with_feature(
+                [m["user_id"] for m in members or []], workspace_id, feature,
+            ))
+        except Exception as e:
+            logger.error(f"[no-entry-zone] could not list workspace members: {e}")
+        for user_id in recipients:
+            try:
+                await self.stream_manager.broadcast_notification(user_id, payload)
+            except Exception as e:
+                logger.error(f"[no-entry-zone] broadcast to {user_id} failed: {e}")
+
+    def _nez_spawn(self, coro):
+        """Fire-and-forget evidence work, keeping a reference so the task is not GC'd."""
+        if not hasattr(self, "_nez_tasks"):
+            self._nez_tasks = set()
+        task = asyncio.create_task(coro)
+        self._nez_tasks.add(task)
+        task.add_done_callback(self._nez_tasks.discard)
+
+    async def _nez_upload_snapshot(self, event_id: int, jpeg: bytes):
+        from app.services.s3_service import s3_service
+        from app.services.no_entry_zone_service import no_entry_zone_service
+        try:
+            key = f"no-entry-zone/snapshots/{event_id}-{uuid.uuid4().hex[:8]}.jpg"
+            path = await s3_service.upload_image_base64_to_s3(base64.b64encode(jpeg).decode("ascii"), key)
+            if path:
+                await no_entry_zone_service.set_evidence(event_id, snapshot_path=path)
+        except Exception as e:
+            logger.error(f"[no-entry-zone] snapshot upload failed for event {event_id}: {e}", exc_info=True)
+
+    async def _nez_upload_clip(self, event_id: int, frames: List[np.ndarray], fps: float):
+        from app.services.s3_service import s3_service
+        from app.services.no_entry_zone_service import no_entry_zone_service
+        temp_path = os.path.join(tempfile.gettempdir(), f"nez-{uuid.uuid4().hex}.mp4")
+
+        def encode() -> bool:
+            h, w = frames[0].shape[:2]
+            w -= w % 2
+            h -= h % 2  # libx264 + yuv420p needs even dimensions
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{w}x{h}",
+                "-pix_fmt", "bgr24", "-r", f"{fps:.3f}", "-i", "pipe:0",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart", temp_path,
+            ]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                for f in frames:
+                    if f.shape[:2] != (h, w):
+                        f = cv2.resize(f, (w, h))
+                    proc.stdin.write(np.ascontiguousarray(f).tobytes())
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            proc.wait()
+            if proc.returncode != 0:
+                logger.error(f"[no-entry-zone] ffmpeg failed: {proc.stderr.read().decode(errors='ignore')[:500]}")
+                return False
+            return True
+
+        try:
+            if not frames or not await asyncio.to_thread(encode):
+                return
+            key = f"no-entry-zone/clips/{event_id}-{uuid.uuid4().hex[:8]}.mp4"
+            path = await s3_service.upload_video_file_to_s3(temp_path, key)
+            if path:
+                await no_entry_zone_service.set_evidence(event_id, clip_path=path)
+        except Exception as e:
+            logger.error(f"[no-entry-zone] clip upload failed for event {event_id}: {e}", exc_info=True)
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+
+    async def _handle_no_entry_zone_result(
         self,
         stream_id: UUID,
         stream_id_str: str,
-        violation: Dict[str, Any],
+        result: Dict[str, Any],
         camera_name: str,
         workspace_id: UUID,
         owner_id: UUID,
     ):
-        """Persist a no-entry-zone violation and notify, mirroring _handle_fire_detection_alert."""
+        """Persist entry/exit triggers and evidence from NoEntryZoneEngine.
+
+        Entries are inserted inline (awaited) so that the exit and the clip — which
+        always arrive on a later frame — find the row. Evidence uploads run in the
+        background so a slow S3 never stalls the frame loop.
+        """
+        from app.services.no_entry_zone_service import no_entry_zone_service
+
+        if not hasattr(self, "_nez_events"):
+            # engine event uuid -> {"event_id", "stream", "exited", "clipped"}; dropped once
+            # both the exit and the clip have landed (they arrive in either order).
+            self._nez_events = {}
+
+        def settle(event_uuid: str, **flags) -> Optional[int]:
+            rec = self._nez_events.get(event_uuid)
+            if rec is None:
+                return None
+            rec.update(flags)
+            if rec["exited"] and rec["clipped"]:
+                self._nez_events.pop(event_uuid, None)
+            return rec["event_id"]
+
+        for trig in result.get("triggers", []):
+            try:
+                if trig["kind"] == "entry":
+                    event_id = await no_entry_zone_service.create_open_event(
+                        incident_id=trig["incident_id"],
+                        zone_id=UUID(trig["zone_id"]),
+                        stream_id=stream_id,
+                        workspace_id=workspace_id,
+                        camera_name=camera_name,
+                        zone_name=trig.get("zone_name"),
+                        target_class=trig.get("target_class") or "unknown",
+                        track_id=trig.get("track_id"),
+                        confidence=trig.get("confidence"),
+                        entered_at=trig.get("entered_at"),
+                        alerted_at=trig.get("alerted_at"),
+                        dwell_seconds=trig.get("dwell_seconds"),
+                    )
+                    if not event_id:
+                        continue
+                    self._nez_events[trig["event_uuid"]] = {
+                        "event_id": event_id, "stream": stream_id_str, "exited": False, "clipped": False,
+                    }
+                    jpeg = result.get("snapshots", {}).get(trig["event_uuid"])
+                    if jpeg:
+                        self._nez_spawn(self._nez_upload_snapshot(event_id, jpeg))
+                    await self._notify_no_entry_zone(
+                        stream_id_str, trig, event_id, camera_name, workspace_id, owner_id,
+                    )
+                    logger.warning(
+                        f"⛔ No-entry-zone alert recorded for {stream_id_str}: "
+                        f"zone={trig.get('zone_name')} event={event_id} incident={trig['incident_id']}"
+                    )
+                else:
+                    event_id = settle(trig["event_uuid"], exited=True)
+                    if event_id and trig.get("exited_at"):
+                        await no_entry_zone_service.close_event(
+                            event_id, exited_at=trig["exited_at"], dwell_seconds=trig.get("dwell_seconds"),
+                        )
+            except Exception as e:
+                logger.error(f"Error handling no-entry-zone {trig.get('kind')} trigger: {e}", exc_info=True)
+
+        for clip in result.get("clips", []):
+            event_id = settle(clip["event_uuid"], clipped=True)
+            if event_id:
+                self._nez_spawn(self._nez_upload_clip(event_id, clip["frames"], clip["fps"]))
+
+        if result.get("released"):
+            # Stream gone: nothing more will arrive for its events.
+            for key in [k for k, v in self._nez_events.items() if v["stream"] == stream_id_str]:
+                self._nez_events.pop(key, None)
+
+    async def _notify_no_entry_zone(
+        self,
+        stream_id_str: str,
+        trig: Dict[str, Any],
+        event_id: int,
+        camera_name: str,
+        workspace_id: UUID,
+        owner_id: UUID,
+    ):
         try:
-            from app.services.no_entry_zone_service import no_entry_zone_service
-
-            event = await no_entry_zone_service.record_event(
-                zone_id=violation["zone_id"],
-                stream_id=stream_id,
-                workspace_id=workspace_id,
-                camera_name=camera_name,
-                zone_name=violation.get("zone_name"),
-                target_class=violation.get("target_class") or "unknown",
-                dwell_seconds=violation.get("dwell_seconds"),
-            )
-            if not event:
-                return
-
-            message = f"⛔ NO-ENTRY VIOLATION: {violation.get('target_class') or 'object'} in '{violation.get('zone_name') or 'zone'}' on '{camera_name}'"
+            what = trig.get("target_class") or "object"
+            message = f"⛔ NO-ENTRY VIOLATION: {what} in '{trig.get('zone_name') or 'zone'}' on '{camera_name}'"
             notification = await notification_service.create_notification(
                 workspace_id=workspace_id,
                 user_id=owner_id,
                 status="urgent",
                 message=message,
-                stream_id=stream_id,
+                stream_id=UUID(stream_id_str),
                 camera_name=camera_name,
             )
-            if notification and self.stream_manager:
-                await self.stream_manager.broadcast_notification(
-                    str(owner_id),
-                    {
-                        "type": "new_notification",
-                        "notification": {
-                            "id": str(notification.get("notification_id")),
-                            "user_id": str(notification.get("user_id")),
-                            "workspace_id": str(notification.get("workspace_id")),
-                            "stream_id": stream_id_str,
-                            "camera_name": camera_name,
-                            "status": notification.get("status"),
-                            "message": message,
-                            "timestamp": notification.get("timestamp").timestamp() if notification.get("timestamp") else datetime.now(ZoneInfo("Africa/Cairo")).timestamp(),
-                            "read": False,
-                        },
-                    },
-                )
-            logger.warning(f"⛔ No-entry-zone alert recorded for {stream_id_str}: zone={violation.get('zone_name')}")
+            if not notification:
+                return
+            ts = notification.get("timestamp")
+            await self._broadcast_to_workspace(owner_id, workspace_id, {
+                "type": "new_notification",
+                "notification": {
+                    "id": str(notification.get("notification_id")),
+                    "user_id": str(notification.get("user_id")),
+                    "workspace_id": str(notification.get("workspace_id")),
+                    "stream_id": stream_id_str,
+                    "camera_name": camera_name,
+                    "status": notification.get("status"),
+                    "message": message,
+                    "timestamp": ts.timestamp() if ts else datetime.now(ZoneInfo("Africa/Cairo")).timestamp(),
+                    "read": False,
+                    "module": "no_entry_zone",
+                    "event_id": event_id,
+                    "incident_id": str(trig["incident_id"]),
+                    "zone_name": trig.get("zone_name"),
+                },
+            })
         except Exception as e:
-            logger.error(f"Error handling no-entry-zone alert: {e}", exc_info=True)
+            logger.error(f"Error sending no-entry-zone notification: {e}", exc_info=True)
 
     async def process_stream_with_sharing(
         self,
@@ -1244,9 +1459,28 @@ class StreamProcessingService:
             no_entry_zone_enabled = bool(_stream_db.get('is_no_entry_zone_camera', False)) if _stream_db else False
             is_people_counting_camera = bool(_stream_db.get('is_people_counting_camera', False)) if _stream_db else False
 
+            # Superadmin feature access (camera owner ∩ workspace) further gates every
+            # detection. Re-checked in the main loop so opening/closing a feature takes
+            # effect on running streams.
+            from app.services.feature_service import feature_service, CAMERA_FEATURES_TTL_SECONDS
+            cam_shoplifting = is_shoplifting_camera
+            cam_blocked_exit = blocked_exit_enabled
+            cam_people_counting = is_people_counting_camera
+            allowed_features = await feature_service.camera_features(stream_id)
+            effective_models = {m for m in detection_models if m in allowed_features}
+            gender_enabled = 'gender' in allowed_features
+            is_shoplifting_camera = cam_shoplifting and 'shoplifting' in allowed_features
+            blocked_exit_enabled = cam_blocked_exit and 'blocked_exit' in allowed_features
+            no_entry_zone_enabled = no_entry_zone_enabled and 'no_entry_zone' in allowed_features
+            is_people_counting_camera = cam_people_counting and 'people_counting' in allowed_features
+            last_feature_refresh = time.monotonic()
+
             if blocked_exit_enabled:
                 try:
                     from app.services.blocked_exit_service import blocked_exit_service
+                    # An episode left open by a crash or restart can't be continued
+                    # (the engine's timers are gone), so close it before starting.
+                    await blocked_exit_service.close_open_episodes(stream_id)
                     zone_cfg = await blocked_exit_service.get_zone_config(stream_id)
                     self.blocked_exit_engine.set_zone_config(stream_id_str, zone_cfg)
                 except Exception as e:
@@ -1255,10 +1489,15 @@ class StreamProcessingService:
             if no_entry_zone_enabled:
                 try:
                     from app.services.no_entry_zone_service import no_entry_zone_service
-                    zones = await no_entry_zone_service.list_zones(workspace_id, stream_id=stream_id)
+                    zones = await no_entry_zone_service.list_zones_for_stream(stream_id)
                     self.no_entry_zone_engine.set_zones(stream_id_str, zones)
                 except Exception as e:
                     logger.error(f"[no-entry-zone] failed to load zones for {stream_id_str}: {e}")
+            # The camera flag and zones are re-read periodically, so enabling/disabling
+            # the camera or editing zones from another process takes effect without a
+            # stream restart.
+            nez_refresh_every = float(getattr(config, "no_entry_zone_zone_refresh_seconds", 10.0))
+            last_nez_refresh = time.monotonic()
 
             # -------------------- SOURCE --------------------
             if not source.startswith("rtsp://"):
@@ -1314,6 +1553,36 @@ class StreamProcessingService:
                             
                     frame_count += 1
                     frames_since_last_save += 1
+
+                    # ---------- FEATURE ACCESS REFRESH ----------
+                    if time.monotonic() - last_feature_refresh >= CAMERA_FEATURES_TTL_SECONDS:
+                        last_feature_refresh = time.monotonic()
+                        new_allowed = await feature_service.camera_features(stream_id)
+                        if new_allowed != allowed_features:
+                            logger.info(
+                                f"[features] {stream_id_str[:8]} allowed features changed: "
+                                f"{sorted(allowed_features)} -> {sorted(new_allowed)}"
+                            )
+                            allowed_features = new_allowed
+                            effective_models = {m for m in detection_models if m in allowed_features}
+                            gender_enabled = 'gender' in allowed_features
+                            is_shoplifting_camera = cam_shoplifting and 'shoplifting' in allowed_features
+                            is_people_counting_camera = cam_people_counting and 'people_counting' in allowed_features
+                            be_now = cam_blocked_exit and 'blocked_exit' in allowed_features
+                            if be_now != blocked_exit_enabled:
+                                try:
+                                    from app.services.blocked_exit_service import blocked_exit_service
+                                    # Either way the engine's open episode can't continue.
+                                    await blocked_exit_service.close_open_episodes(stream_id)
+                                    if be_now:
+                                        self.blocked_exit_engine.set_zone_config(
+                                            stream_id_str, await blocked_exit_service.get_zone_config(stream_id),
+                                        )
+                                except Exception as e:
+                                    logger.error(f"[blocked-exit] feature toggle failed for {stream_id_str}: {e}")
+                                blocked_exit_enabled = be_now
+                            # no-entry-zone follows on its own refresh below
+                            last_nez_refresh = 0.0
                     # (no per-frame shoplifting counter needed — dedup is time-based now)
                     
                     # Buffer resized frame to save memory
@@ -1386,7 +1655,7 @@ class StreamProcessingService:
                         except Exception as e:
                             logger.error(f"Shoplifting detection error for stream {stream_id_str}: {e}")
 
-                    # ===== BLOCKED-EXIT DETECTION (independent rate, gated by detection_models) =====
+                    # ===== BLOCKED-EXIT DETECTION (independent rate, gated by is_blocked_exit_camera) =====
                     if blocked_exit_enabled and frame_count % shoplifting_frame_rate == 0 and self.blocked_exit_engine.has_config(stream_id_str):
                         engine = self.blocked_exit_engine
                         if not engine.is_loaded and not blocked_exit_engine_load_attempted:
@@ -1399,14 +1668,37 @@ class StreamProcessingService:
                             be_result = await loop.run_in_executor(
                                 thread_pool, engine.process_frame, stream_id_str, frame,
                             )
-                            if be_result and be_result.get("alert"):
+                            if be_result and be_result.get("transition"):
                                 await self._handle_blocked_exit_alert(
                                     stream_id, stream_id_str, be_result, camera_name, workspace_id, owner_id,
                                 )
                         except Exception as e:
                             logger.error(f"Blocked-exit detection error for stream {stream_id_str}: {e}")
 
-                    # ===== NO-ENTRY-ZONE DETECTION (independent rate, gated by detection_models) =====
+                    # ===== NO-ENTRY-ZONE DETECTION (independent rate, gated by is_no_entry_zone_camera) =====
+                    if time.monotonic() - last_nez_refresh >= nez_refresh_every:
+                        last_nez_refresh = time.monotonic()
+                        try:
+                            from app.services.no_entry_zone_service import no_entry_zone_service
+                            now_enabled = (
+                                'no_entry_zone' in allowed_features
+                                and await no_entry_zone_service.is_camera_enabled(stream_id)
+                            )
+                            if now_enabled:
+                                self.no_entry_zone_engine.set_zones(
+                                    stream_id_str, await no_entry_zone_service.list_zones_for_stream(stream_id),
+                                )
+                            elif no_entry_zone_enabled:
+                                logger.info(f"[no-entry-zone] disabled on {stream_id_str}, closing open events")
+                                await self._handle_no_entry_zone_result(
+                                    stream_id, stream_id_str,
+                                    self.no_entry_zone_engine.release_stream(stream_id_str),
+                                    camera_name, workspace_id, owner_id,
+                                )
+                            no_entry_zone_enabled = now_enabled
+                        except Exception as e:
+                            logger.error(f"[no-entry-zone] zone refresh failed for {stream_id_str}: {e}")
+
                     if no_entry_zone_enabled and frame_count % shoplifting_frame_rate == 0 and self.no_entry_zone_engine.has_zones(stream_id_str):
                         engine = self.no_entry_zone_engine
                         if not engine.is_loaded and not no_entry_zone_engine_load_attempted:
@@ -1416,12 +1708,12 @@ class StreamProcessingService:
                             except Exception as _le:
                                 logger.error(f"[no-entry-zone] lazy load_models failed: {_le}")
                         try:
-                            violations = await loop.run_in_executor(
+                            nez_result = await loop.run_in_executor(
                                 thread_pool, engine.process_frame, stream_id_str, frame,
                             )
-                            for violation in violations:
-                                await self._handle_no_entry_zone_alert(
-                                    stream_id, stream_id_str, violation, camera_name, workspace_id, owner_id,
+                            if nez_result["triggers"] or nez_result["clips"]:
+                                await self._handle_no_entry_zone_result(
+                                    stream_id, stream_id_str, nez_result, camera_name, workspace_id, owner_id,
                                 )
                         except Exception as e:
                             logger.error(f"No-entry-zone detection error for stream {stream_id_str}: {e}")
@@ -1627,7 +1919,8 @@ class StreamProcessingService:
                             conf_threshold,
                             threshold_settings,
                             stream_id_str,
-                            detection_models,
+                            effective_models,
+                            gender_enabled,
                         )
                     except Exception as detection_err:
                         logger.error(
@@ -1734,6 +2027,17 @@ class StreamProcessingService:
             # ✅ CRITICAL: ALWAYS cleanup, even on crash
             logger.info(f"Cleaning up stream {stream_id_str}")
 
+            # Close open no-entry events and flush partial clips; otherwise they would
+            # stay open forever (exited_at NULL) once the stream is gone.
+            try:
+                nez_final = self.no_entry_zone_engine.release_stream(stream_id_str)
+                if nez_final["triggers"] or nez_final["clips"]:
+                    await self._handle_no_entry_zone_result(
+                        stream_id, stream_id_str, nez_final, camera_name, workspace_id, owner_id,
+                    )
+            except Exception as cleanup_err:
+                logger.error(f"Error closing no-entry-zone events: {cleanup_err}")
+
             try:
                 if shared_stream:
                     await shared_stream.remove_subscriber(stream_id_str)
@@ -1749,6 +2053,15 @@ class StreamProcessingService:
                             
             except Exception as cleanup_err:
                 logger.error(f"Error removing subscriber: {cleanup_err}")
+
+            try:
+                if self.blocked_exit_engine.has_config(stream_id_str) or \
+                        stream_id_str in self.blocked_exit_engine._states:
+                    from app.services.blocked_exit_service import blocked_exit_service
+                    self.blocked_exit_engine.clear_stream(stream_id_str)
+                    await blocked_exit_service.close_open_episodes(stream_id)
+            except Exception as cleanup_err:
+                logger.error(f"Error closing blocked-exit episode: {cleanup_err}")
 
             try:
                 if self.stream_manager:

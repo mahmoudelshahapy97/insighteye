@@ -126,7 +126,8 @@ async def get_all_streams(
                    vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
                    vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
                    vs.is_shoplifting_camera, vs.is_blocked_exit_camera, vs.is_no_entry_zone_camera,
-                   vs.is_people_counting_camera, vs.detection_models
+                   vs.is_people_counting_camera, vs.detection_models,
+                   w.enabled_features AS workspace_features
             FROM video_stream vs
             JOIN users u ON vs.user_id = u.user_id
             LEFT JOIN workspaces w ON vs.workspace_id = w.workspace_id
@@ -179,6 +180,7 @@ async def get_all_streams(
                 "is_no_entry_zone_camera": s["is_no_entry_zone_camera"],
                 "is_people_counting_camera": s["is_people_counting_camera"],
                 "detection_models": s["detection_models"],
+                "workspace_features": list(s["workspace_features"] or []),
                 "created_at": s["created_at"].isoformat() if s["created_at"] else None,
                 "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
                 "workspace_id": str(s["workspace_id"]) if s["workspace_id"] else None,
@@ -192,6 +194,32 @@ async def get_all_streams(
     except Exception as e:
         logger.error(f"Unexpected error retrieving all streams: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+
+_FLAG_FEATURES = {
+    "is_shoplifting_camera": "shoplifting",
+    "is_blocked_exit_camera": "blocked_exit",
+    "is_no_entry_zone_camera": "no_entry_zone",
+    "is_people_counting_camera": "people_counting",
+}
+
+
+async def _closed_features_requested(stream_update: StreamUpdate) -> List[str]:
+    """Features this update turns on that the camera's workspace has closed."""
+    requested = set(stream_update.detection_models or [])
+    requested |= {feat for flag, feat in _FLAG_FEATURES.items() if getattr(stream_update, flag, None)}
+    if not requested:
+        return []
+    row = await db_manager.execute_query(
+        """SELECT w.enabled_features FROM video_stream vs
+           JOIN workspaces w ON w.workspace_id = vs.workspace_id
+           WHERE vs.stream_id = $1""",
+        (UUID(ensure_uuid_str(stream_update.id)),),
+        fetch_one=True,
+    )
+    if not row:
+        return []  # unknown camera: let update_camera report it
+    return sorted(requested - set(row["enabled_features"] or []))
+
 
 @router.put("/source", status_code=status.HTTP_200_OK)
 async def update_streams(
@@ -211,6 +239,12 @@ async def update_streams(
         failed_ids = []
 
         for stream_update in streams:
+            closed = await _closed_features_requested(stream_update)
+            if closed:
+                failed_ids.append(
+                    f"{stream_update.id} (not enabled for this camera's workspace: {', '.join(closed)})"
+                )
+                continue
             success, error = await camera_service.update_camera(stream_update, user_id_obj, user_role)
             if success:
                 updated_ids.append(ensure_uuid_str(stream_update.id))
@@ -2359,4 +2393,4 @@ async def get_my_camera_limit(
             status_code=500,
             detail="An unexpected error occurred while retrieving camera limit."
         )
-    
+    

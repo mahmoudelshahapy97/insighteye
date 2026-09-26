@@ -70,12 +70,29 @@ def _occupancy(region: np.ndarray, obstacle_masks: List[np.ndarray]) -> float:
 
 
 class _StreamState:
-    __slots__ = ("blocked_since", "last_state", "last_event_at")
+    """Temporal state for one camera.
+
+    An episode opens once an obstruction has persisted for debounce_seconds and
+    closes once the exit has stayed clear for clear_hold_seconds, so a person
+    walking past never opens one and a momentary gap never closes one.
+    """
+
+    __slots__ = (
+        "blocked_since", "clear_since", "episode_open", "episode_state",
+        "episode_started", "last_update_at",
+    )
 
     def __init__(self) -> None:
         self.blocked_since: Optional[float] = None
-        self.last_state: str = "clear"
-        self.last_event_at: float = 0.0
+        self.clear_since: Optional[float] = None
+        self.episode_open: bool = False
+        self.episode_state: Optional[str] = None
+        self.episode_started: Optional[float] = None
+        self.last_update_at: float = 0.0
+
+    def reset_timers(self) -> None:
+        self.blocked_since = None
+        self.clear_since = None
 
 
 class BlockedExitEngine:
@@ -87,9 +104,11 @@ class BlockedExitEngine:
         self.model = None
         self._configs: Dict[str, Dict[str, Any]] = {}   # stream_id -> config row
         self._states: Dict[str, _StreamState] = {}
+        self._mask_cache: Dict[str, Tuple[Tuple[int, int], np.ndarray]] = {}
         self.min_accessibility_default = 50.0
         self.debounce_seconds_default = 5.0
-        self.event_cooldown_seconds = 60.0
+        self.clear_hold_seconds = 3.0
+        self.update_interval_seconds = 10.0
 
     def load_models(self) -> bool:
         if self.is_loaded:
@@ -111,18 +130,60 @@ class BlockedExitEngine:
             return False
 
     def set_zone_config(self, stream_id: str, cfg: Optional[Dict[str, Any]]) -> None:
-        """Cache a camera's door-polygon config; called on load and hot-reload."""
-        if cfg is None:
+        """Cache a camera's door-polygon config; called on load and hot-reload.
+
+        Inactive or polygon-less configs are dropped so has_config() gates them
+        out. Debounce timers restart against the new polygon, but an episode
+        already open is kept so it can still be closed normally.
+        """
+        self._mask_cache.pop(stream_id, None)
+        if cfg is None or not cfg.get("door_polygon") or cfg.get("is_active") is False:
             self._configs.pop(stream_id, None)
         else:
             self._configs[stream_id] = cfg
+        state = self._states.get(stream_id)
+        if state is not None:
+            state.reset_timers()
+
+    def clear_stream(self, stream_id: str) -> None:
+        """Forget everything about a stream (called when it stops)."""
+        self._configs.pop(stream_id, None)
+        self._states.pop(stream_id, None)
+        self._mask_cache.pop(stream_id, None)
 
     def has_config(self, stream_id: str) -> bool:
-        return stream_id in self._configs and self._configs[stream_id].get("door_polygon")
+        return stream_id in self._configs and bool(self._configs[stream_id].get("door_polygon"))
 
-    def process_frame(self, stream_id: str, frame: np.ndarray) -> Optional[Dict[str, Any]]:
-        """Returns a dict describing the current state, or None if no polygon
-        is configured / the model isn't loaded / no event should fire yet."""
+    @staticmethod
+    def _scale_polygon(
+        polygon: List[List[float]], ref_w: Optional[int], ref_h: Optional[int], width: int, height: int,
+    ) -> List[List[float]]:
+        """Map a polygon drawn on a ref_w x ref_h calibration frame onto the live frame."""
+        if not ref_w or not ref_h or ref_w <= 0 or ref_h <= 0:
+            return polygon
+        sx, sy = width / ref_w, height / ref_h
+        return [[x * sx, y * sy] for x, y in polygon]
+
+    def _door_mask(self, stream_id: str, cfg: Dict[str, Any], width: int, height: int) -> np.ndarray:
+        cached = self._mask_cache.get(stream_id)
+        if cached and cached[0] == (width, height):
+            return cached[1]
+        polygon = self._scale_polygon(
+            cfg["door_polygon"], cfg.get("calibration_frame_w"), cfg.get("calibration_frame_h"), width, height,
+        )
+        mask = _polygon_to_mask(polygon, width, height)
+        self._mask_cache[stream_id] = ((width, height), mask)
+        return mask
+
+    def process_frame(
+        self, stream_id: str, frame: np.ndarray, now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Returns the current reading plus the episode transition it caused.
+
+        transition is one of None, "open", "update", "escalate", "close".
+        "alert" is True on open/escalate (the moments worth notifying about).
+        Returns None if no polygon is configured or the model isn't loaded.
+        """
         cfg = self._configs.get(stream_id)
         if not cfg or not cfg.get("door_polygon"):
             return None
@@ -130,9 +191,8 @@ class BlockedExitEngine:
             return None
 
         height, width = frame.shape[:2]
-        door_mask = _polygon_to_mask(cfg["door_polygon"], width, height)
-        door_area = int(np.count_nonzero(door_mask))
-        if door_area == 0:
+        door_mask = self._door_mask(stream_id, cfg, width, height)
+        if not np.count_nonzero(door_mask):
             return None
 
         try:
@@ -143,25 +203,43 @@ class BlockedExitEngine:
             return None
 
         obstacle_masks: List[np.ndarray] = []
-        blocking_objects: List[str] = []
+        blocking: List[Tuple[str, List[float]]] = []
         people_count = 0
         for det in detections:
             mask = _bbox_to_mask(det["bbox"], width, height)
-            overlap = int(np.count_nonzero(cv2.bitwise_and(door_mask, mask)))
-            if overlap <= 0:
+            if not np.count_nonzero(cv2.bitwise_and(door_mask, mask)):
                 continue
             class_id = det["class_id"]
-            label = self._class_label(class_id)
             if class_id == PERSON_CLASS_ID:
                 people_count += 1
             obstacle_masks.append(mask)
-            blocking_objects.append(label)
+            blocking.append((self._class_label(class_id), det["bbox"]))
 
         occupied_pct = _occupancy(door_mask, obstacle_masks) * 100.0
         accessibility_pct = round(_clamp(100.0 - occupied_pct), 2)
+        reading = self.evaluate(
+            stream_id, accessibility_pct, [label for label, _ in blocking], people_count, now=now,
+        )
+        if reading["transition"] == "open":
+            reading["evidence_jpeg"] = self._annotate(frame, cfg, width, height, blocking, reading)
+        return reading
 
+    def evaluate(
+        self,
+        stream_id: str,
+        accessibility_pct: float,
+        blocking_objects: List[str],
+        people_count: int = 0,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Classify one accessibility reading and advance the stream's episode
+        state machine. Split from process_frame so it can be tested without a model."""
+        cfg = self._configs.get(stream_id) or {}
+        now = time.monotonic() if now is None else now
         min_accessibility = float(cfg.get("min_accessibility_pct") or self.min_accessibility_default)
-        debounce_seconds = float(cfg.get("debounce_seconds") or self.debounce_seconds_default)
+        debounce_seconds = float(
+            cfg["debounce_seconds"] if cfg.get("debounce_seconds") is not None else self.debounce_seconds_default
+        )
 
         if accessibility_pct >= min_accessibility:
             state = "clear"
@@ -170,35 +248,85 @@ class BlockedExitEngine:
         else:
             state = "partially_blocked"
 
-        stream_state = self._states.setdefault(stream_id, _StreamState())
-        now = time.monotonic()
+        st = self._states.setdefault(stream_id, _StreamState())
+        transition: Optional[str] = None
 
         if state == "clear":
-            stream_state.blocked_since = None
-            stream_state.last_state = state
-            return {"state": state, "accessibility_pct": accessibility_pct, "alert": False}
+            st.blocked_since = None
+            if st.episode_open:
+                if st.clear_since is None:
+                    st.clear_since = now
+                if now - st.clear_since >= self.clear_hold_seconds:
+                    transition = "close"
+                    st.episode_open = False
+                    st.episode_state = None
+                    st.episode_started = None
+                    st.clear_since = None
+        else:
+            st.clear_since = None
+            if st.blocked_since is None:
+                st.blocked_since = now
+            if not st.episode_open:
+                if now - st.blocked_since >= debounce_seconds:
+                    transition = "open"
+                    st.episode_open = True
+                    st.episode_state = state
+                    st.episode_started = st.blocked_since
+                    st.last_update_at = now
+            elif state == "blocked" and st.episode_state == "partially_blocked":
+                transition = "escalate"
+                st.episode_state = "blocked"
+                st.last_update_at = now
+            elif now - st.last_update_at >= self.update_interval_seconds:
+                transition = "update"
+                st.last_update_at = now
 
-        if stream_state.blocked_since is None:
-            stream_state.blocked_since = now
-        blocked_duration = now - stream_state.blocked_since
-        stream_state.last_state = state
-
-        alert = False
-        if blocked_duration >= debounce_seconds and (now - stream_state.last_event_at) >= self.event_cooldown_seconds:
-            alert = True
-            stream_state.last_event_at = now
-
-        risk_score, risk_level = self._assess_risk(state, accessibility_pct, blocked_duration, blocking_objects, people_count)
-
+        blocked_duration = (now - st.episode_started) if st.episode_started is not None else (
+            (now - st.blocked_since) if st.blocked_since is not None else 0.0
+        )
+        risk_score, risk_level = self._assess_risk(
+            state, accessibility_pct, blocked_duration, blocking_objects, people_count,
+        )
         return {
             "state": state,
+            "episode_state": st.episode_state,
             "accessibility_pct": accessibility_pct,
             "blocking_objects": sorted(set(blocking_objects)),
             "risk_score": risk_score,
             "risk_level": risk_level,
             "recommended_action": _RISK_ACTIONS[risk_level],
-            "alert": alert,
+            "blocked_duration_s": round(blocked_duration, 1),
+            "transition": transition,
+            "alert": transition in ("open", "escalate"),
         }
+
+    def _annotate(
+        self, frame: np.ndarray, cfg: Dict[str, Any], width: int, height: int,
+        blocking: List[Tuple[str, List[float]]], reading: Dict[str, Any],
+    ) -> Optional[bytes]:
+        """JPEG of the frame with the door polygon and blocking boxes drawn on."""
+        try:
+            img = frame.copy()
+            polygon = self._scale_polygon(
+                cfg["door_polygon"], cfg.get("calibration_frame_w"), cfg.get("calibration_frame_h"), width, height,
+            )
+            pts = np.round(np.asarray(polygon, dtype=np.float32)).astype(np.int32)
+            color = (0, 0, 255) if reading["state"] == "blocked" else (0, 165, 255)
+            overlay = img.copy()
+            cv2.fillPoly(overlay, [pts], color)
+            img = cv2.addWeighted(overlay, 0.25, img, 0.75, 0)
+            cv2.polylines(img, [pts], True, color, 2)
+            for label, bbox in blocking:
+                x1, y1, x2, y2 = (int(round(v)) for v in bbox)
+                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 2)
+                cv2.putText(img, label, (x1, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            caption = f"{reading['state'].replace('_', ' ')} - {reading['accessibility_pct']:.0f}% accessible"
+            cv2.putText(img, caption, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            return buf.tobytes() if ok else None
+        except Exception as e:
+            logger.warning(f"blocked-exit evidence annotation failed: {e}")
+            return None
 
     def _class_label(self, class_id: int) -> str:
         # ModelFactory loaders don't expose COCO class names; fall back to id.

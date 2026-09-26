@@ -6,6 +6,7 @@ pydantic
 #opencv-python-headless==4.8.1.78
 chromadb
 ultralytics==8.4.7
+lap>=0.5.12
 Pillow
 datetime
 uvicorn

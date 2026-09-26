@@ -90,6 +90,35 @@ async def lifespan(app: FastAPI):
         logger.warning("Could not create threshold_violations table: %s", e)
 
     try:
+        # No-entry-zone v2 columns (database/insighteye-no-entry-zone-v2.sql is the
+        # full migration; these are the columns the backend reads and writes).
+        from app.services.database import db_manager as _db
+        for stmt in (
+            "ALTER TABLE no_entry_zones ADD COLUMN IF NOT EXISTS consecutive_frames INTEGER",
+            "ALTER TABLE no_entry_zones ADD COLUMN IF NOT EXISTS cooldown_seconds NUMERIC(6,2)",
+            "ALTER TABLE no_entry_zones ADD COLUMN IF NOT EXISTS anchor VARCHAR(20)",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS track_id INTEGER",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS confidence NUMERIC(5,4)",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS entered_at TIMESTAMPTZ",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS exited_at TIMESTAMPTZ",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS snapshot_path TEXT",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS clip_path TEXT",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS acknowledged_by UUID "
+            "REFERENCES users(user_id) ON DELETE SET NULL",
+            "ALTER TABLE no_entry_events ADD COLUMN IF NOT EXISTS resolved_by UUID "
+            "REFERENCES users(user_id) ON DELETE SET NULL",
+            "CREATE INDEX IF NOT EXISTS idx_no_entry_events_ws_incident "
+            "ON no_entry_events (workspace_id, incident_id)",
+            "CREATE INDEX IF NOT EXISTS idx_no_entry_events_ws_ts "
+            "ON no_entry_events (workspace_id, event_timestamp DESC)",
+        ):
+            await _db.execute_query(stmt, fetch_one=False)
+        logger.info("no-entry-zone v2 columns ensured.")
+    except Exception as e:
+        logger.warning("Could not ensure no-entry-zone v2 columns: %s", e)
+
+    try:
         from app.services.database import db_manager as _db
         await _db.execute_query(
             "CREATE INDEX IF NOT EXISTS idx_stream_results_workspace_timestamp "
