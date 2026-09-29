@@ -119,6 +119,17 @@ async def lifespan(app: FastAPI):
         logger.warning("Could not ensure no-entry-zone v2 columns: %s", e)
 
     try:
+        # Blocked-exit evidence parity with no_entry_events: a clip and the detection
+        # confidence per episode (evidence-videos tab and confidence-audit chart).
+        from app.services.database import db_manager as _db
+        from app.services.blocked_exit_service import EVIDENCE_COLUMNS_DDL
+        for stmt in EVIDENCE_COLUMNS_DDL:
+            await _db.execute_query(stmt, fetch_one=False)
+        logger.info("blocked-exit evidence columns ensured.")
+    except Exception as e:
+        logger.warning("Could not ensure blocked-exit evidence columns: %s", e)
+
+    try:
         from app.services.database import db_manager as _db
         await _db.execute_query(
             "CREATE INDEX IF NOT EXISTS idx_stream_results_workspace_timestamp "
@@ -305,4 +316,4 @@ if __name__ == "__main__":
         host=config.app_host,
         port=config.app_port,
     )
-    
+    

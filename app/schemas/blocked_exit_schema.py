@@ -30,6 +30,13 @@ class BlockedExitEventBase(BaseModel):
     min_accessibility_pct: Optional[float] = None
     peak_risk_score: Optional[float] = None
     acknowledged_at: Optional[datetime] = None
+    camera_area: Optional[str] = None
+    # Evidence: peak / mean detection confidence of the blocking objects, and files
+    confidence: Optional[float] = None
+    avg_confidence: Optional[float] = None
+    snapshot_path: Optional[str] = None
+    clip_path: Optional[str] = None      # annotated clip (door polygon + boxes)
+    video_path: Optional[str] = None     # full-rate footage before the blockage, like shoplifting
 
 
 class BlockedExitEventResponse(BlockedExitEventBase):

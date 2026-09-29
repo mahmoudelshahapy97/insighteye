@@ -74,7 +74,7 @@ async def test_door_polygon_needs_three_xy_points(client, mocker):
 
 
 async def test_repolygon_does_not_reset_strategy(client, mocker):
-    mocker.patch.object(mod.blocked_exit_service, "get_camera", mocker.AsyncMock(return_value={"name": "cam"}))
+    mocker.patch.object(mod.blocked_exit_service, "get_camera", mocker.AsyncMock(return_value={"name": "cam", "is_blocked_exit_camera": True}))
     stream = uuid4()
     saved = {
         "config_id": uuid4(), "stream_id": stream, "door_polygon": [[0, 0], [10, 0], [10, 10]],
@@ -177,3 +177,139 @@ async def test_permissions_shape(client, mocker):
     async with client as c:
         r = await c.get("/blocked-exit/permissions")
     assert r.json() == {"can_resolve": True, "can_manage": False}
+
+
+# ─────────────────────────────────────────────
+# Feature gating, polygon editor, evidence videos and charts
+# ─────────────────────────────────────────────
+
+SQUARE = [[10, 10], [110, 10], [110, 110], [10, 110]]
+
+
+def _role(mocker, allowed: bool):
+    from fastapi import HTTPException
+
+    async def check(*a, **kw):
+        if not allowed:
+            raise HTTPException(status_code=403, detail="nope")
+    return mocker.patch.object(mod, "check_workspace_access", side_effect=check)
+
+
+async def test_polygon_writes_need_the_feature_enabled(client, mocker):
+    _role(mocker, True)
+    mocker.patch.object(mod.blocked_exit_service, "get_camera",
+                        mocker.AsyncMock(return_value={"name": "cam", "is_blocked_exit_camera": False}))
+    set_polygon = mocker.patch.object(mod.blocked_exit_service, "set_door_polygon", mocker.AsyncMock())
+    stream = uuid4()
+    async with client as c:
+        r1 = await c.put(f"/blocked-exit/cameras/{stream}/polygon",
+                         json={"polygon": SQUARE, "ref_width": 640, "ref_height": 360})
+        r2 = await c.put(f"/blocked-exit/cameras/{stream}/door-polygon",
+                         json={"door_polygon": SQUARE, "calibration_frame_w": 640, "calibration_frame_h": 360})
+        r3 = await c.patch(f"/blocked-exit/cameras/{stream}/config", json={"is_active": False})
+    assert r1.status_code == r2.status_code == r3.status_code == 409
+    set_polygon.assert_not_awaited()
+
+
+async def test_polygon_put_is_admin_only(client, mocker):
+    _role(mocker, False)
+    get_camera = mocker.patch.object(mod.blocked_exit_service, "get_camera", mocker.AsyncMock())
+    async with client as c:
+        r = await c.put(f"/blocked-exit/cameras/{uuid4()}/polygon",
+                        json={"polygon": SQUARE, "ref_width": 640, "ref_height": 360})
+    assert r.status_code == 403
+    get_camera.assert_not_awaited()
+
+
+async def test_polygon_round_trip_in_the_shared_shape(client, mocker):
+    _role(mocker, True)
+    stream, cfg_id = uuid4(), uuid4()
+    mocker.patch.object(mod.blocked_exit_service, "get_camera",
+                        mocker.AsyncMock(return_value={"name": "Exit A", "is_blocked_exit_camera": True}))
+    saved = {"config_id": cfg_id, "stream_id": stream, "door_polygon": SQUARE,
+             "calibration_frame_w": 640, "calibration_frame_h": 360, "is_active": True}
+    set_polygon = mocker.patch.object(mod.blocked_exit_service, "set_door_polygon", mocker.AsyncMock(return_value=saved))
+    mocker.patch.object(mod.blocked_exit_service, "get_zone_config", mocker.AsyncMock(side_effect=[None, saved]))
+    hot = mocker.patch.object(mod, "_hot_reload")
+    async with client as c:
+        empty = (await c.get(f"/blocked-exit/cameras/{stream}/polygon")).json()
+        put = await c.put(f"/blocked-exit/cameras/{stream}/polygon",
+                          json={"polygon": SQUARE, "ref_width": 640, "ref_height": 360})
+        got = (await c.get(f"/blocked-exit/cameras/{stream}/polygon")).json()
+    assert empty["polygon"] is None and empty["point_count"] == 0 and empty["camera_name"] == "Exit A"
+    assert put.status_code == 200, put.text
+    assert got == put.json()
+    assert got["point_count"] == 4 and got["ref_width"] == 640 and got["id"] == str(cfg_id)
+    kw = set_polygon.await_args.kwargs
+    assert kw["door_polygon"] == SQUARE and kw["calibration_frame_w"] == 640
+    assert kw.get("detector_strategy") is None  # settings are kept
+    hot.assert_called_once()
+
+
+async def test_polygon_put_validates_geometry(client, mocker):
+    _role(mocker, True)
+    async with client as c:
+        r = await c.put(f"/blocked-exit/cameras/{uuid4()}/polygon",
+                        json={"polygon": [[0, 0], [100, 100], [100, 0], [0, 100]], "ref_width": 640, "ref_height": 360})
+    assert r.status_code == 422
+
+
+async def test_evidence_and_videos_sign_clip_and_snapshot(client, mocker):
+    from app.services import s3_service as s3mod
+    ev = {"event_id": 3, "event_timestamp": "2026-09-01T10:00:00Z", "status": "detected", "state": "blocked",
+          "clip_path": "s3://b/c.mp4", "video_path": "s3://b/v.mp4", "snapshot_path": None,
+          "evidence_paths": ["s3://b/s.jpg"], "camera_name": "Exit A", "zone": "Z1", "confidence": 0.77}
+    mocker.patch.object(mod.blocked_exit_service, "get_event", mocker.AsyncMock(side_effect=[ev, None]))
+    get = mocker.patch.object(mod.blocked_exit_service, "get_events", mocker.AsyncMock(return_value=[ev]))
+    mocker.patch.object(mod.blocked_exit_service, "count_events", mocker.AsyncMock(return_value=1))
+    mocker.patch.object(s3mod.s3_service, "get_presigned_url",
+                        mocker.AsyncMock(side_effect=lambda p, expiration: f"https://signed/{p[-5:]}"))
+    async with client as c:
+        evidence = await c.get("/blocked-exit/events/3/evidence")
+        missing = await c.get("/blocked-exit/events/4/evidence")
+        videos = await c.get("/blocked-exit/videos", params={"location": "HQ,Annex", "end_time": "18:00"})
+    assert evidence.json() == {"snapshot_url": "https://signed/s.jpg", "clip_url": "https://signed/c.mp4",
+                               "video_url": "https://signed/v.mp4", "expires_in": mod.EVIDENCE_URL_TTL}
+    assert missing.status_code == 404
+    item = videos.json()["items"][0]
+    assert item["clip_url"] == "https://signed/c.mp4" and item["peak_state"] == "blocked"
+    assert item["video_url"] == "https://signed/v.mp4"
+    assert item["download_url"] == "blocked-exit/events/3/video/download"
+    assert item["camera_zone"] == "Z1" and item["confidence"] == 0.77
+    kw = get.await_args.kwargs
+    assert kw["has_clip"] is True and kw["location"] == "HQ,Annex" and kw["end_time"] == "18:00"
+
+
+async def test_video_download_redirects_like_shoplifting(client, mocker):
+    from app.services import s3_service as s3mod
+    mocker.patch.object(mod.blocked_exit_service, "get_event", mocker.AsyncMock(side_effect=[
+        {"video_path": "s3://b/v.mp4", "clip_path": "s3://b/c.mp4"},
+        {"video_path": None, "clip_path": "s3://b/c.mp4"},
+        {"video_path": None, "clip_path": None},
+        None,
+    ]))
+    mocker.patch.object(s3mod.s3_service, "get_presigned_url",
+                        mocker.AsyncMock(side_effect=lambda p, expiration: f"https://signed/{p[-5:]}"))
+    async with client as c:
+        video = await c.get("/blocked-exit/events/3/video/download", follow_redirects=False)
+        clip = await c.get("/blocked-exit/events/3/video/download", follow_redirects=False)
+        none = await c.get("/blocked-exit/events/3/video/download", follow_redirects=False)
+        missing = await c.get("/blocked-exit/events/3/video/download", follow_redirects=False)
+    assert video.status_code == 302 and video.headers["location"] == "https://signed/v.mp4"
+    assert clip.headers["location"] == "https://signed/c.mp4"
+    assert none.status_code == missing.status_code == 404
+
+
+async def test_chart_endpoints(client, mocker):
+    per_cam = mocker.patch.object(mod.blocked_exit_service, "incidents_per_camera", mocker.AsyncMock(return_value=[]))
+    audit = mocker.patch.object(mod.blocked_exit_service, "confidence_audit", mocker.AsyncMock(return_value={
+        "summary": {"events": 0, "threshold": 0.4, "low_confidence_cutoff": 0.5},
+        "per_camera": [], "histogram": [], "per_event": [],
+    }))
+    cam = uuid4()
+    async with client as c:
+        r1 = await c.get("/blocked-exit/analytics/incidents-per-camera", params={"camera_id": str(cam)})
+        r2 = await c.get("/blocked-exit/analytics/confidence-audit", params={"floor_level": "1"})
+    assert r1.status_code == r2.status_code == 200, r2.text
+    assert per_cam.await_args.kwargs["camera_id"] == str(cam)
+    assert audit.await_args.kwargs["floor_level"] == "1"

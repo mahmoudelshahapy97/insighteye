@@ -7,6 +7,8 @@ Restricted-polygon intrusion detection.
 /overview                         - KPI cards + latest incidents
 /permissions                      - what the caller may change (drives the UI)
 /cameras                          - cameras enabled for no-entry-zone, with zone counts
+/cameras/{stream_id}/polygon      - get / replace the camera's polygon (single-polygon editor)
+/videos                           - evidence clips with presigned URLs (hierarchy/date/time filters)
 /incidents                        - list / filter incidents (events grouped by incident_id)
 /incidents/{incident_id}/resolve  - acknowledge / resolve every event of an incident
 /events                           - list / filter violation events
@@ -14,6 +16,8 @@ Restricted-polygon intrusion detection.
 /events/{event_id}/evidence       - short-lived URLs for the snapshot and clip
 /events/{event_id}/resolve        - acknowledge / resolve an event
 /analytics/summary                - time series + breakdowns
+/analytics/incidents-per-camera   - chart: incidents per camera (hierarchy/date/time filters)
+/analytics/confidence-audit       - chart: model accuracy & confidence audit
 /dashboard/active                 - live unresolved events
 /dashboard/summary                - daily rollup
 /zones                            - list / create zones
@@ -23,6 +27,7 @@ Restricted-polygon intrusion detection.
 
 Reading is open to every workspace member; acknowledging/resolving needs member (not
 viewer); zone changes and data deletion need workspace admin. System admins bypass.
+Zones can only be created or edited on cameras with no-entry-zone detection enabled.
 """
 
 import logging
@@ -42,6 +47,13 @@ from app.services.no_entry_zone_service import no_entry_zone_service
 from app.services.database import db_manager
 from app.utils.permission_utils import check_workspace_access
 from app.services.nez import rtsp_probe
+from app.schemas.evidence_schema import (
+    CameraIncidentCount,
+    CameraPolygonRequest,
+    CameraPolygonResponse,
+    ConfidenceAuditResponse,
+    EvidenceVideoListResponse,
+)
 from app.schemas.no_entry_zone_schema import (
     NoEntryEventListResponse,
     NoEntryEventResponse,
@@ -99,17 +111,34 @@ def _filters(
     end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     start_time: Optional[str] = Query(None, description="Time-of-day lower bound (HH:MM)"),
     end_time: Optional[str] = Query(None, description="Time-of-day upper bound (HH:MM)"),
-    location: Optional[str] = Query(None, description="Filter by camera location"),
-    building: Optional[str] = Query(None, description="Filter by building"),
-    floor_level: Optional[str] = Query(None, description="Filter by floor level"),
-    zone: Optional[str] = Query(None, description="Filter by the camera's location zone (not a no-entry zone)"),
+    location: Optional[str] = Query(None, description="Camera location (comma-separated for several)"),
+    area: Optional[str] = Query(None, description="Camera area (comma-separated for several)"),
+    building: Optional[str] = Query(None, description="Building (comma-separated for several)"),
+    floor_level: Optional[str] = Query(None, description="Floor level (comma-separated for several)"),
+    zone: Optional[str] = Query(None, description="The camera's location zone, not a no-entry zone (comma-separated)"),
 ):
     return dict(
         start_date=start_date, end_date=end_date,
         start_time=start_time, end_time=end_time,
-        location=location, building=building,
+        location=location, area=area, building=building,
         floor_level=floor_level, zone=zone,
     )
+
+
+async def _require_enabled_camera(stream_id: UUID, workspace_id: UUID) -> None:
+    """404 outside the workspace; 409 when no-entry-zone detection is off on the camera."""
+    enabled = await no_entry_zone_service.camera_flag(stream_id, workspace_id)
+    if enabled is None:
+        raise HTTPException(status_code=404, detail="Camera not found in this workspace")
+    if not enabled:
+        raise HTTPException(status_code=409, detail="No-entry-zone detection is not enabled on this camera")
+
+
+async def _sign(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    from app.services.s3_service import s3_service
+    return await s3_service.get_presigned_url(path, expiration=EVIDENCE_URL_TTL)
 
 
 async def _refresh_engine(stream_id) -> None:
@@ -320,6 +349,100 @@ async def camera_snapshot(
     )
 
 
+def _polygon_response(stream_id: UUID, camera_name: Optional[str], zone: Optional[Dict]) -> Dict:
+    if not zone:
+        return {"stream_id": stream_id, "camera_name": camera_name}
+    return {
+        "stream_id": stream_id, "camera_name": zone.get("camera_name") or camera_name,
+        "id": zone["zone_id"], "polygon": zone["polygon"],
+        "ref_width": zone["ref_width"], "ref_height": zone["ref_height"],
+        "point_count": len(zone["polygon"] or []), "is_active": zone["is_active"],
+        "updated_at": zone.get("updated_at"),
+    }
+
+
+@router.get("/cameras/{stream_id}/polygon", response_model=CameraPolygonResponse)
+async def get_camera_polygon(
+    stream_id: UUID,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """The camera's polygon (its first zone); ``polygon`` is null when none is drawn yet."""
+    workspace_id = await _workspace_with_role(current_user, None)
+    row = await _camera_or_404(stream_id, workspace_id)
+    zone = await no_entry_zone_service.primary_zone(stream_id, workspace_id)
+    return _polygon_response(stream_id, row.get("name"), zone)
+
+
+@router.put("/cameras/{stream_id}/polygon", response_model=CameraPolygonResponse)
+async def set_camera_polygon(
+    stream_id: UUID,
+    request: CameraPolygonRequest,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Replace the camera's polygon, creating its zone on first save. Only for cameras
+    with no-entry-zone detection enabled."""
+    workspace_id = await _workspace_with_role(current_user, "admin")
+    await _require_enabled_camera(stream_id, workspace_id)
+    body = request.model_dump(exclude_none=True)
+    try:
+        zone = await no_entry_zone_service.primary_zone(stream_id, workspace_id)
+        if zone:
+            zone = await no_entry_zone_service.update_zone(zone["zone_id"], workspace_id, body)
+        else:
+            zone = await no_entry_zone_service.create_zone(
+                workspace_id, {**body, "stream_id": stream_id, "name": "Default"},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"set_camera_polygon error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error saving the polygon.")
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not found")
+    try:
+        await _refresh_engine(stream_id)
+    except Exception as e:
+        logger.warning(f"Failed to hot-reload zones for {stream_id}: {e}")
+    return _polygon_response(stream_id, None, zone)
+
+
+# ─────────────────────────────────────────────
+# Evidence videos
+# ─────────────────────────────────────────────
+
+@router.get("/videos", response_model=EvidenceVideoListResponse)
+async def list_evidence_videos(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    status_filter: Optional[EventStatus] = Query(None, description="detected | acknowledged | resolved"),
+    f: dict = Depends(_filters),
+    page: int = Query(1, ge=1),
+    limit: int = Query(12, ge=1, le=100),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Events that have a recorded clip, newest first, with presigned clip/snapshot URLs."""
+    workspace_id = await _workspace_with_role(current_user, None)
+    offset = (page - 1) * limit
+    kw = dict(status=status_filter, camera_id=camera_id, has_clip=True, **f)
+    try:
+        events = await no_entry_zone_service.get_events(workspace_id, limit=limit, offset=offset, **kw)
+        total = await no_entry_zone_service.count_events(workspace_id, **kw)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"list_evidence_videos error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving evidence videos.")
+    items = []
+    for ev in events:
+        items.append({
+            **ev,
+            "clip_url": await _sign(ev.get("clip_path")),
+            "snapshot_url": await _sign(ev.get("snapshot_path")),
+        })
+    return EvidenceVideoListResponse(
+        items=items, total=total, limit=limit, offset=offset, page=page, expires_in=EVIDENCE_URL_TTL,
+    )
+
+
 # ─────────────────────────────────────────────
 # Incidents
 # ─────────────────────────────────────────────
@@ -424,16 +547,9 @@ async def get_no_entry_event_evidence(
     event = await no_entry_zone_service.get_event(event_id, workspace_id)
     if not event:
         raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
-    from app.services.s3_service import s3_service
-
-    async def sign(path: Optional[str]) -> Optional[str]:
-        if not path:
-            return None
-        return await s3_service.get_presigned_url(path, expiration=EVIDENCE_URL_TTL)
-
     return EvidenceUrls(
-        snapshot_url=await sign(event.get("snapshot_path")),
-        clip_url=await sign(event.get("clip_path")),
+        snapshot_url=await _sign(event.get("snapshot_path")),
+        clip_url=await _sign(event.get("clip_path")),
         expires_in=EVIDENCE_URL_TTL,
     )
 
@@ -476,6 +592,41 @@ async def get_analytics_summary(
     except Exception as e:
         logger.error(f"no-entry-zone analytics error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving no-entry-zone analytics.")
+
+
+@router.get("/analytics/incidents-per-camera", response_model=List[CameraIncidentCount])
+async def get_incidents_per_camera(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Chart 1: events, incidents and resolved events per camera."""
+    workspace_id = await _workspace_with_role(current_user, None)
+    try:
+        return await no_entry_zone_service.incidents_per_camera(workspace_id, camera_id=camera_id, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"incidents_per_camera error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving incidents per camera.")
+
+
+@router.get("/analytics/confidence-audit", response_model=ConfidenceAuditResponse)
+async def get_confidence_audit(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Chart 2: model accuracy & confidence audit — detection confidence summary, per
+    camera, as a histogram and for the latest 200 events."""
+    workspace_id = await _workspace_with_role(current_user, None)
+    try:
+        return await no_entry_zone_service.confidence_audit(workspace_id, camera_id=camera_id, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"confidence_audit error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the confidence audit.")
 
 
 @router.get("/dashboard/active", response_model=List[ActiveNoEntryEventSummary])
@@ -538,8 +689,7 @@ async def create_zone(
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     workspace_id = await _workspace_with_role(current_user, "admin")
-    if not await no_entry_zone_service.stream_in_workspace(request.stream_id, workspace_id):
-        raise HTTPException(status_code=404, detail="Camera not found in this workspace")
+    await _require_enabled_camera(request.stream_id, workspace_id)
     try:
         zone = await no_entry_zone_service.create_zone(workspace_id, request.model_dump())
     except HTTPException as e:
@@ -564,6 +714,10 @@ async def update_zone(
     current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
 ):
     workspace_id = await _workspace_with_role(current_user, "admin")
+    existing = await no_entry_zone_service.get_zone(zone_id, workspace_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Zone not found")
+    await _require_enabled_camera(existing["stream_id"], workspace_id)
     try:
         updated = await no_entry_zone_service.update_zone(
             zone_id, workspace_id, request.model_dump(exclude_unset=True)

@@ -5,12 +5,34 @@ from typing import List, Dict, Any, Optional, Tuple
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from app.config.settings import config
+from app.services import evidence_analytics
 from app.services.database import db_manager
 from app.utils.parser_utils import parse_date_format, parse_time_string
 
-_TZ = ZoneInfo("Africa/Cairo")
+_TZ_NAME = "Africa/Cairo"
+_TZ = ZoneInfo(_TZ_NAME)
 
 logger = logging.getLogger(__name__)
+
+# Evidence columns (clip + detection confidence per episode); applied idempotently on
+# startup by app/main.py.
+EVIDENCE_COLUMNS_DDL = (
+    "ALTER TABLE blocked_exit_events ADD COLUMN IF NOT EXISTS confidence NUMERIC(5,4)",
+    "ALTER TABLE blocked_exit_events ADD COLUMN IF NOT EXISTS avg_confidence NUMERIC(5,4)",
+    "ALTER TABLE blocked_exit_events ADD COLUMN IF NOT EXISTS snapshot_path TEXT",
+    "ALTER TABLE blocked_exit_events ADD COLUMN IF NOT EXISTS clip_path TEXT",
+    # Full-rate episode video saved like shoplifting's (buffered footage before the open).
+    "ALTER TABLE blocked_exit_events ADD COLUMN IF NOT EXISTS video_path TEXT",
+    "UPDATE blocked_exit_events SET snapshot_path = evidence_paths[1] "
+    "WHERE snapshot_path IS NULL AND cardinality(evidence_paths) > 0",
+    "CREATE INDEX IF NOT EXISTS idx_blocked_exit_events_ws_ts "
+    "ON blocked_exit_events (workspace_id, event_timestamp DESC)",
+    "DROP INDEX IF EXISTS idx_blocked_exit_events_ws_clip",
+    "CREATE INDEX IF NOT EXISTS idx_blocked_exit_events_ws_video "
+    "ON blocked_exit_events (workspace_id, event_timestamp DESC) "
+    "WHERE clip_path IS NOT NULL OR video_path IS NOT NULL",
+)
 
 
 def _decode_zone_config_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -44,11 +66,13 @@ class BlockedExitService:
         state: Optional[str] = None,
         risk_level: Optional[str] = None,
         open_only: bool = False,
+        has_clip: bool = False,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
         location: Optional[str] = None,
+        area: Optional[str] = None,
         building: Optional[str] = None,
         floor_level: Optional[str] = None,
         zone: Optional[str] = None,
@@ -77,6 +101,10 @@ class BlockedExitService:
             params.append(risk_level)
         if open_only:
             conditions.append(f"{table_alias}.status IN ('detected', 'acknowledged')")
+        if has_clip:
+            conditions.append(f"({table_alias}.video_path IS NOT NULL OR {table_alias}.clip_path IS NOT NULL)")
+        # Time-of-day bounds are compared in the same zone the date bounds are built in.
+        local_time = f"({table_alias}.event_timestamp AT TIME ZONE '{_TZ_NAME}')::time"
         if start_date:
             sd = parse_date_format(start_date)
             st = parse_time_string(start_time, dt_time.min) if start_time else dt_time.min
@@ -86,7 +114,7 @@ class BlockedExitService:
         elif start_time:
             t = parse_time_string(start_time, dt_time.min)
             p += 1
-            conditions.append(f"{table_alias}.event_timestamp::time >= ${p}")
+            conditions.append(f"{local_time} >= ${p}")
             params.append(t)
         if end_date:
             ed = parse_date_format(end_date)
@@ -97,24 +125,16 @@ class BlockedExitService:
         elif end_time and not start_date:
             t = parse_time_string(end_time, dt_time(23, 59, 59))
             p += 1
-            conditions.append(f"{table_alias}.event_timestamp::time <= ${p}")
+            conditions.append(f"{local_time} <= ${p}")
             params.append(t)
-        if location:
-            p += 1
-            conditions.append(f"{vs_alias}.location = ${p}")
-            params.append(location)
-        if building:
-            p += 1
-            conditions.append(f"{vs_alias}.building = ${p}")
-            params.append(building)
-        if floor_level:
-            p += 1
-            conditions.append(f"{vs_alias}.floor_level = ${p}")
-            params.append(floor_level)
-        if zone:
-            p += 1
-            conditions.append(f"{vs_alias}.zone = ${p}")
-            params.append(zone)
+        # Camera hierarchy; each accepts one value or a comma-separated list.
+        for col, value in (("location", location), ("area", area), ("building", building),
+                           ("floor_level", floor_level), ("zone", zone)):
+            values = evidence_analytics.csv_values(value) if value else []
+            if values:
+                p += 1
+                conditions.append(f"{vs_alias}.{col} = ANY(${p}::text[])")
+                params.append(values)
 
         return conditions, params, p
 
@@ -127,9 +147,10 @@ class BlockedExitService:
         be.state, be.peak_state, be.accessibility_pct, be.min_accessibility_pct,
         be.blocking_objects, be.risk_score, be.peak_risk_score, be.risk_level,
         be.recommended_action, be.status, be.description, be.evidence_paths,
+        be.confidence, be.avg_confidence, be.snapshot_path, be.clip_path, be.video_path,
         be.acknowledged_at, be.resolved_at,
         COALESCE(vs.name, be.camera_name) AS camera_name, vs.location AS camera_location,
-        vs.building, vs.floor_level, vs.zone,
+        vs.area AS camera_area, vs.building, vs.floor_level, vs.zone,
         CASE WHEN be.ended_at IS NULL
              THEN EXTRACT(EPOCH FROM (NOW() - be.event_timestamp))
              ELSE be.duration_s END::float AS effective_duration_s
@@ -255,6 +276,9 @@ class BlockedExitService:
         risk_level: Optional[str],
         recommended_action: Optional[str],
         evidence_paths: Optional[List[str]] = None,
+        confidence: Optional[float] = None,
+        avg_confidence: Optional[float] = None,
+        snapshot_path: Optional[str] = None,
     ) -> Tuple[Optional[int], bool]:
         """Start a blockage episode. If one is already open for the stream (e.g. the
         engine was reset mid-episode) that one is continued instead.
@@ -269,6 +293,7 @@ class BlockedExitService:
                 event_id=existing["event_id"], state=state, accessibility_pct=accessibility_pct,
                 blocking_objects=blocking_objects, risk_score=risk_score, risk_level=risk_level,
                 recommended_action=recommended_action,
+                confidence=confidence, avg_confidence=avg_confidence,
             )
             return existing["event_id"], False
 
@@ -277,11 +302,12 @@ class BlockedExitService:
             INSERT INTO blocked_exit_events (
                 stream_id, workspace_id, camera_name, config_id, state, peak_state,
                 accessibility_pct, min_accessibility_pct, blocking_objects,
-                risk_score, peak_risk_score, risk_level, recommended_action, evidence_paths
+                risk_score, peak_risk_score, risk_level, recommended_action, evidence_paths,
+                confidence, avg_confidence, snapshot_path
             )
             SELECT $1::uuid, $2::uuid, $3::varchar, cfg.config_id, $4::varchar, $4::varchar,
                    $5::numeric, $5::numeric, $6::text[], $7::numeric, $7::numeric,
-                   $8::varchar, $9::text, $10::text[]
+                   $8::varchar, $9::text, $10::text[], $11::numeric, $12::numeric, $13::text
             FROM (SELECT 1) AS one
             LEFT JOIN exit_zone_config cfg ON cfg.stream_id = $1::uuid
             ON CONFLICT (stream_id) WHERE ended_at IS NULL DO NOTHING
@@ -290,6 +316,7 @@ class BlockedExitService:
             (
                 stream_id, workspace_id, camera_name, state, accessibility_pct,
                 blocking_objects, risk_score, risk_level, recommended_action, evidence_paths,
+                confidence, avg_confidence, snapshot_path,
             ),
             fetch_one=True,
         )
@@ -305,9 +332,11 @@ class BlockedExitService:
         risk_score: Optional[float],
         risk_level: Optional[str],
         recommended_action: Optional[str],
+        confidence: Optional[float] = None,
+        avg_confidence: Optional[float] = None,
     ) -> None:
         """Refresh an open episode with the latest reading, keeping the worst values seen.
-        The risk level only ever rises during an episode."""
+        The risk level only ever rises during an episode; confidence keeps its peak."""
         await self.db.execute_query(
             """
             UPDATE blocked_exit_events
@@ -326,23 +355,50 @@ class BlockedExitService:
                 recommended_action    = CASE
                     WHEN array_position(ARRAY['low','medium','high','critical']::varchar[], $6::varchar)
                        > COALESCE(array_position(ARRAY['low','medium','high','critical']::varchar[], risk_level), 0)
-                    THEN $7::text ELSE recommended_action END
+                    THEN $7::text ELSE recommended_action END,
+                confidence            = GREATEST(confidence, $8::numeric),
+                avg_confidence        = COALESCE($9::numeric, avg_confidence)
             WHERE event_id = $1 AND ended_at IS NULL
             """,
-            (event_id, state, accessibility_pct, blocking_objects, risk_score, risk_level, recommended_action),
+            (event_id, state, accessibility_pct, blocking_objects, risk_score, risk_level, recommended_action,
+             confidence, avg_confidence),
         )
 
-    async def close_open_episodes(self, stream_id: UUID) -> int:
-        """Close the stream's open episode (exit confirmed clear, or stream stopped)."""
+    async def close_open_episodes(
+        self, stream_id: UUID, *, confidence: Optional[float] = None, avg_confidence: Optional[float] = None,
+    ) -> int:
+        """Close the stream's open episode (exit confirmed clear, or stream stopped),
+        folding in the engine's final confidence reading when there is one."""
         return await self.db.execute_query(
             """
             UPDATE blocked_exit_events
-            SET ended_at   = NOW(),
-                duration_s = GREATEST(EXTRACT(EPOCH FROM (NOW() - event_timestamp)), 0),
-                state      = 'clear'
+            SET ended_at       = NOW(),
+                duration_s     = GREATEST(EXTRACT(EPOCH FROM (NOW() - event_timestamp)), 0),
+                state          = 'clear',
+                confidence     = GREATEST(confidence, $2::numeric),
+                avg_confidence = COALESCE($3::numeric, avg_confidence)
             WHERE stream_id = $1 AND ended_at IS NULL
             """,
-            (stream_id,),
+            (stream_id, confidence, avg_confidence),
+            return_rowcount=True,
+        )
+
+    async def set_evidence(
+        self, event_id: int, *, snapshot_path: Optional[str] = None, clip_path: Optional[str] = None,
+        video_path: Optional[str] = None,
+    ) -> None:
+        """Record an uploaded evidence file: the snapshot, the annotated clip or the
+        full-rate episode video. The first of each wins; evidence_paths (shown as
+        snapshots) is left alone."""
+        await self.db.execute_query(
+            """
+            UPDATE blocked_exit_events
+            SET snapshot_path = COALESCE(snapshot_path, $2),
+                clip_path     = COALESCE(clip_path, $3),
+                video_path    = COALESCE(video_path, $4)
+            WHERE event_id = $1
+            """,
+            (event_id, snapshot_path, clip_path, video_path),
             return_rowcount=True,
         )
 
@@ -358,6 +414,27 @@ class BlockedExitService:
         """Backwards-compatible wrapper: opens (or continues) an episode."""
         event_id, created = await self.open_episode(**kwargs)
         return event_id if created else None
+
+    # =========================================================
+    # Charts (visualisations tab)
+    # =========================================================
+
+    _CHART_FROM = "blocked_exit_events be LEFT JOIN video_stream vs ON be.stream_id = vs.stream_id"
+
+    async def incidents_per_camera(self, workspace_id: UUID, **filters) -> List[Dict[str, Any]]:
+        """Each blockage episode is one incident."""
+        conditions, params, _ = self._build_event_conditions(workspace_id, **filters)
+        return await evidence_analytics.incidents_per_camera(
+            self.db, from_sql=self._CHART_FROM, where=" AND ".join(conditions), params=params,
+            alias="be", incident_expr="COUNT(*)",
+        )
+
+    async def confidence_audit(self, workspace_id: UUID, **filters) -> Dict[str, Any]:
+        conditions, params, _ = self._build_event_conditions(workspace_id, **filters)
+        return await evidence_analytics.confidence_audit(
+            self.db, from_sql=self._CHART_FROM, where=" AND ".join(conditions), params=params,
+            alias="be", threshold=float(getattr(config, "blocked_exit_confidence", 0.4)),
+        )
 
     # =========================================================
     # Cameras & live status

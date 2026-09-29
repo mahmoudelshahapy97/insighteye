@@ -30,6 +30,7 @@ class NoEntryEventBase(BaseModel):
     clip_path: Optional[str] = None
     evidence_paths: Optional[List[str]] = None
     camera_location: Optional[str] = None
+    camera_area: Optional[str] = None
     building: Optional[str] = None
     floor_level: Optional[str] = None
     camera_zone: Optional[str] = None

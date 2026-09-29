@@ -7,17 +7,24 @@ Monitors emergency exits for obstructions and reports exit accessibility.
 /status                          - live state of every blocked-exit camera
 /events                          - list / filter events (episodes)
 /events/{event_id}               - one event with evidence snapshot URLs
+/events/{event_id}/evidence      - short-lived URLs for the snapshot, clip and episode video
+/events/{event_id}/video/download - redirect to a fresh URL of the episode video (like shoplifting)
+/videos                          - evidence clips with presigned URLs (hierarchy/date/time filters)
 /events/{event_id}/resolve       - acknowledge / resolve an event
 /events/{event_id}/acknowledge   - shorthand for resolve(status=acknowledged)
 /dashboard/active                - live unresolved events
 /dashboard/summary               - daily rollup
-/analytics/*                     - summary, most-blocked, daily-report, hourly, timeline
+/analytics/*                     - summary, most-blocked, daily-report, hourly, timeline,
+                                   incidents-per-camera, confidence-audit
 /configs                         - every door-polygon config in the workspace
 /cameras/{stream_id}/door-polygon - set/update door polygon calibration
 /cameras/{stream_id}/config      - read / patch settings / delete a config
+/cameras/{stream_id}/polygon     - get / replace the door polygon (shared polygon-editor shape)
 /test-alert/{stream_id}          - send a test notification
 /workspace/delete_data           - filtered delete
 /workspace/delete_all_data       - delete all (confirm required)
+
+The door polygon can only be set or changed on cameras with Blocked Exit enabled.
 """
 
 import asyncio
@@ -28,6 +35,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Response
+from fastapi.responses import RedirectResponse
 from typing import Dict, Any, List, Optional
 
 from app.services.session_service import session_manager
@@ -40,6 +48,18 @@ from app.services.notification_service import notification_service
 from app.services import camera_runtime
 from app.services.nez import rtsp_probe
 from app.utils.permission_utils import check_workspace_access
+from app.schemas.evidence_schema import (
+    CameraIncidentCount,
+    CameraPolygonRequest,
+    CameraPolygonResponse,
+    ConfidenceAuditResponse,
+    EvidenceVideoListResponse,
+)
+from app.schemas.no_entry_zone_schema import EvidenceUrls
+
+
+class BlockedExitEvidenceUrls(EvidenceUrls):
+    video_url: Optional[str] = None  # full-rate episode video (saved like shoplifting's)
 from app.schemas.blocked_exit_schema import (
     BlockedExitEventResponse,
     BlockedExitEventDetail,
@@ -65,6 +85,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/blocked-exit", tags=["Blocked Exit"],
                    dependencies=[Depends(require_feature("blocked_exit"))])
 
+EVIDENCE_URL_TTL = 900
+
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -87,6 +109,28 @@ async def _require_camera(stream_id: UUID, workspace_id: UUID) -> Dict[str, Any]
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found in this workspace.")
     return camera
+
+
+async def _require_enabled_camera(stream_id: UUID, workspace_id: UUID) -> Dict[str, Any]:
+    """404 outside the workspace; 409 when Blocked Exit is not enabled on the camera."""
+    camera = await _require_camera(stream_id, workspace_id)
+    if not camera.get("is_blocked_exit_camera"):
+        raise HTTPException(status_code=409, detail="Blocked Exit is not enabled on this camera.")
+    return camera
+
+
+async def _require_role(current_user: Dict, workspace_id: UUID, role: str) -> None:
+    await check_workspace_access(
+        db_manager, current_user["user_id"], workspace_id,
+        required_role=role, system_role=current_user.get("role"),
+    )
+
+
+async def _sign(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    from app.services.s3_service import s3_service
+    return await s3_service.get_presigned_url(path, expiration=EVIDENCE_URL_TTL)
 
 
 def _hot_reload(stream_id: UUID, cfg: Optional[Dict[str, Any]]) -> None:
@@ -116,15 +160,16 @@ def _filters(
     end_date: Optional[str] = Query(None, description="ISO-8601 end datetime"),
     start_time: Optional[str] = Query(None, description="Time-of-day lower bound (HH:MM)"),
     end_time: Optional[str] = Query(None, description="Time-of-day upper bound (HH:MM)"),
-    location: Optional[str] = Query(None, description="Filter by camera location"),
-    building: Optional[str] = Query(None, description="Filter by building"),
-    floor_level: Optional[str] = Query(None, description="Filter by floor level"),
-    zone: Optional[str] = Query(None, description="Filter by zone"),
+    location: Optional[str] = Query(None, description="Camera location (comma-separated for several)"),
+    area: Optional[str] = Query(None, description="Camera area (comma-separated for several)"),
+    building: Optional[str] = Query(None, description="Building (comma-separated for several)"),
+    floor_level: Optional[str] = Query(None, description="Floor level (comma-separated for several)"),
+    zone: Optional[str] = Query(None, description="Zone (comma-separated for several)"),
 ):
     return dict(
         start_date=start_date, end_date=end_date,
         start_time=start_time, end_time=end_time,
-        location=location, building=building,
+        location=location, area=area, building=building,
         floor_level=floor_level, zone=zone,
     )
 
@@ -190,6 +235,86 @@ async def get_blocked_exit_event(
             if url and url.startswith("http"):
                 urls.append(url)
     return {**event, "snapshot_urls": urls}
+
+
+@router.get("/events/{event_id}/evidence", response_model=BlockedExitEvidenceUrls)
+async def get_blocked_exit_event_evidence(
+    event_id: int,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Presigned URLs, so <img>/<video> can load the evidence without a bearer header."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    event = await blocked_exit_service.get_event(workspace_id, event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+    snapshot = event.get("snapshot_path") or next(iter(event.get("evidence_paths") or []), None)
+    return BlockedExitEvidenceUrls(
+        snapshot_url=await _sign(snapshot),
+        clip_url=await _sign(event.get("clip_path")),
+        video_url=await _sign(event.get("video_path")),
+        expires_in=EVIDENCE_URL_TTL,
+    )
+
+
+@router.get("/events/{event_id}/video/download")
+async def download_blocked_exit_video(
+    event_id: int,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Stable download link, like shoplifting's: redirects to a fresh presigned URL of
+    the episode video (the annotated clip if the video is not saved)."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    event = await blocked_exit_service.get_event(workspace_id, event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+    path = event.get("video_path") or event.get("clip_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="No video available for this event.")
+    from app.services.s3_service import s3_service
+    url = await s3_service.get_presigned_url(path, expiration=3600)
+    if not url:
+        raise HTTPException(status_code=502, detail="Could not create a download link.")
+    return RedirectResponse(url=url, status_code=302)
+
+
+@router.get("/videos", response_model=EvidenceVideoListResponse)
+async def list_evidence_videos(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    status_filter: Optional[str] = Query(
+        None, pattern="^(detected|acknowledged|resolved)$", description="detected | acknowledged | resolved",
+    ),
+    f: dict = Depends(_filters),
+    page: int = Query(1, ge=1),
+    limit: int = Query(12, ge=1, le=100),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Episodes that have a recorded clip, newest first, with presigned clip/snapshot URLs."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    offset = (page - 1) * limit
+    kw = dict(status=status_filter, camera_id=str(camera_id) if camera_id else None, has_clip=True, **f)
+    try:
+        events = await blocked_exit_service.get_events(workspace_id=workspace_id, limit=limit, offset=offset, **kw)
+        total = await blocked_exit_service.count_events(workspace_id=workspace_id, **kw)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"blocked-exit list_evidence_videos error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving evidence videos.")
+    items = []
+    for ev in events:
+        snapshot = ev.get("snapshot_path") or next(iter(ev.get("evidence_paths") or []), None)
+        items.append({
+            **ev,
+            "camera_zone": ev.get("zone"),
+            "peak_state": ev.get("peak_state") or ev.get("state"),
+            "clip_url": await _sign(ev.get("clip_path")),
+            "video_url": await _sign(ev.get("video_path")),
+            "snapshot_url": await _sign(snapshot),
+            "download_url": f"blocked-exit/events/{ev['event_id']}/video/download",
+        })
+    return EvidenceVideoListResponse(
+        items=items, total=total, limit=limit, offset=offset, page=page, expires_in=EVIDENCE_URL_TTL,
+    )
 
 
 async def _set_event_status(event_id: int, status: str, description: Optional[str], current_user: Dict):
@@ -261,7 +386,7 @@ async def set_door_polygon(
 ):
     try:
         workspace_id = await get_workspace_id_for_user(current_user["username"])
-        await _require_camera(stream_id, workspace_id)
+        await _require_enabled_camera(stream_id, workspace_id)
         row = await blocked_exit_service.set_door_polygon(
             stream_id=stream_id,
             workspace_id=workspace_id,
@@ -302,7 +427,7 @@ async def update_zone_config(
 ):
     """Change detector settings (threshold, debounce, strategy, active) without redrawing."""
     workspace_id = await get_workspace_id_for_user(current_user["username"])
-    await _require_camera(stream_id, workspace_id)
+    await _require_enabled_camera(stream_id, workspace_id)
     row = await blocked_exit_service.update_config(
         stream_id=stream_id, workspace_id=workspace_id, fields=request.model_dump(exclude_unset=True),
     )
@@ -327,6 +452,57 @@ async def delete_zone_config(
     _hot_reload(stream_id, None)
     await blocked_exit_service.close_open_episodes(stream_id)
     return {"message": "Door polygon removed"}
+
+
+def _polygon_response(stream_id: UUID, camera_name: Optional[str], cfg: Optional[Dict[str, Any]]) -> Dict:
+    if not cfg or not cfg.get("door_polygon"):
+        return {"stream_id": stream_id, "camera_name": camera_name,
+                "id": (cfg or {}).get("config_id"), "is_active": (cfg or {}).get("is_active")}
+    return {
+        "stream_id": stream_id, "camera_name": camera_name, "id": cfg["config_id"],
+        "polygon": cfg["door_polygon"],
+        "ref_width": cfg.get("calibration_frame_w"), "ref_height": cfg.get("calibration_frame_h"),
+        "point_count": len(cfg["door_polygon"]), "is_active": cfg.get("is_active"),
+        "updated_at": cfg.get("updated_at"),
+    }
+
+
+@router.get("/cameras/{stream_id}/polygon", response_model=CameraPolygonResponse)
+async def get_camera_polygon(
+    stream_id: UUID,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """The camera's door polygon in the shared editor shape; ``polygon`` is null until drawn."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    camera = await _require_camera(stream_id, workspace_id)
+    cfg = await blocked_exit_service.get_zone_config(stream_id, workspace_id)
+    return _polygon_response(stream_id, camera.get("name"), cfg)
+
+
+@router.put("/cameras/{stream_id}/polygon", response_model=CameraPolygonResponse)
+async def set_camera_polygon(
+    stream_id: UUID,
+    request: CameraPolygonRequest,
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Replace the door polygon (detector settings are kept). Workspace admins only, and
+    only on cameras with Blocked Exit enabled."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    await _require_role(current_user, workspace_id, "admin")
+    camera = await _require_enabled_camera(stream_id, workspace_id)
+    try:
+        row = await blocked_exit_service.set_door_polygon(
+            stream_id=stream_id, workspace_id=workspace_id, door_polygon=request.polygon,
+            calibration_frame_w=request.ref_width, calibration_frame_h=request.ref_height,
+            is_active=request.is_active,
+        )
+    except Exception as e:
+        logger.error(f"blocked-exit set_camera_polygon error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error saving the polygon.")
+    if not row:
+        raise HTTPException(status_code=404, detail="Camera not found in this workspace.")
+    _hot_reload(stream_id, row)
+    return _polygon_response(stream_id, camera.get("name"), row)
 
 
 @router.get("/configs", response_model=List[ExitZoneConfigResponse])
@@ -574,6 +750,45 @@ async def analytics_hourly(
 ):
     workspace_id = await get_workspace_id_for_user(current_user["username"])
     return await blocked_exit_service.hourly_heatmap(workspace_id, days)
+
+
+@router.get("/analytics/incidents-per-camera", response_model=List[CameraIncidentCount])
+async def analytics_incidents_per_camera(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Chart 1: blockage episodes (incidents) per camera."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    try:
+        return await blocked_exit_service.incidents_per_camera(
+            workspace_id, camera_id=str(camera_id) if camera_id else None, **f,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"blocked-exit incidents_per_camera error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving incidents per camera.")
+
+
+@router.get("/analytics/confidence-audit", response_model=ConfidenceAuditResponse)
+async def analytics_confidence_audit(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Chart 2: model accuracy & confidence audit of the blocking-object detections
+    (peak confidence per episode)."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    try:
+        return await blocked_exit_service.confidence_audit(
+            workspace_id, camera_id=str(camera_id) if camera_id else None, **f,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"blocked-exit confidence_audit error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the confidence audit.")
 
 
 @router.get("/analytics/timeline/{stream_id}", response_model=List[BlockedExitTimelineEntry])

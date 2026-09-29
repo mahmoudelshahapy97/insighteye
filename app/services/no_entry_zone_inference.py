@@ -18,15 +18,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from app.config.settings import config
+from app.services.evidence_clip import ClipRecorder, resize_max_width as _resize_max_width
 from app.services.model_loader import ModelFactory, ModelBackend
 from app.services.nez.geometry import to_numpy_polygon, scale_polygon
 from app.services.nez.zone_logic import (
@@ -46,19 +46,11 @@ _GREEN = (80, 200, 80)
 
 
 @dataclass
-class _ClipJob:
-    event_uuid: str
-    frames: List[Tuple[float, np.ndarray]]
-    until_ts: float
-
-
-@dataclass
 class _StreamState:
     tracker: Any
     evaluators: Dict[str, ZoneEvaluator] = field(default_factory=dict)
     pending_zones: Optional[List[Dict[str, Any]]] = None
-    preroll: Deque[Tuple[float, np.ndarray]] = field(default_factory=deque)
-    clip_jobs: List[_ClipJob] = field(default_factory=list)
+    clips: ClipRecorder = field(default_factory=ClipRecorder)
 
 
 def _trigger_dict(t: ViolationTrigger) -> Dict[str, Any]:
@@ -76,14 +68,6 @@ def _trigger_dict(t: ViolationTrigger) -> Dict[str, Any]:
         "exited_at": t.exited_at,
         "dwell_seconds": t.duration_seconds,
     }
-
-
-def _resize_max_width(frame: np.ndarray, max_width: int) -> np.ndarray:
-    h, w = frame.shape[:2]
-    if w <= max_width:
-        return frame
-    scale = max_width / float(w)
-    return cv2.resize(frame, (max_width, int(round(h * scale))))
 
 
 class NoEntryZoneEngine:
@@ -145,7 +129,7 @@ class NoEntryZoneEngine:
         state = self._streams.get(stream_id)
         return bool(state and (
             state.pending_zones is not None
-            or state.clip_jobs
+            or state.clips.busy
             or any(ev.tracked_count for ev in state.evaluators.values())
         ))
 
@@ -226,18 +210,13 @@ class NoEntryZoneEngine:
             triggers.extend(result.triggers)
 
         # ---- evidence -------------------------------------------------------
-        needs_frames = bool(armed) or bool(state.clip_jobs)
+        needs_frames = bool(armed) or state.clips.busy
         small = None
         if needs_frames:
             small = self._annotate(
                 _resize_max_width(frame, CLIP_MAX_WIDTH), frame_size, state, detections, None
             )
-            pre = float(getattr(config, "no_entry_zone_clip_pre_seconds", 3.0))
-            state.preroll.append((ts, small))
-            while state.preroll and ts - state.preroll[0][0] > pre:
-                state.preroll.popleft()
-            for job in state.clip_jobs:
-                job.frames.append((ts, small))
+            state.clips.push(ts, small, float(getattr(config, "no_entry_zone_clip_pre_seconds", 3.0)))
 
         post = float(getattr(config, "no_entry_zone_clip_post_seconds", 4.0))
         for t in triggers:
@@ -253,9 +232,7 @@ class NoEntryZoneEngine:
             except Exception as e:
                 logger.warning(f"[no-entry-zone] snapshot failed: {e}")
             if small is not None:
-                state.clip_jobs.append(
-                    _ClipJob(event_uuid=str(t.event_id), frames=list(state.preroll), until_ts=ts + post)
-                )
+                state.clips.start(str(t.event_id), ts, post)
 
         out["clips"] = self._pop_finished_clips(state, ts, force=False)
         return out
@@ -279,22 +256,10 @@ class NoEntryZoneEngine:
     # ------------------------------------------------------------------ helpers
     @staticmethod
     def _pop_finished_clips(state: _StreamState, ts: float, force: bool) -> List[Dict[str, Any]]:
-        done, keep = [], []
-        for job in state.clip_jobs:
-            (done if force or ts >= job.until_ts else keep).append(job)
-        state.clip_jobs = keep
-        clips = []
-        for job in done:
-            if len(job.frames) < 2:
-                continue
-            span = job.frames[-1][0] - job.frames[0][0]
-            fps = (len(job.frames) - 1) / span if span > 0 else 5.0
-            clips.append({
-                "event_uuid": job.event_uuid,
-                "frames": [f for _, f in job.frames],
-                "fps": max(1.0, min(30.0, fps)),
-            })
-        return clips
+        return [
+            {"event_uuid": c["key"], "frames": c["frames"], "fps": c["fps"]}
+            for c in state.clips.pop_finished(ts, force=force)
+        ]
 
     def _annotate(
         self,

@@ -1080,15 +1080,100 @@ class StreamProcessingService:
         escalate -> update it and notify again (partially blocked became blocked)
         update   -> refresh accessibility / risk on the open episode
         close    -> set ended_at + duration
+
+        Evidence clips the engine finished on this frame are uploaded afterwards (they
+        can complete on frames without a transition, even after the episode closed).
         """
         transition = result.get("transition")
-        if not transition:
+        try:
+            if transition:
+                await self._apply_blocked_exit_transition(
+                    stream_id, stream_id_str, result, camera_name, workspace_id, owner_id,
+                )
+        finally:
+            if result.get("clips"):
+                await self._handle_blocked_exit_clips(stream_id, stream_id_str, workspace_id, result["clips"])
+
+    async def _handle_blocked_exit_clips(
+        self, stream_id: UUID, stream_id_str: str, workspace_id: UUID, clips: List[Dict[str, Any]],
+    ):
+        """Upload finished evidence clips and attach each to the episode it was recorded for."""
+        from app.services.blocked_exit_service import blocked_exit_service
+        episodes = self._be_episode_map()
+        for clip in clips:
+            rec = episodes.pop(clip["key"], None)
+            event_id = rec["event_id"] if rec else None
+            if event_id is None:
+                # The episode id was not captured (e.g. the insert raced); the clip still
+                # belongs to the camera's open episode if there is one.
+                try:
+                    event_id = await blocked_exit_service.get_open_episode_id(stream_id)
+                except Exception as e:
+                    logger.warning(f"[blocked-exit] episode lookup for clip failed on {stream_id_str}: {e}")
+            if event_id is None:
+                logger.info(f"[blocked-exit] dropping clip with no episode on {stream_id_str}")
+                continue
+            self._nez_spawn(self._upload_clip(
+                clip["frames"], clip["fps"],
+                key=f"blocked-exit/{workspace_id}/{stream_id_str}/clips/{event_id}-{uuid.uuid4().hex[:8]}.mp4",
+                on_uploaded=lambda path, eid=event_id: blocked_exit_service.set_evidence(eid, clip_path=path),
+                tag="blocked-exit",
+            ))
+
+    async def _save_blocked_exit_video(
+        self, event_id: int, workspace_id: UUID, stream_id_str: str,
+        frames: List[np.ndarray], timestamps: List[float],
+    ):
+        """Save the episode's video the way shoplifting does: the buffered full-rate
+        footage leading up to the blockage, encoded to mp4, uploaded to S3 and stored as
+        the event's video_path. The fps comes from the buffer's timestamps."""
+        from app.services.blocked_exit_service import blocked_exit_service
+        if len(frames) < 2:
             return
+        span = timestamps[-1] - timestamps[0] if len(timestamps) == len(frames) else 0
+        fps = max(1.0, min(30.0, (len(frames) - 1) / span)) if span > 0 else 10.0
+        await self._upload_clip(
+            frames, fps,
+            key=f"blocked-exit/{workspace_id}/{stream_id_str}/videos/{event_id}-{uuid.uuid4().hex[:8]}.mp4",
+            on_uploaded=lambda path: blocked_exit_service.set_evidence(event_id, video_path=path),
+            tag="blocked-exit",
+        )
+        logger.info(f"[blocked-exit] episode video done for event {event_id} ({len(frames)} frames @ {fps:.1f} fps)")
+
+    def _be_episode_map(self) -> Dict[str, Dict[str, Any]]:
+        """engine episode_uuid -> {"event_id", "stream"}, so clips find their DB row."""
+        if not hasattr(self, "_be_episodes"):
+            self._be_episodes = {}
+        return self._be_episodes
+
+    async def _release_blocked_exit_stream(self, stream_id: UUID, stream_id_str: str, workspace_id: UUID):
+        """Flush the engine's partial clips for a stream and close its open episode."""
+        from app.services.blocked_exit_service import blocked_exit_service
+        released = self.blocked_exit_engine.release_stream(stream_id_str)
+        await blocked_exit_service.close_open_episodes(stream_id)
+        if released.get("clips"):
+            await self._handle_blocked_exit_clips(stream_id, stream_id_str, workspace_id, released["clips"])
+        episodes = self._be_episode_map()
+        for key in [k for k, v in episodes.items() if v["stream"] == stream_id_str]:
+            episodes.pop(key, None)
+
+    async def _apply_blocked_exit_transition(
+        self,
+        stream_id: UUID,
+        stream_id_str: str,
+        result: Dict[str, Any],
+        camera_name: str,
+        workspace_id: UUID,
+        owner_id: UUID,
+    ):
+        transition = result["transition"]
         try:
             from app.services.blocked_exit_service import blocked_exit_service
 
             if transition == "close":
-                await blocked_exit_service.close_open_episodes(stream_id)
+                await blocked_exit_service.close_open_episodes(
+                    stream_id, confidence=result.get("confidence"), avg_confidence=result.get("avg_confidence"),
+                )
                 logger.info(f"🚪 Blocked-exit episode closed for {stream_id_str}")
                 return
 
@@ -1099,10 +1184,13 @@ class StreamProcessingService:
                 risk_score=result.get("risk_score"),
                 risk_level=result.get("risk_level"),
                 recommended_action=result.get("recommended_action"),
+                confidence=result.get("confidence"),
+                avg_confidence=result.get("avg_confidence"),
             )
 
             if transition == "open":
                 evidence_paths = None
+                snapshot_path = None
                 jpeg = result.get("evidence_jpeg")
                 if jpeg:
                     try:
@@ -1112,12 +1200,20 @@ class StreamProcessingService:
                             f"blocked-exit/{workspace_id}/{stream_id_str}/{uuid.uuid4()}.jpg",
                         )
                         evidence_paths = [path] if path else None
+                        snapshot_path = path or None
                     except Exception as e:
                         logger.warning(f"[blocked-exit] evidence upload failed for {stream_id_str}: {e}")
-                _, created = await blocked_exit_service.open_episode(
+                event_id, created = await blocked_exit_service.open_episode(
                     stream_id=stream_id, workspace_id=workspace_id, camera_name=camera_name,
-                    evidence_paths=evidence_paths, **reading,
+                    evidence_paths=evidence_paths, snapshot_path=snapshot_path, **reading,
                 )
+                if event_id is not None and result.get("episode_uuid"):
+                    self._be_episode_map()[result["episode_uuid"]] = {"event_id": event_id, "stream": stream_id_str}
+                if created and result.get("recent_frames"):
+                    self._nez_spawn(self._save_blocked_exit_video(
+                        event_id, workspace_id, stream_id_str,
+                        result["recent_frames"], result.get("recent_frames_ts") or [],
+                    ))
                 if not created:
                     return  # continued an episode that was already open; already notified
             else:
@@ -1207,45 +1303,27 @@ class StreamProcessingService:
             logger.error(f"[no-entry-zone] snapshot upload failed for event {event_id}: {e}", exc_info=True)
 
     async def _nez_upload_clip(self, event_id: int, frames: List[np.ndarray], fps: float):
-        from app.services.s3_service import s3_service
         from app.services.no_entry_zone_service import no_entry_zone_service
-        temp_path = os.path.join(tempfile.gettempdir(), f"nez-{uuid.uuid4().hex}.mp4")
+        await self._upload_clip(
+            frames, fps,
+            key=f"no-entry-zone/clips/{event_id}-{uuid.uuid4().hex[:8]}.mp4",
+            on_uploaded=lambda path: no_entry_zone_service.set_evidence(event_id, clip_path=path),
+            tag="no-entry-zone",
+        )
 
-        def encode() -> bool:
-            h, w = frames[0].shape[:2]
-            w -= w % 2
-            h -= h % 2  # libx264 + yuv420p needs even dimensions
-            cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{w}x{h}",
-                "-pix_fmt", "bgr24", "-r", f"{fps:.3f}", "-i", "pipe:0",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart", temp_path,
-            ]
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            try:
-                for f in frames:
-                    if f.shape[:2] != (h, w):
-                        f = cv2.resize(f, (w, h))
-                    proc.stdin.write(np.ascontiguousarray(f).tobytes())
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
-            proc.wait()
-            if proc.returncode != 0:
-                logger.error(f"[no-entry-zone] ffmpeg failed: {proc.stderr.read().decode(errors='ignore')[:500]}")
-                return False
-            return True
-
+    async def _upload_clip(self, frames: List[np.ndarray], fps: float, *, key: str, on_uploaded, tag: str):
+        """Encode an evidence clip, upload it to S3 and hand the path to ``on_uploaded``."""
+        from app.services.evidence_clip import encode_mp4
+        from app.services.s3_service import s3_service
+        temp_path = os.path.join(tempfile.gettempdir(), f"clip-{uuid.uuid4().hex}.mp4")
         try:
-            if not frames or not await asyncio.to_thread(encode):
+            if not frames or not await asyncio.to_thread(encode_mp4, frames, fps, temp_path):
                 return
-            key = f"no-entry-zone/clips/{event_id}-{uuid.uuid4().hex[:8]}.mp4"
             path = await s3_service.upload_video_file_to_s3(temp_path, key)
             if path:
-                await no_entry_zone_service.set_evidence(event_id, clip_path=path)
+                await on_uploaded(path)
         except Exception as e:
-            logger.error(f"[no-entry-zone] clip upload failed for event {event_id}: {e}", exc_info=True)
+            logger.error(f"[{tag}] clip upload failed ({key}): {e}", exc_info=True)
         finally:
             try:
                 if os.path.exists(temp_path):
@@ -1404,6 +1482,7 @@ class StreamProcessingService:
 
         from collections import deque
         video_buffer = deque(maxlen=300)   # ~10 s at 30 fps
+        video_buffer_ts = deque(maxlen=300)  # monotonic time of each buffered frame (true fps for saved videos)
         last_shoplifting_save_time = None  # time-based dedup — save at most once per 5 min
         shoplifting_engine_load_attempted = False  # throttle: only retry once per stream session
         blocked_exit_engine_load_attempted = False
@@ -1573,7 +1652,7 @@ class StreamProcessingService:
                                 try:
                                     from app.services.blocked_exit_service import blocked_exit_service
                                     # Either way the engine's open episode can't continue.
-                                    await blocked_exit_service.close_open_episodes(stream_id)
+                                    await self._release_blocked_exit_stream(stream_id, stream_id_str, workspace_id)
                                     if be_now:
                                         self.blocked_exit_engine.set_zone_config(
                                             stream_id_str, await blocked_exit_service.get_zone_config(stream_id),
@@ -1588,6 +1667,7 @@ class StreamProcessingService:
                     # Buffer resized frame to save memory
                     small_frame = cv2.resize(frame, (640, 480))
                     video_buffer.append(small_frame)
+                    video_buffer_ts.append(time.monotonic())
 
                     current_time = datetime.now(ZoneInfo("Africa/Cairo"))
 
@@ -1668,7 +1748,12 @@ class StreamProcessingService:
                             be_result = await loop.run_in_executor(
                                 thread_pool, engine.process_frame, stream_id_str, frame,
                             )
-                            if be_result and be_result.get("transition"):
+                            if be_result and (be_result.get("transition") or be_result.get("clips")):
+                                if be_result.get("transition") == "open":
+                                    # Like shoplifting: the episode's video is the full-rate
+                                    # footage buffered up to the moment it opened.
+                                    be_result["recent_frames"] = list(video_buffer)
+                                    be_result["recent_frames_ts"] = list(video_buffer_ts)
                                 await self._handle_blocked_exit_alert(
                                     stream_id, stream_id_str, be_result, camera_name, workspace_id, owner_id,
                                 )
@@ -2057,9 +2142,7 @@ class StreamProcessingService:
             try:
                 if self.blocked_exit_engine.has_config(stream_id_str) or \
                         stream_id_str in self.blocked_exit_engine._states:
-                    from app.services.blocked_exit_service import blocked_exit_service
-                    self.blocked_exit_engine.clear_stream(stream_id_str)
-                    await blocked_exit_service.close_open_episodes(stream_id)
+                    await self._release_blocked_exit_stream(stream_id, stream_id_str, workspace_id)
             except Exception as cleanup_err:
                 logger.error(f"Error closing blocked-exit episode: {cleanup_err}")
 

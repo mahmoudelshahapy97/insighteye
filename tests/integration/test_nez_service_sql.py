@@ -161,6 +161,30 @@ async def test_full_lifecycle(svc):
     )
     assert a["total_events"] == 0 and len(a["series"]) >= 24
 
+    # single-polygon editor, camera flag, 3-tab charts and videos
+    assert (await service.primary_zone(stream, ws))["zone_id"] == zone["zone_id"]
+    assert await service.primary_zone(stream, uuid.uuid4()) is None
+    assert await service.camera_flag(stream, ws) is True
+    assert await service.camera_flag(stream, uuid.uuid4()) is None
+    assert await service.count_events(ws, has_clip=True) == 1
+    assert (await service.get_events(ws, has_clip=True))[0]["event_id"] == ids[1]
+    assert await service.count_events(ws, location="nowhere, elsewhere") == 0
+    assert await service.count_events(ws, area="x", building="y", floor_level="z", zone="w") == 0
+    per_cam = await service.incidents_per_camera(ws)
+    assert len(per_cam) == 1 and per_cam[0]["camera_name"] == "cam-1"
+    assert per_cam[0]["events"] == 4 and per_cam[0]["incidents"] == 2 and per_cam[0]["resolved"] == 1
+    assert await service.incidents_per_camera(ws, target_class="nothing") == []
+    audit = await service.confidence_audit(ws)
+    s = audit["summary"]
+    assert s["events"] == s["scored_events"] == 4
+    assert s["min_confidence"] == pytest.approx(0.5) and s["max_confidence"] == pytest.approx(0.82)
+    low = sum(c < s["low_confidence_cutoff"] for c in (0.8, 0.81, 0.82, 0.5))
+    assert s["low_confidence"] == low and s["low_confidence_share"] == low / 4
+    assert len(audit["histogram"]) == 10 and sum(b["count"] for b in audit["histogram"]) == 4
+    assert audit["per_camera"][0]["events"] == 4 and len(audit["per_event"]) == 4
+    empty = await service.confidence_audit(ws, camera_id=str(uuid.uuid4()))
+    assert empty["summary"]["events"] == 0 and empty["summary"]["low_confidence_share"] is None
+
     assert (await service.delete_events(ws, camera_id=str(stream), start_date="2000-01-01"))["deleted"] == 4
     assert await service.delete_zone(zone["zone_id"], ws) == stream
     assert await service.delete_zone(zone["zone_id"], ws) is None

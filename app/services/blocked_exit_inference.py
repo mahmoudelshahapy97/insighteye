@@ -9,12 +9,14 @@ loaders used in production only return bounding boxes.
 
 import logging
 import time
+import uuid
 from typing import Dict, Any, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from app.config.settings import config
+from app.services.evidence_clip import ClipRecorder, resize_max_width
 from app.services.model_loader import ModelFactory, ModelBackend
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,7 @@ CLASS_WEIGHTS: Dict[str, float] = {
 }
 DEFAULT_CLASS_WEIGHT = 0.6
 PERSON_CLASS_ID = 0
+CLIP_MAX_WIDTH = 960
 
 _RISK_ACTIONS = {
     "low": "No action required",
@@ -75,11 +78,16 @@ class _StreamState:
     An episode opens once an obstruction has persisted for debounce_seconds and
     closes once the exit has stayed clear for clear_hold_seconds, so a person
     walking past never opens one and a momentary gap never closes one.
+
+    Detection confidence of the blocking objects is accumulated from the first
+    obstructed frame (debounce included) until the episode closes: per frame the
+    most confident blocking detection is sampled, giving a peak and a mean.
     """
 
     __slots__ = (
         "blocked_since", "clear_since", "episode_open", "episode_state",
-        "episode_started", "last_update_at",
+        "episode_started", "last_update_at", "episode_uuid",
+        "conf_peak", "conf_sum", "conf_n", "clips",
     )
 
     def __init__(self) -> None:
@@ -89,10 +97,31 @@ class _StreamState:
         self.episode_state: Optional[str] = None
         self.episode_started: Optional[float] = None
         self.last_update_at: float = 0.0
+        self.episode_uuid: Optional[str] = None
+        self.clips = ClipRecorder()
+        self.reset_confidence()
 
     def reset_timers(self) -> None:
         self.blocked_since = None
         self.clear_since = None
+
+    def reset_confidence(self) -> None:
+        self.conf_peak = 0.0
+        self.conf_sum = 0.0
+        self.conf_n = 0
+
+    def sample_confidence(self, confidences: Optional[List[float]]) -> None:
+        if not confidences:
+            return
+        top = float(max(confidences))
+        self.conf_peak = max(self.conf_peak, top)
+        self.conf_sum += top
+        self.conf_n += 1
+
+    def confidence(self) -> Tuple[Optional[float], Optional[float]]:
+        if not self.conf_n:
+            return None, None
+        return round(self.conf_peak, 4), round(self.conf_sum / self.conf_n, 4)
 
 
 class BlockedExitEngine:
@@ -151,6 +180,15 @@ class BlockedExitEngine:
         self._states.pop(stream_id, None)
         self._mask_cache.pop(stream_id, None)
 
+    def release_stream(self, stream_id: str, now: Optional[float] = None) -> Dict[str, Any]:
+        """Stream stopped or the feature was switched off: flush partially recorded
+        clips, then forget the stream. Returns ``{"clips": [{"key", "frames", "fps"}]}``."""
+        state = self._states.get(stream_id)
+        now = time.monotonic() if now is None else now
+        clips = state.clips.pop_finished(now, force=True) if state else []
+        self.clear_stream(stream_id)
+        return {"clips": clips}
+
     def has_config(self, stream_id: str) -> bool:
         return stream_id in self._configs and bool(self._configs[stream_id].get("door_polygon"))
 
@@ -183,6 +221,10 @@ class BlockedExitEngine:
         transition is one of None, "open", "update", "escalate", "close".
         "alert" is True on open/escalate (the moments worth notifying about).
         Returns None if no polygon is configured or the model isn't loaded.
+
+        The reading also carries ``confidence`` / ``avg_confidence`` (peak and mean of
+        the blocking detections), ``episode_uuid`` and ``clips``: evidence clips that
+        finished on this frame, keyed by the episode_uuid they were recorded for.
         """
         cfg = self._configs.get(stream_id)
         if not cfg or not cfg.get("door_polygon"):
@@ -204,6 +246,7 @@ class BlockedExitEngine:
 
         obstacle_masks: List[np.ndarray] = []
         blocking: List[Tuple[str, List[float]]] = []
+        blocking_conf: List[float] = []
         people_count = 0
         for det in detections:
             mask = _bbox_to_mask(det["bbox"], width, height)
@@ -214,15 +257,41 @@ class BlockedExitEngine:
                 people_count += 1
             obstacle_masks.append(mask)
             blocking.append((self._class_label(class_id), det["bbox"]))
+            if det.get("confidence") is not None:
+                blocking_conf.append(float(det["confidence"]))
 
         occupied_pct = _occupancy(door_mask, obstacle_masks) * 100.0
         accessibility_pct = round(_clamp(100.0 - occupied_pct), 2)
+        now = time.monotonic() if now is None else now
         reading = self.evaluate(
-            stream_id, accessibility_pct, [label for label, _ in blocking], people_count, now=now,
+            stream_id, accessibility_pct, [label for label, _ in blocking], people_count,
+            now=now, confidences=blocking_conf,
         )
         if reading["transition"] == "open":
             reading["evidence_jpeg"] = self._annotate(frame, cfg, width, height, blocking, reading)
+        reading["clips"] = self._record_clip(stream_id, frame, cfg, (width, height), blocking, reading, now)
         return reading
+
+    def _record_clip(
+        self, stream_id: str, frame: np.ndarray, cfg: Dict[str, Any], source_size: Tuple[int, int],
+        blocking: List[Tuple[str, List[float]]], reading: Dict[str, Any], now: float,
+    ) -> List[Dict[str, Any]]:
+        """Buffer the annotated frame while an obstruction is building up, an episode is
+        open or a clip is still recording; start a clip when an episode opens."""
+        st = self._states.get(stream_id)
+        if st is None:
+            return []
+        if st.blocked_since is not None or st.episode_open or st.clips.busy:
+            try:
+                small = self._draw(resize_max_width(frame, CLIP_MAX_WIDTH), cfg, source_size, blocking, reading)
+                st.clips.push(now, small, float(getattr(config, "blocked_exit_clip_pre_seconds", 3.0)))
+            except Exception as e:
+                logger.warning(f"blocked-exit clip frame failed for {stream_id}: {e}")
+        if reading["transition"] == "open" and reading.get("episode_uuid"):
+            st.clips.start(
+                reading["episode_uuid"], now, float(getattr(config, "blocked_exit_clip_post_seconds", 5.0)),
+            )
+        return st.clips.pop_finished(now)
 
     def evaluate(
         self,
@@ -231,6 +300,7 @@ class BlockedExitEngine:
         blocking_objects: List[str],
         people_count: int = 0,
         now: Optional[float] = None,
+        confidences: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
         """Classify one accessibility reading and advance the stream's episode
         state machine. Split from process_frame so it can be tested without a model."""
@@ -266,12 +336,16 @@ class BlockedExitEngine:
             st.clear_since = None
             if st.blocked_since is None:
                 st.blocked_since = now
+                if not st.episode_open:
+                    st.reset_confidence()  # a new obstruction; earlier samples were a passer-by
+            st.sample_confidence(confidences)
             if not st.episode_open:
                 if now - st.blocked_since >= debounce_seconds:
                     transition = "open"
                     st.episode_open = True
                     st.episode_state = state
                     st.episode_started = st.blocked_since
+                    st.episode_uuid = uuid.uuid4().hex
                     st.last_update_at = now
             elif state == "blocked" and st.episode_state == "partially_blocked":
                 transition = "escalate"
@@ -287,6 +361,11 @@ class BlockedExitEngine:
         risk_score, risk_level = self._assess_risk(
             state, accessibility_pct, blocked_duration, blocking_objects, people_count,
         )
+        confidence, avg_confidence = st.confidence()
+        episode_uuid = st.episode_uuid
+        if transition == "close":
+            st.episode_uuid = None
+            st.reset_confidence()
         return {
             "state": state,
             "episode_state": st.episode_state,
@@ -298,6 +377,9 @@ class BlockedExitEngine:
             "blocked_duration_s": round(blocked_duration, 1),
             "transition": transition,
             "alert": transition in ("open", "escalate"),
+            "confidence": confidence,
+            "avg_confidence": avg_confidence,
+            "episode_uuid": episode_uuid,
         }
 
     def _annotate(
@@ -306,27 +388,39 @@ class BlockedExitEngine:
     ) -> Optional[bytes]:
         """JPEG of the frame with the door polygon and blocking boxes drawn on."""
         try:
-            img = frame.copy()
-            polygon = self._scale_polygon(
-                cfg["door_polygon"], cfg.get("calibration_frame_w"), cfg.get("calibration_frame_h"), width, height,
-            )
-            pts = np.round(np.asarray(polygon, dtype=np.float32)).astype(np.int32)
-            color = (0, 0, 255) if reading["state"] == "blocked" else (0, 165, 255)
-            overlay = img.copy()
-            cv2.fillPoly(overlay, [pts], color)
-            img = cv2.addWeighted(overlay, 0.25, img, 0.75, 0)
-            cv2.polylines(img, [pts], True, color, 2)
-            for label, bbox in blocking:
-                x1, y1, x2, y2 = (int(round(v)) for v in bbox)
-                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 2)
-                cv2.putText(img, label, (x1, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            caption = f"{reading['state'].replace('_', ' ')} - {reading['accessibility_pct']:.0f}% accessible"
-            cv2.putText(img, caption, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            img = self._draw(frame.copy(), cfg, (width, height), blocking, reading)
             ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
             return buf.tobytes() if ok else None
         except Exception as e:
             logger.warning(f"blocked-exit evidence annotation failed: {e}")
             return None
+
+    def _draw(
+        self, img: np.ndarray, cfg: Dict[str, Any], source_size: Tuple[int, int],
+        blocking: List[Tuple[str, List[float]]], reading: Dict[str, Any],
+    ) -> np.ndarray:
+        """Draw the door polygon, blocking boxes and state onto ``img``, which may be a
+        downscaled copy of a ``source_size`` frame (boxes are in source pixels)."""
+        height, width = img.shape[:2]
+        sx, sy = width / source_size[0], height / source_size[1]
+        polygon = self._scale_polygon(
+            cfg["door_polygon"], cfg.get("calibration_frame_w"), cfg.get("calibration_frame_h"), width, height,
+        )
+        pts = np.round(np.asarray(polygon, dtype=np.float32)).astype(np.int32)
+        color = (0, 0, 255) if reading["state"] == "blocked" else (
+            (0, 165, 255) if reading["state"] == "partially_blocked" else (80, 200, 80)
+        )
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        img = cv2.addWeighted(overlay, 0.25, img, 0.75, 0)
+        cv2.polylines(img, [pts], True, color, 2)
+        for label, bbox in blocking:
+            x1, y1, x2, y2 = (int(round(v * f)) for v, f in zip(bbox, (sx, sy, sx, sy)))
+            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 2)
+            cv2.putText(img, label, (x1, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        caption = f"{reading['state'].replace('_', ' ')} - {reading['accessibility_pct']:.0f}% accessible"
+        cv2.putText(img, caption, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        return img
 
     def _class_label(self, class_id: int) -> str:
         # ModelFactory loaders don't expose COCO class names; fall back to id.

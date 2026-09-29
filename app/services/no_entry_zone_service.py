@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from app.config.settings import config
 from app.services.database import db_manager
+from app.services import evidence_analytics
 from app.utils.parser_utils import parse_date_format, parse_time_string
 
 _TZ_NAME = getattr(config, "no_entry_zone_timezone", "Africa/Cairo")
@@ -21,7 +22,7 @@ _EVENT_COLUMNS = """
     ne.track_id, ne.confidence, ne.dwell_seconds, ne.status, ne.description,
     ne.snapshot_path, ne.clip_path, ne.evidence_paths,
     ne.acknowledged_at, ne.resolved_at,
-    vs.location AS camera_location, vs.building, vs.floor_level, vs.zone AS camera_zone
+    vs.location AS camera_location, vs.area AS camera_area, vs.building, vs.floor_level, vs.zone AS camera_zone
 """
 
 # Nullable per-zone overrides: an explicit null in a PATCH resets them to the default.
@@ -59,11 +60,13 @@ class NoEntryZoneService:
         zone_id: Optional[str] = None,
         incident_id: Optional[str] = None,
         target_class: Optional[str] = None,
+        has_clip: bool = False,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
         location: Optional[str] = None,
+        area: Optional[str] = None,
         building: Optional[str] = None,
         floor_level: Optional[str] = None,
         zone: Optional[str] = None,
@@ -90,6 +93,8 @@ class NoEntryZoneService:
             add(f"{table_alias}.incident_id = $?::uuid", str(incident_id))
         if target_class:
             add(f"{table_alias}.target_class = $?", target_class)
+        if has_clip:
+            conditions.append(f"{table_alias}.clip_path IS NOT NULL")
 
         # Time-of-day bounds are compared in the configured zone, the same zone the
         # date bounds are built in (the DB session zone may differ).
@@ -106,14 +111,12 @@ class NoEntryZoneService:
             add(f"{table_alias}.event_timestamp <= $?", datetime.combine(ed, et).replace(tzinfo=_TZ))
         elif end_time and not start_date:
             add(f"{local_time} <= $?", parse_time_string(end_time, dt_time(23, 59, 59)))
-        if location:
-            add(f"{vs_alias}.location = $?", location)
-        if building:
-            add(f"{vs_alias}.building = $?", building)
-        if floor_level:
-            add(f"{vs_alias}.floor_level = $?", floor_level)
-        if zone:
-            add(f"{vs_alias}.zone = $?", zone)
+        # Camera hierarchy; each accepts one value or a comma-separated list.
+        for col, value in (("location", location), ("area", area), ("building", building),
+                           ("floor_level", floor_level), ("zone", zone)):
+            values = evidence_analytics.csv_values(value) if value else []
+            if values:
+                add(f"{vs_alias}.{col} = ANY($?::text[])", values)
 
         return conditions, params, p
 
@@ -544,6 +547,26 @@ class NoEntryZoneService:
         return bool(row and row.get("is_no_entry_zone_camera"))
 
     # =========================================================
+    # Charts (visualisations tab)
+    # =========================================================
+
+    _CHART_FROM = "no_entry_events ne LEFT JOIN video_stream vs ON ne.stream_id = vs.stream_id"
+
+    async def incidents_per_camera(self, workspace_id: UUID, **filters) -> List[Dict[str, Any]]:
+        conditions, params, _ = self._build_event_conditions(workspace_id, **filters)
+        return await evidence_analytics.incidents_per_camera(
+            self.db, from_sql=self._CHART_FROM, where=" AND ".join(conditions), params=params,
+            alias="ne", incident_expr="COUNT(DISTINCT ne.incident_id)",
+        )
+
+    async def confidence_audit(self, workspace_id: UUID, **filters) -> Dict[str, Any]:
+        conditions, params, _ = self._build_event_conditions(workspace_id, **filters)
+        return await evidence_analytics.confidence_audit(
+            self.db, from_sql=self._CHART_FROM, where=" AND ".join(conditions), params=params,
+            alias="ne", threshold=float(getattr(config, "no_entry_zone_confidence", 0.4)),
+        )
+
+    # =========================================================
     # Cameras
     # =========================================================
 
@@ -578,6 +601,16 @@ class NoEntryZoneService:
             fetch_one=True,
         )
         return row is not None
+
+    async def camera_flag(self, stream_id: UUID, workspace_id: UUID) -> Optional[bool]:
+        """``None`` when the camera is not in the workspace, else whether no-entry-zone
+        detection is enabled on it."""
+        row = await self.db.execute_query(
+            "SELECT is_no_entry_zone_camera FROM video_stream WHERE stream_id = $1 AND workspace_id = $2",
+            (stream_id, workspace_id),
+            fetch_one=True,
+        )
+        return None if row is None else bool(row.get("is_no_entry_zone_camera"))
 
     # =========================================================
     # Zone CRUD
@@ -615,6 +648,22 @@ class NoEntryZoneService:
             WHERE z.zone_id = $1 AND z.workspace_id = $2
             """,
             (zone_id, workspace_id),
+            fetch_one=True,
+        )
+        return _decode_zone_row(row)
+
+    async def primary_zone(self, stream_id: UUID, workspace_id: UUID) -> Optional[Dict[str, Any]]:
+        """The camera's first zone — the one the single-polygon editor reads and writes."""
+        row = await self.db.execute_query(
+            """
+            SELECT z.*, vs.name AS camera_name
+            FROM no_entry_zones z
+            LEFT JOIN video_stream vs ON vs.stream_id = z.stream_id
+            WHERE z.stream_id = $1 AND z.workspace_id = $2
+            ORDER BY z.created_at, z.zone_id
+            LIMIT 1
+            """,
+            (stream_id, workspace_id),
             fetch_one=True,
         )
         return _decode_zone_row(row)

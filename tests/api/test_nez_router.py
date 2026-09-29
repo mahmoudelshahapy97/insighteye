@@ -102,7 +102,7 @@ async def test_viewer_can_read_but_not_write(viewer, mocker):
 
 
 async def test_zone_create_rejects_camera_from_another_workspace(admin, mocker):
-    mocker.patch.object(mod.no_entry_zone_service, "stream_in_workspace", mocker.AsyncMock(return_value=False))
+    mocker.patch.object(mod.no_entry_zone_service, "camera_flag", mocker.AsyncMock(return_value=None))
     create = mocker.patch.object(mod.no_entry_zone_service, "create_zone", mocker.AsyncMock())
     async with admin as c:
         r = await c.post("/no-entry-zone/zones", json=_zone_body())
@@ -120,7 +120,7 @@ async def test_zone_create_rejects_camera_from_another_workspace(admin, mocker):
     (SQUARE, {"anchor": "top_left"}),
 ])
 async def test_zone_validation(admin, mocker, polygon, extra):
-    mocker.patch.object(mod.no_entry_zone_service, "stream_in_workspace", mocker.AsyncMock(return_value=True))
+    mocker.patch.object(mod.no_entry_zone_service, "camera_flag", mocker.AsyncMock(return_value=True))
     create = mocker.patch.object(mod.no_entry_zone_service, "create_zone", mocker.AsyncMock())
     async with admin as c:
         r = await c.post("/no-entry-zone/zones", json=_zone_body(polygon=polygon, **extra))
@@ -135,7 +135,7 @@ async def test_zone_create_refreshes_the_engine(admin, mocker):
         "ref_width": 640, "ref_height": 480, "target_classes": ["car", "person"],
         "min_dwell_seconds": 1.0, "schedule": None, "is_active": True,
     }
-    mocker.patch.object(mod.no_entry_zone_service, "stream_in_workspace", mocker.AsyncMock(return_value=True))
+    mocker.patch.object(mod.no_entry_zone_service, "camera_flag", mocker.AsyncMock(return_value=True))
     create = mocker.patch.object(mod.no_entry_zone_service, "create_zone", mocker.AsyncMock(return_value=saved))
     async with admin as c:
         r = await c.post("/no-entry-zone/zones", json=_zone_body(
@@ -197,7 +197,7 @@ async def test_analytics_picks_bucket_from_range(admin, mocker):
 async def test_duplicate_zone_name_is_a_409_not_a_500(admin, mocker):
     from fastapi import HTTPException as DBConflict
 
-    mocker.patch.object(mod.no_entry_zone_service, "stream_in_workspace", mocker.AsyncMock(return_value=True))
+    mocker.patch.object(mod.no_entry_zone_service, "camera_flag", mocker.AsyncMock(return_value=True))
     mocker.patch.object(
         mod.no_entry_zone_service, "create_zone",
         mocker.AsyncMock(side_effect=DBConflict(status_code=409, detail="Duplicate entry")),
@@ -206,3 +206,115 @@ async def test_duplicate_zone_name_is_a_409_not_a_500(admin, mocker):
         r = await c.post("/no-entry-zone/zones", json=_zone_body())
     assert r.status_code == 409
     assert "already exists" in r.json()["detail"]
+
+
+# ─────────────────────────────────────────────
+# Feature gating, single-polygon editor, videos and charts
+# ─────────────────────────────────────────────
+
+async def test_zones_cannot_be_drawn_on_a_camera_without_the_feature(admin, mocker):
+    mocker.patch.object(mod.no_entry_zone_service, "camera_flag", mocker.AsyncMock(return_value=False))
+    create = mocker.patch.object(mod.no_entry_zone_service, "create_zone", mocker.AsyncMock())
+    mocker.patch.object(mod.no_entry_zone_service, "get_zone", mocker.AsyncMock(return_value={"stream_id": uuid4()}))
+    update = mocker.patch.object(mod.no_entry_zone_service, "update_zone", mocker.AsyncMock())
+    async with admin as c:
+        assert (await c.post("/no-entry-zone/zones", json=_zone_body())).status_code == 409
+        r = await c.patch(f"/no-entry-zone/zones/{uuid4()}", json={"name": "x"})
+        assert r.status_code == 409
+        r = await c.put(f"/no-entry-zone/cameras/{uuid4()}/polygon",
+                        json={"polygon": SQUARE, "ref_width": 640, "ref_height": 480})
+        assert r.status_code == 409
+    create.assert_not_awaited()
+    update.assert_not_awaited()
+
+
+async def test_get_polygon_is_null_before_one_is_drawn(admin, mocker):
+    stream = uuid4()
+    mocker.patch.object(mod, "_camera_or_404", mocker.AsyncMock(return_value={"name": "Gate"}))
+    mocker.patch.object(mod.no_entry_zone_service, "primary_zone", mocker.AsyncMock(return_value=None))
+    async with admin as c:
+        r = await c.get(f"/no-entry-zone/cameras/{stream}/polygon")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["stream_id"] == str(stream) and body["camera_name"] == "Gate"
+    assert body["polygon"] is None and body["point_count"] == 0
+
+
+async def test_put_polygon_creates_then_updates_the_primary_zone(admin, mocker):
+    stream, zone_id = uuid4(), uuid4()
+    saved = {"zone_id": zone_id, "stream_id": stream, "camera_name": "Gate", "polygon": SQUARE,
+             "ref_width": 640, "ref_height": 480, "is_active": True}
+    mocker.patch.object(mod.no_entry_zone_service, "camera_flag", mocker.AsyncMock(return_value=True))
+    mocker.patch.object(mod.no_entry_zone_service, "primary_zone", mocker.AsyncMock(side_effect=[None, saved]))
+    create = mocker.patch.object(mod.no_entry_zone_service, "create_zone", mocker.AsyncMock(return_value=saved))
+    update = mocker.patch.object(mod.no_entry_zone_service, "update_zone", mocker.AsyncMock(return_value=saved))
+    body = {"polygon": SQUARE, "ref_width": 640, "ref_height": 480}
+    async with admin as c:
+        first = await c.put(f"/no-entry-zone/cameras/{stream}/polygon", json=body)
+        second = await c.put(f"/no-entry-zone/cameras/{stream}/polygon", json=body)
+    assert first.status_code == second.status_code == 200, first.text
+    assert first.json()["point_count"] == 4 and first.json()["id"] == str(zone_id)
+    data = create.await_args.args[1]
+    assert data["stream_id"] == stream and data["name"] == "Default" and data["polygon"] == SQUARE
+    assert update.await_args.args[0] == zone_id
+    assert mod._refresh_engine.await_count == 2
+
+
+@pytest.mark.parametrize("polygon", [
+    [[0, 0], [10, 10]],                             # too few points
+    [[0, 0], [100, 100], [100, 0], [0, 100]],       # edges cross
+    [[0, 0], [5000, 0], [5000, 50]],                # outside the frame
+])
+async def test_put_polygon_validates(admin, mocker, polygon):
+    mocker.patch.object(mod.no_entry_zone_service, "camera_flag", mocker.AsyncMock(return_value=True))
+    async with admin as c:
+        r = await c.put(f"/no-entry-zone/cameras/{uuid4()}/polygon",
+                        json={"polygon": polygon, "ref_width": 640, "ref_height": 480})
+    assert r.status_code == 422
+
+
+async def test_viewer_cannot_save_a_polygon(viewer, mocker):
+    flag = mocker.patch.object(mod.no_entry_zone_service, "camera_flag", mocker.AsyncMock(return_value=True))
+    async with viewer as c:
+        r = await c.put(f"/no-entry-zone/cameras/{uuid4()}/polygon",
+                        json={"polygon": SQUARE, "ref_width": 640, "ref_height": 480})
+    assert r.status_code == 403
+    flag.assert_not_awaited()
+
+
+async def test_videos_only_ask_for_clips_and_sign_them(admin, mocker):
+    from app.services import s3_service as s3mod
+    get = mocker.patch.object(mod.no_entry_zone_service, "get_events", mocker.AsyncMock(return_value=[{
+        "event_id": 5, "event_timestamp": "2026-09-01T10:00:00Z", "status": "detected",
+        "clip_path": "s3://b/c.mp4", "snapshot_path": None, "camera_name": "Gate",
+    }]))
+    count = mocker.patch.object(mod.no_entry_zone_service, "count_events", mocker.AsyncMock(return_value=1))
+    mocker.patch.object(s3mod.s3_service, "get_presigned_url", mocker.AsyncMock(return_value="https://signed"))
+    async with admin as c:
+        r = await c.get("/no-entry-zone/videos", params={
+            "building": "A,B", "start_date": "2026-09-01", "start_time": "08:00", "page": 2, "limit": 6,
+        })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 1 and body["offset"] == 6
+    assert body["items"][0]["clip_url"] == "https://signed" and body["items"][0]["snapshot_url"] is None
+    kw = get.await_args.kwargs
+    assert kw["has_clip"] is True and kw["building"] == "A,B" and kw["start_time"] == "08:00"
+    assert count.await_args.kwargs["has_clip"] is True
+
+
+async def test_chart_endpoints_pass_filters(admin, mocker):
+    per_cam = mocker.patch.object(mod.no_entry_zone_service, "incidents_per_camera", mocker.AsyncMock(return_value=[
+        {"stream_id": uuid4(), "camera_name": "Gate", "events": 4, "incidents": 2, "resolved": 1},
+    ]))
+    audit = mocker.patch.object(mod.no_entry_zone_service, "confidence_audit", mocker.AsyncMock(return_value={
+        "summary": {"events": 0, "threshold": 0.4, "low_confidence_cutoff": 0.5},
+        "per_camera": [], "histogram": [], "per_event": [],
+    }))
+    async with admin as c:
+        r1 = await c.get("/no-entry-zone/analytics/incidents-per-camera", params={"area": "North"})
+        r2 = await c.get("/no-entry-zone/analytics/confidence-audit", params={"end_date": "2026-09-30"})
+    assert r1.status_code == 200 and r1.json()[0]["incidents"] == 2
+    assert r2.status_code == 200, r2.text
+    assert per_cam.await_args.kwargs["area"] == "North"
+    assert audit.await_args.kwargs["end_date"] == "2026-09-30"
