@@ -203,6 +203,57 @@ _FLAG_FEATURES = {
 }
 
 
+class AdminStreamCreate(StreamCreate):
+    workspace_id: UUID
+    user_id: UUID  # camera owner; must be a member of workspace_id
+
+
+@router.post("/admin/source", status_code=status.HTTP_201_CREATED)
+async def admin_create_stream(
+    stream: AdminStreamCreate,
+    request: Request,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Create a camera in any workspace on behalf of one of its members (superadmin only)."""
+    if not workspace_service.is_superadmin(current_user_data):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This action requires superadmin privileges.")
+
+    ws = await db_manager.execute_query(
+        "SELECT enabled_features FROM workspaces WHERE workspace_id = $1 AND is_active = TRUE",
+        (stream.workspace_id,),
+        fetch_one=True,
+    )
+    if not ws:
+        raise HTTPException(status_code=404, detail="Workspace not found or inactive.")
+
+    requested = set(stream.detection_models or [])
+    requested |= {feat for flag, feat in _FLAG_FEATURES.items() if getattr(stream, flag, False)}
+    closed = sorted(requested - set(ws["enabled_features"] or []))
+    if closed:
+        raise HTTPException(status_code=400, detail=f"Not enabled for this workspace: {', '.join(closed)}")
+
+    await check_workspace_access(db_manager, stream.user_id, stream.workspace_id, required_role=None)
+    owner = await user_manager.get_user_by_id(str(stream.user_id))
+    owner_username = owner.get("username") if owner else None
+
+    stream_id = await camera_service.create_camera(
+        StreamCreate(**stream.model_dump(exclude={"workspace_id", "user_id"})),
+        stream.user_id,
+        stream.workspace_id,
+        owner_username,
+    )
+
+    await session_manager.log_action(
+        content=f"User '{current_user_data['username']}' added Camera '{stream.name}' (ID: {stream_id}) for user {stream.user_id} in workspace (ID: {stream.workspace_id})",
+        user_id=str(current_user_data["user_id"]),
+        workspace_id=str(stream.workspace_id),
+        action_type="Added_Camera",
+        ip_address=request.client.host if request.client else "Unknown",
+        user_agent=request.headers.get("user-agent", "Unknown")
+    )
+    return {"message": "Stream created successfully", "id": stream_id}
+
+
 async def _closed_features_requested(stream_update: StreamUpdate) -> List[str]:
     """Features this update turns on that the camera's workspace has closed."""
     requested = set(stream_update.detection_models or [])
@@ -2393,4 +2444,4 @@ async def get_my_camera_limit(
             status_code=500,
             detail="An unexpected error occurred while retrieving camera limit."
         )
-    
+    

@@ -9,6 +9,9 @@ class CreateUserRequest(BaseModel):
     email: EmailStr = Field(..., description="Email address for the new user")
     role: str = Field("user", pattern="^(user|admin|superadmin)$")
     count_of_camera: int = Field(5)
+    # Admin-created users are added to this workspace; /signup ignores it.
+    workspace_id: Optional[UUID] = Field(None, description="Workspace to add the new user to")
+    workspace_role: str = Field("member", pattern="^(admin|member|viewer)$")
 
 class LoginRequest(BaseModel):
     username: Optional[str] = Field(None, description="Username of the user")

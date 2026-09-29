@@ -512,3 +512,101 @@ async def admin_set_workspace_features(
         user_agent=request.headers.get("user-agent")
     )
     return {"message": "Workspace features updated.", "features": sorted(set(body.features))}
+
+
+async def _stop_workspace_streams(workspace_id: UUID) -> int:
+    """Stop every running camera in a workspace. Returns how many were stopped."""
+    from app.services.stream_service import stream_manager
+    from app.services.distributed_stream_manager import distributed_stream_manager
+
+    streams = await workspace_service.db_manager.execute_query(
+        "SELECT stream_id, user_id FROM video_stream WHERE workspace_id = $1 AND is_streaming = TRUE",
+        (workspace_id,),
+        fetch_all=True,
+    ) or []
+    for s in streams:
+        try:
+            # The owner is normally a member, which stop_stream_in_workspace requires.
+            await stream_manager.stop_stream_in_workspace(
+                stream_id=s["stream_id"],
+                requester_user_id=s["user_id"],
+                stop_reason="user_action",
+                additional_context="Workspace deactivated by superadmin",
+            )
+        except Exception as e:
+            logger.warning(f"Stop via stream manager failed for {s['stream_id']} ({e}); forcing lock release")
+            await distributed_stream_manager.release_camera_lock(
+                str(s["stream_id"]), reason="user_action", force_stop=True
+            )
+    return len(streams)
+
+
+async def _get_workspace_or_404(workspace_id: UUID) -> Dict:
+    row = await workspace_service.db_manager.execute_query(
+        "SELECT name, is_active FROM workspaces WHERE workspace_id = $1",
+        (workspace_id,),
+        fetch_one=True,
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found.")
+    return row
+
+
+@router.post("/admin/workspaces/{workspace_id}/deactivate", response_model=dict)
+async def admin_deactivate_workspace(
+    workspace_id: UUID,
+    request: Request,
+    current_user_data: Dict = Depends(get_current_user_full_data_dependency)
+):
+    """Stop the workspace's cameras and mark it inactive; its data is kept (superadmin only)."""
+    _require_superadmin(current_user_data)
+    ws = await _get_workspace_or_404(workspace_id)
+
+    # Stop first: the stop path looks the cameras up through their workspace.
+    stopped = await _stop_workspace_streams(workspace_id)
+    await workspace_service.db_manager.execute_query(
+        "UPDATE workspaces SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE workspace_id = $1",
+        (workspace_id,),
+    )
+    feature_service.invalidate_cameras()
+
+    await session_manager.log_action(
+        content=f"User '{current_user_data['username']}' deactivated workspace '{ws['name']}' ({stopped} camera(s) stopped).",
+        user_id=str(current_user_data['user_id']),
+        workspace_id=str(workspace_id),
+        action_type="Workspace_Deactivated",
+        ip_address=request.client.host if request.client else "N/A",
+        user_agent=request.headers.get("user-agent")
+    )
+    return {"message": f"Workspace '{ws['name']}' deactivated.", "stopped_streams": stopped}
+
+
+@router.delete("/admin/workspaces/{workspace_id}", response_model=dict)
+async def admin_delete_workspace(
+    workspace_id: UUID,
+    request: Request,
+    current_user_data: Dict = Depends(get_current_user_full_data_dependency)
+):
+    """Permanently delete an inactive workspace and everything that cascades from it (superadmin only)."""
+    _require_superadmin(current_user_data)
+    ws = await _get_workspace_or_404(workspace_id)
+    if ws["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deactivate the workspace before deleting it permanently."
+        )
+
+    await workspace_service.db_manager.execute_query(
+        "DELETE FROM workspaces WHERE workspace_id = $1", (workspace_id,)
+    )
+    feature_service.invalidate_cameras()
+
+    # workspace_id is left out: the row it would reference is gone.
+    await session_manager.log_action(
+        content=f"User '{current_user_data['username']}' permanently deleted workspace '{ws['name']}' (ID: {workspace_id}).",
+        user_id=str(current_user_data['user_id']),
+        action_type="Workspace_Deleted",
+        ip_address=request.client.host if request.client else "N/A",
+        user_agent=request.headers.get("user-agent")
+    )
+    return {"message": f"Workspace '{ws['name']}' deleted."}

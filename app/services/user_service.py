@@ -115,7 +115,10 @@ class UserManager:
         except Exception as e:
             logger.error(f"Failed to log security event ({event_type}) for user {str(db_user_id)}: {e}", exc_info=True)
 
-    async def create_user(self, username, email, password, role='user', count_of_camera: int = 5) -> bool:
+    async def create_user(
+        self, username, email, password, role='user', count_of_camera: int = 5,
+        workspace_id: Optional[UUID] = None, workspace_role: str = 'member'
+    ) -> bool:
         query_check = "SELECT user_id FROM users WHERE username = $1"
         existing_user = await self.db_manager.execute_query(query_check, (username,), fetch_one=True)
 
@@ -128,6 +131,14 @@ class UserManager:
             logger.warning(f"Password validation failed for new user {username}: {msg}")
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg) 
 
+        if workspace_id:
+            ws = await self.db_manager.execute_query(
+                "SELECT 1 FROM workspaces WHERE workspace_id = $1 AND is_active = TRUE",
+                (workspace_id,), fetch_one=True
+            )
+            if not ws:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found or inactive.")
+
         hashed_password = self.get_password_hash(password)
         user_id_obj = uuid.uuid4() # This is a UUID object
 
@@ -135,26 +146,37 @@ class UserManager:
         subscription_date = created_at + timedelta(days=90) 
         is_active = True 
 
-        query_insert_user = """
-            INSERT INTO users 
-            (user_id, username, email, created_at, is_active, role, count_of_camera, subscription_date, is_subscribed, is_search, is_prediction) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        """
-        await self.db_manager.execute_query(query_insert_user, (
-            user_id_obj, username, email, created_at, is_active, role, count_of_camera, 
-            subscription_date, True, True, True 
-        ))
+        # One transaction: a user is never left without their workspace membership.
+        async with self.db_manager.transaction() as conn:
+            query_insert_user = """
+                INSERT INTO users 
+                (user_id, username, email, created_at, is_active, role, count_of_camera, subscription_date, is_subscribed, is_search, is_prediction) 
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            """
+            await self.db_manager.execute_query(query_insert_user, (
+                user_id_obj, username, email, created_at, is_active, role, count_of_camera, 
+                subscription_date, True, True, True 
+            ), connection=conn)
 
-        password_id_obj = uuid.uuid4() # This is a UUID object
-        query_insert_password = """
-            INSERT INTO user_accounts (password_id, user_id, password_hash, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5)
-        """
-        await self.db_manager.execute_query(query_insert_password, (
-            password_id_obj, user_id_obj, hashed_password, created_at, created_at # Pass password_id_obj and user_id_obj (UUIDs)
-        ))
+            password_id_obj = uuid.uuid4() # This is a UUID object
+            query_insert_password = """
+                INSERT INTO user_accounts (password_id, user_id, password_hash, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5)
+            """
+            await self.db_manager.execute_query(query_insert_password, (
+                password_id_obj, user_id_obj, hashed_password, created_at, created_at # Pass password_id_obj and user_id_obj (UUIDs)
+            ), connection=conn)
 
-        await self._log_security_event(user_id=user_id_obj, event_type="user_created", severity="low", event_data={"username": username, "email": email})
+            if workspace_id:
+                await self.db_manager.execute_query(
+                    """INSERT INTO workspace_members
+                       (membership_id, workspace_id, user_id, role, created_at, updated_at)
+                       VALUES ($1, $2, $3, $4, $5, $6)""",
+                    (uuid.uuid4(), workspace_id, user_id_obj, workspace_role, created_at, created_at),
+                    connection=conn
+                )
+
+        await self._log_security_event(user_id=user_id_obj, event_type="user_created", severity="low", event_data={"username": username, "email": email, "workspace_id": str(workspace_id) if workspace_id else None})
         return True 
 
     async def verify_user_password(self, username, password) -> bool:
@@ -588,7 +610,8 @@ class UserManager:
             await self._log_security_event(user_id=user_id, event_type="user_role_changed", severity="high", event_data={"username": username, "new_role": role})
         return bool(rows_affected is not None and rows_affected > 0)
 
-    async def get_all_users(self) -> List[Dict]:
+    async def get_all_users(self, workspace_id: Optional[UUID] = None) -> List[Dict]:
+        """All users, or only the members of `workspace_id` when given."""
         query = """
             SELECT u.user_id, u.username, u.email, u.created_at, u.is_active, u.last_login, u.role, 
                 u.is_subscribed, u.subscription_date, u.count_of_camera, u.enabled_features,
@@ -598,9 +621,13 @@ class UserManager:
                     WHERE wm.user_id = u.user_id ORDER BY w.name
                 ), '{}') AS workspaces
             FROM users u
-            ORDER BY u.username
         """
-        users_data = await self.db_manager.execute_query(query, fetch_all=True)
+        params = None
+        if workspace_id:
+            query += " WHERE EXISTS (SELECT 1 FROM workspace_members wm WHERE wm.user_id = u.user_id AND wm.workspace_id = $1)"
+            params = (workspace_id,)
+        query += " ORDER BY u.username"
+        users_data = await self.db_manager.execute_query(query, params, fetch_all=True)
         return [dict(user) for user in users_data] if users_data else [] 
 
     async def change_password(self, username: str, current_password: str, new_password: str) -> bool:
@@ -749,4 +776,4 @@ class UserManager:
                 detail="Failed to create user and workspace."
             )
 
-user_manager = UserManager()
+user_manager = UserManager()

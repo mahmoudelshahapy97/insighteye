@@ -1,6 +1,6 @@
 # app/routes/user_router.py
-from fastapi import APIRouter, HTTPException, status, Depends, Request as FastAPIRequest
-from typing import Dict, Any
+from fastapi import APIRouter, HTTPException, status, Depends, Query, Request as FastAPIRequest
+from typing import Dict, Any, Optional
 from uuid import UUID
 from pydantic import BaseModel, Field
 from app.services.database import db_manager
@@ -59,7 +59,10 @@ async def create_user_route(
         HTTPException: If the username already exists or if a database error occurs.
     """
     try:
-        success = await user_manager.create_user(request.username, request.email, request.password, request.role, request.count_of_camera)
+        success = await user_manager.create_user(
+            request.username, request.email, request.password, request.role, request.count_of_camera,
+            workspace_id=request.workspace_id, workspace_role=request.workspace_role,
+        )
         if success:
             return {"message": "User created successfully"}
         else:
@@ -175,10 +178,11 @@ async def reset_password_route(
 
 @router.get("")
 async def get_all_users_route(
+    workspace_id: Optional[UUID] = Query(None, description="Only members of this workspace"),
     current_user: dict = Depends(get_current_superadmin_user_dependency)
 ):
     """
-    Gets all users. Superadmin only.
+    Gets all users, optionally only the members of one workspace. Superadmin only.
 
     Returns:
         A list of all users.
@@ -187,7 +191,7 @@ async def get_all_users_route(
         HTTPException: If a database error occurs.
     """
     try:
-        users = await user_manager.get_all_users()
+        users = await user_manager.get_all_users(workspace_id)
         return users
     except HTTPException as http_exc:
          raise http_exc
