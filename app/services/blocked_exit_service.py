@@ -440,6 +440,73 @@ class BlockedExitService:
     # Cameras & live status
     # =========================================================
 
+
+    _BE_INCIDENT = "be.event_id"
+    BE_DURATION_EDGES = (0, 30, 60, 300, 900)
+    TOP_OBJECTS = 10
+
+    def _chart_args(self, workspace_id: UUID, filters: Dict[str, Any]) -> Dict[str, Any]:
+        conditions, params, _ = self._build_event_conditions(workspace_id, **filters)
+        return {"from_sql": self._CHART_FROM, "where": " AND ".join(conditions), "params": params}
+
+    async def trend(self, workspace_id: UUID, bucket: Optional[str] = None, **filters) -> Dict[str, Any]:
+        return await evidence_analytics.trend(
+            self.db, **self._chart_args(workspace_id, filters), alias="be",
+            incident_key=self._BE_INCIDENT, bucket=bucket,
+        )
+
+    async def heatmap(self, workspace_id: UUID, **filters) -> List[Dict[str, Any]]:
+        return await evidence_analytics.heatmap(
+            self.db, **self._chart_args(workspace_id, filters), alias="be", incident_key=self._BE_INCIDENT,
+        )
+
+    async def response_times(self, workspace_id: UUID, **filters) -> Dict[str, Any]:
+        return await evidence_analytics.response_times(
+            self.db, **self._chart_args(workspace_id, filters), alias="be", incident_key=self._BE_INCIDENT,
+        )
+
+    async def breakdown(self, workspace_id: UUID, **filters) -> Dict[str, Any]:
+        """How long exits stayed blocked per camera, the duration spread, and what blocked them."""
+        args = self._chart_args(workspace_id, filters)
+        from_sql, where, params = args["from_sql"], args["where"], tuple(args["params"])
+        # Open episodes have no duration yet: count them as blocked until now.
+        duration = "COALESCE(be.duration_s, EXTRACT(EPOCH FROM COALESCE(be.ended_at, NOW()) - be.event_timestamp))"
+        per_camera = await self.db.execute_query(
+            f"""
+            SELECT be.stream_id,
+                   COALESCE(vs.name, MAX(be.camera_name))              AS camera_name,
+                   COUNT(*)                                            AS episodes,
+                   COALESCE(SUM({duration}), 0)::float                 AS total_blocked_s,
+                   AVG({duration})::float                              AS avg_duration_s,
+                   MAX({duration})::float                              AS max_duration_s,
+                   MIN(COALESCE(be.min_accessibility_pct, be.accessibility_pct))::float AS worst_accessibility_pct,
+                   COUNT(*) FILTER (WHERE be.peak_state = 'blocked')   AS fully_blocked
+            FROM {from_sql}
+            WHERE {where}
+            GROUP BY be.stream_id, vs.name
+            ORDER BY total_blocked_s DESC, episodes DESC, camera_name
+            """,
+            params,
+            fetch_all=True,
+        ) or []
+        top_objects = await self.db.execute_query(
+            f"""
+            SELECT obj AS object, COUNT(DISTINCT be.event_id) AS episodes
+            FROM {from_sql}
+            CROSS JOIN LATERAL unnest(COALESCE(be.blocking_objects, ARRAY[]::text[])) AS obj
+            WHERE {where}
+            GROUP BY obj
+            ORDER BY episodes DESC, object
+            LIMIT {self.TOP_OBJECTS}
+            """,
+            params,
+            fetch_all=True,
+        ) or []
+        durations = await evidence_analytics.histogram(
+            self.db, **args, value_sql=duration, edges=self.BE_DURATION_EDGES,
+        )
+        return {"per_camera": per_camera, "duration_histogram": durations, "top_objects": top_objects}
+
     async def get_camera(self, workspace_id: UUID, stream_id: UUID) -> Optional[Dict[str, Any]]:
         return await self.db.execute_query(
             """

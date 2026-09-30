@@ -1,8 +1,8 @@
 """Shapes shared by the no-entry-zone and blocked-exit "3 tab" pages: the single
-polygon per camera, the evidence video grid and the two visualisations."""
+polygon per camera, the evidence video grid and the visualisations."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -144,3 +144,89 @@ class ConfidenceAuditResponse(BaseModel):
     per_camera: List[CameraConfidence]
     histogram: List[ConfidenceBucket]
     per_event: List[EventConfidence]
+
+
+class TrendPoint(BaseModel):
+    bucket_start: datetime  # local (Africa/Cairo) start of the hour or day
+    incidents: int = 0
+    resolved: int = 0
+
+
+class TrendResponse(BaseModel):
+    bucket: Literal["hour", "day"]
+    points: List[TrendPoint]
+
+
+class HeatmapCell(BaseModel):
+    weekday: int  # 0 = Sunday
+    hour: int
+    incidents: int
+
+
+class ResponseTimeStats(BaseModel):
+    incidents: int = 0
+    acknowledged: int = 0
+    resolved: int = 0
+    open: int = 0
+    ack_median_s: Optional[float] = None
+    ack_p90_s: Optional[float] = None
+    resolve_median_s: Optional[float] = None
+    resolve_p90_s: Optional[float] = None
+
+
+class CameraResponseTimes(ResponseTimeStats):
+    stream_id: Optional[UUID] = None
+    camera_name: Optional[str] = None
+
+
+class ResponseTimesResponse(BaseModel):
+    summary: ResponseTimeStats
+    per_camera: List[CameraResponseTimes]
+
+
+class HistogramBucket(BaseModel):
+    min: float
+    max: Optional[float] = None  # None: open-ended last bucket
+    count: int = 0
+
+
+class ZoneIncidents(BaseModel):
+    zone_name: str
+    incidents: int = 0
+    events: int = 0
+    avg_dwell_s: Optional[float] = None
+    max_dwell_s: Optional[float] = None
+
+
+class TargetCount(BaseModel):
+    target_class: str
+    events: int = 0
+    incidents: int = 0
+
+
+class NoEntryBreakdownResponse(BaseModel):
+    per_zone: List[ZoneIncidents]
+    by_target: List[TargetCount]
+    dwell_histogram: List[HistogramBucket]
+
+
+class CameraBlockage(BaseModel):
+    stream_id: Optional[UUID] = None
+    camera_name: Optional[str] = None
+    episodes: int = 0
+    total_blocked_s: float = 0
+    avg_duration_s: Optional[float] = None
+    max_duration_s: Optional[float] = None
+    worst_accessibility_pct: Optional[float] = None
+    fully_blocked: int = 0
+
+
+class BlockingObjectCount(BaseModel):
+    object: str
+    episodes: int = 0
+
+
+class BlockedExitBreakdownResponse(BaseModel):
+    per_camera: List[CameraBlockage]
+    duration_histogram: List[HistogramBucket]
+    top_objects: List[BlockingObjectCount]

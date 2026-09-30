@@ -137,3 +137,61 @@ async def test_episode_evidence_and_charts(svc):
     assert audit["histogram"][-1]["count"] == 1          # 0.95 falls in 0.9-1.0
     assert [e["event_id"] for e in audit["per_event"]] == [event_id]
     assert other
+
+
+async def test_trend_heatmap_response_times_and_breakdown(svc):
+    service, ws, stream = svc
+    pool = service.db.pool
+    rows = [
+        # (hours ago, duration_s, peak_state, min_acc, objects, ack after s, resolve after s)
+        (30, 20, "partially_blocked", 60.0, ["chair"], 60, 600),
+        (29, 400, "blocked", 5.0, ["box", "chair"], 120, None),
+        (2, 45, "blocked", 0.0, ["box"], None, None),
+    ]
+    async with pool.acquire() as c:
+        for ago, dur, peak, acc, objs, ack, res in rows:
+            await c.execute(
+                """
+                INSERT INTO blocked_exit_events
+                    (workspace_id, stream_id, camera_name, event_timestamp, ended_at, duration_s, state,
+                     peak_state, min_accessibility_pct, blocking_objects, status, acknowledged_at, resolved_at)
+                VALUES ($1, $2, 'exit-1', NOW() - make_interval(hours => $3),
+                        NOW() - make_interval(hours => $3) + make_interval(secs => $4), $4, $5, $5, $6, $7,
+                        CASE WHEN $9::int IS NOT NULL THEN 'resolved' ELSE 'detected' END,
+                        NOW() - make_interval(hours => $3) + make_interval(secs => $8::int),
+                        NOW() - make_interval(hours => $3) + make_interval(secs => $9::int))
+                """,
+                ws, stream, ago, dur, peak, acc, objs, ack, res,
+            )
+
+    trend = await service.trend(ws)
+    assert trend["bucket"] == "hour"  # 28 h span, under the 2-day auto cutoff
+    assert sum(p["incidents"] for p in trend["points"]) == 3
+    assert sum(p["resolved"] for p in trend["points"]) == 1
+    assert len(trend["points"]) >= 28  # empty hours are filled in
+    daily = await service.trend(ws, bucket="day")
+    assert daily["bucket"] == "day" and sum(p["incidents"] for p in daily["points"]) == 3
+
+    cells = await service.heatmap(ws)
+    assert sum(c["incidents"] for c in cells) == 3
+    assert all(0 <= c["weekday"] <= 6 and 0 <= c["hour"] <= 23 for c in cells)
+
+    rt = await service.response_times(ws)
+    assert rt["summary"]["incidents"] == 3
+    assert rt["summary"]["acknowledged"] == 2 and rt["summary"]["resolved"] == 1 and rt["summary"]["open"] == 2
+    assert rt["summary"]["ack_median_s"] == pytest.approx(90, abs=1)
+    assert rt["summary"]["resolve_median_s"] == pytest.approx(600, abs=1)
+    assert rt["per_camera"][0]["camera_name"] == "exit-1"
+
+    b = await service.breakdown(ws)
+    cam = b["per_camera"][0]
+    assert cam["episodes"] == 3 and cam["fully_blocked"] == 2
+    assert cam["total_blocked_s"] == pytest.approx(465)
+    assert cam["worst_accessibility_pct"] == 0.0
+    assert [h["count"] for h in b["duration_histogram"]] == [1, 1, 0, 1, 0]
+    assert b["top_objects"][0] in ({"object": "box", "episodes": 2}, {"object": "chair", "episodes": 2})
+    assert {o["object"] for o in b["top_objects"]} == {"box", "chair"}
+
+    # Filters apply: an unknown area leaves every chart empty.
+    assert (await service.trend(ws, area="Nowhere"))["points"] == []
+    assert await service.heatmap(ws, area="Nowhere") == []

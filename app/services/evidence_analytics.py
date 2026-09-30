@@ -5,7 +5,7 @@ and filter it with ``video_stream vs`` joined in, so the per-camera incident cou
 the confidence audit are the same SQL over a different ``FROM`` clause.
 """
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 HISTOGRAM_BUCKETS = 10
 PER_EVENT_LIMIT = 200
@@ -144,3 +144,145 @@ async def confidence_audit(
         "histogram": histogram,
         "per_event": per_event,
     }
+
+
+TZ = "Africa/Cairo"
+TREND_BUCKETS = ("hour", "day")
+AUTO_HOURLY_SPAN_S = 2 * 86400
+
+
+async def trend(
+    db, *, from_sql: str, where: str, params: Sequence[Any], alias: str, incident_key: str,
+    bucket: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Incidents and resolved incidents per hour or day (local time), with empty buckets
+    filled in. ``bucket=None`` picks hourly for spans of two days or less, else daily."""
+    local = f"({alias}.event_timestamp AT TIME ZONE '{TZ}')"
+    if bucket not in TREND_BUCKETS:
+        span = await db.execute_query(
+            f"SELECT EXTRACT(EPOCH FROM MAX({alias}.event_timestamp) - MIN({alias}.event_timestamp))::float AS s "
+            f"FROM {from_sql} WHERE {where}",
+            tuple(params),
+            fetch_one=True,
+        ) or {}
+        seconds = span.get("s")
+        bucket = "hour" if seconds is not None and seconds <= AUTO_HOURLY_SPAN_S else "day"
+    rows = await db.execute_query(
+        f"""
+        WITH ev AS (
+            SELECT date_trunc('{bucket}', {local}) AS b, {incident_key} AS k, {alias}.status
+            FROM {from_sql}
+            WHERE {where}
+        ),
+        series AS (
+            SELECT generate_series(MIN(b), MAX(b), INTERVAL '1 {bucket}') AS b FROM ev
+        )
+        SELECT series.b                                                AS bucket_start,
+               COUNT(DISTINCT ev.k)                                    AS incidents,
+               COUNT(DISTINCT ev.k) FILTER (WHERE ev.status = 'resolved') AS resolved
+        FROM series LEFT JOIN ev ON ev.b = series.b
+        GROUP BY series.b
+        ORDER BY series.b
+        """,
+        tuple(params),
+        fetch_all=True,
+    ) or []
+    return {"bucket": bucket, "points": rows}
+
+
+async def heatmap(
+    db, *, from_sql: str, where: str, params: Sequence[Any], alias: str, incident_key: str,
+) -> List[Dict[str, Any]]:
+    """Incidents per weekday (0 = Sunday, like ``/blocked-exit/analytics/hourly``) and
+    local hour. Only non-empty cells are returned."""
+    local = f"({alias}.event_timestamp AT TIME ZONE '{TZ}')"
+    return await db.execute_query(
+        f"""
+        SELECT EXTRACT(DOW FROM {local})::int  AS weekday,
+               EXTRACT(HOUR FROM {local})::int AS hour,
+               COUNT(DISTINCT {incident_key})   AS incidents
+        FROM {from_sql}
+        WHERE {where}
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+        """,
+        tuple(params),
+        fetch_all=True,
+    ) or []
+
+
+_RESPONSE_FIELDS = """
+    COUNT(*)                                                               AS incidents,
+    COUNT(a)                                                               AS acknowledged,
+    COUNT(r)                                                               AS resolved,
+    COUNT(*) FILTER (WHERE r IS NULL)                                      AS open,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM a - t0)) AS ack_median_s,
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM a - t0)) AS ack_p90_s,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM r - t0)) AS resolve_median_s,
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM r - t0)) AS resolve_p90_s
+"""
+
+
+async def response_times(
+    db, *, from_sql: str, where: str, params: Sequence[Any], alias: str, incident_key: str,
+) -> Dict[str, Any]:
+    """How long operators take to acknowledge and resolve an incident, measured from its
+    first event. Median and 90th percentile, overall and per camera."""
+    incidents_cte = f"""
+        WITH inc AS (
+            SELECT {incident_key}                                     AS k,
+                   {alias}.stream_id,
+                   MAX(COALESCE(vs.name, {alias}.camera_name))        AS camera_name,
+                   MIN({alias}.event_timestamp)                       AS t0,
+                   MIN({alias}.acknowledged_at)                       AS a,
+                   MIN({alias}.resolved_at)                           AS r
+            FROM {from_sql}
+            WHERE {where}
+            GROUP BY {incident_key}, {alias}.stream_id
+        )
+    """
+    summary = await db.execute_query(
+        f"{incidents_cte} SELECT {_RESPONSE_FIELDS} FROM inc",
+        tuple(params),
+        fetch_one=True,
+    ) or {}
+    per_camera = await db.execute_query(
+        f"""{incidents_cte}
+        SELECT stream_id, MAX(camera_name) AS camera_name, {_RESPONSE_FIELDS}
+        FROM inc
+        GROUP BY stream_id
+        ORDER BY incidents DESC, camera_name
+        """,
+        tuple(params),
+        fetch_all=True,
+    ) or []
+    empty = {"incidents": 0, "acknowledged": 0, "resolved": 0, "open": 0}
+    return {"summary": {**empty, **{k: v for k, v in summary.items() if v is not None}}, "per_camera": per_camera}
+
+
+async def histogram(
+    db, *, from_sql: str, where: str, params: Sequence[Any], value_sql: str,
+    edges: Sequence[float],
+) -> List[Dict[str, Any]]:
+    """Count rows of ``value_sql`` into ``[edges[i], edges[i+1])`` buckets; the last
+    bucket is open-ended (``max`` is None)."""
+    rows = await db.execute_query(
+        f"""
+        SELECT width_bucket(({value_sql})::float, ARRAY[{', '.join(str(float(e)) for e in edges)}]::float[]) AS b,
+               COUNT(*) AS count
+        FROM {from_sql}
+        WHERE ({where}) AND ({value_sql}) IS NOT NULL
+        GROUP BY 1
+        """,
+        tuple(params),
+        fetch_all=True,
+    ) or []
+    counts = {r["b"]: r["count"] for r in rows}
+    return [
+        {
+            "min": float(edges[i]),
+            "max": float(edges[i + 1]) if i + 1 < len(edges) else None,
+            "count": counts.get(i + 1, 0),
+        }
+        for i in range(len(edges))
+    ]

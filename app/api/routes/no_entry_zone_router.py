@@ -53,6 +53,10 @@ from app.schemas.evidence_schema import (
     CameraPolygonResponse,
     ConfidenceAuditResponse,
     EvidenceVideoListResponse,
+    HeatmapCell,
+    ResponseTimesResponse,
+    TrendResponse,
+    NoEntryBreakdownResponse,
 )
 from app.schemas.no_entry_zone_schema import (
     NoEntryEventListResponse,
@@ -628,6 +632,75 @@ async def get_confidence_audit(
         logger.error(f"confidence_audit error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving the confidence audit.")
 
+
+
+@router.get("/analytics/trend", response_model=TrendResponse)
+async def nez_trend(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    bucket: Optional[Literal["hour", "day"]] = Query(None, description="hour or day; auto when omitted"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Incidents and resolved incidents per hour or day (local time). ``bucket`` defaults to hourly for spans of two days or less."""
+    workspace_id = await _workspace_with_role(current_user, None)
+    try:
+        return await no_entry_zone_service.trend(workspace_id, bucket=bucket, camera_id=camera_id, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"nez_trend error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the trend chart.")
+
+
+@router.get("/analytics/heatmap", response_model=List[HeatmapCell])
+async def nez_heatmap(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Incidents per weekday (0 = Sunday) and local hour; empty cells are omitted."""
+    workspace_id = await _workspace_with_role(current_user, None)
+    try:
+        return await no_entry_zone_service.heatmap(workspace_id, camera_id=camera_id, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"nez_heatmap error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the heatmap chart.")
+
+
+@router.get("/analytics/response-times", response_model=ResponseTimesResponse)
+async def nez_response_times(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Median / 90th-percentile time from an incident to its acknowledgement and resolution, overall and per camera."""
+    workspace_id = await _workspace_with_role(current_user, None)
+    try:
+        return await no_entry_zone_service.response_times(workspace_id, camera_id=camera_id, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"nez_response_times error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the response times chart.")
+
+
+@router.get("/analytics/breakdown", response_model=NoEntryBreakdownResponse)
+async def nez_breakdown(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Incidents per zone, dwell-time histogram and detected classes."""
+    workspace_id = await _workspace_with_role(current_user, None)
+    try:
+        return await no_entry_zone_service.breakdown(workspace_id, camera_id=camera_id, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"nez_breakdown error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the breakdown chart.")
 
 @router.get("/dashboard/active", response_model=List[ActiveNoEntryEventSummary])
 async def get_active_no_entry_dashboard(

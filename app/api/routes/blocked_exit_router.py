@@ -36,7 +36,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Response
 from fastapi.responses import RedirectResponse
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Literal, Optional
 
 from app.services.session_service import session_manager
 from app.services.feature_service import require_feature
@@ -54,6 +54,10 @@ from app.schemas.evidence_schema import (
     CameraPolygonResponse,
     ConfidenceAuditResponse,
     EvidenceVideoListResponse,
+    HeatmapCell,
+    ResponseTimesResponse,
+    TrendResponse,
+    BlockedExitBreakdownResponse,
 )
 from app.schemas.no_entry_zone_schema import EvidenceUrls
 
@@ -790,6 +794,75 @@ async def analytics_confidence_audit(
         logger.error(f"blocked-exit confidence_audit error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving the confidence audit.")
 
+
+
+@router.get("/analytics/trend", response_model=TrendResponse)
+async def blocked_exit_trend(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    bucket: Optional[Literal["hour", "day"]] = Query(None, description="hour or day; auto when omitted"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Incidents and resolved incidents per hour or day (local time). ``bucket`` defaults to hourly for spans of two days or less."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    try:
+        return await blocked_exit_service.trend(workspace_id, bucket=bucket, camera_id=str(camera_id) if camera_id else None, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"blocked_exit_trend error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the trend chart.")
+
+
+@router.get("/analytics/heatmap", response_model=List[HeatmapCell])
+async def blocked_exit_heatmap(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Incidents per weekday (0 = Sunday) and local hour; empty cells are omitted."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    try:
+        return await blocked_exit_service.heatmap(workspace_id, camera_id=str(camera_id) if camera_id else None, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"blocked_exit_heatmap error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the heatmap chart.")
+
+
+@router.get("/analytics/response-times", response_model=ResponseTimesResponse)
+async def blocked_exit_response_times(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Median / 90th-percentile time from an incident to its acknowledgement and resolution, overall and per camera."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    try:
+        return await blocked_exit_service.response_times(workspace_id, camera_id=str(camera_id) if camera_id else None, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"blocked_exit_response_times error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the response times chart.")
+
+
+@router.get("/analytics/breakdown", response_model=BlockedExitBreakdownResponse)
+async def blocked_exit_breakdown(
+    camera_id: Optional[UUID] = Query(None, description="Filter by stream/camera UUID"),
+    f: dict = Depends(_filters),
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Blocked time per camera, episode-duration histogram and most common blocking objects."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    try:
+        return await blocked_exit_service.breakdown(workspace_id, camera_id=str(camera_id) if camera_id else None, **f)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"blocked_exit_breakdown error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving the breakdown chart.")
 
 @router.get("/analytics/timeline/{stream_id}", response_model=List[BlockedExitTimelineEntry])
 async def analytics_timeline(

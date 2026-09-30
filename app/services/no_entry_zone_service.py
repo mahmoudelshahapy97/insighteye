@@ -570,6 +570,67 @@ class NoEntryZoneService:
     # Cameras
     # =========================================================
 
+
+    _NEZ_INCIDENT = "COALESCE(ne.incident_id::text, 'event-' || ne.event_id)"
+    NEZ_DWELL_EDGES = (0, 5, 10, 30, 60, 120)
+
+    def _chart_args(self, workspace_id: UUID, filters: Dict[str, Any]) -> Dict[str, Any]:
+        conditions, params, _ = self._build_event_conditions(workspace_id, **filters)
+        return {"from_sql": self._CHART_FROM, "where": " AND ".join(conditions), "params": params}
+
+    async def trend(self, workspace_id: UUID, bucket: Optional[str] = None, **filters) -> Dict[str, Any]:
+        return await evidence_analytics.trend(
+            self.db, **self._chart_args(workspace_id, filters), alias="ne",
+            incident_key=self._NEZ_INCIDENT, bucket=bucket,
+        )
+
+    async def heatmap(self, workspace_id: UUID, **filters) -> List[Dict[str, Any]]:
+        return await evidence_analytics.heatmap(
+            self.db, **self._chart_args(workspace_id, filters), alias="ne", incident_key=self._NEZ_INCIDENT,
+        )
+
+    async def response_times(self, workspace_id: UUID, **filters) -> Dict[str, Any]:
+        return await evidence_analytics.response_times(
+            self.db, **self._chart_args(workspace_id, filters), alias="ne", incident_key=self._NEZ_INCIDENT,
+        )
+
+    async def breakdown(self, workspace_id: UUID, **filters) -> Dict[str, Any]:
+        """Incidents per zone, how long intruders stayed, and what was detected."""
+        args = self._chart_args(workspace_id, filters)
+        from_sql, where, params = args["from_sql"], args["where"], tuple(args["params"])
+        per_zone = await self.db.execute_query(
+            f"""
+            SELECT COALESCE(ne.zone_name, 'Unnamed zone')          AS zone_name,
+                   COUNT(DISTINCT {self._NEZ_INCIDENT})            AS incidents,
+                   COUNT(*)                                        AS events,
+                   AVG(ne.dwell_seconds)::float                    AS avg_dwell_s,
+                   MAX(ne.dwell_seconds)::float                    AS max_dwell_s
+            FROM {from_sql}
+            WHERE {where}
+            GROUP BY 1
+            ORDER BY incidents DESC, events DESC, zone_name
+            """,
+            params,
+            fetch_all=True,
+        ) or []
+        by_target = await self.db.execute_query(
+            f"""
+            SELECT COALESCE(ne.target_class, 'unknown') AS target_class,
+                   COUNT(*)                             AS events,
+                   COUNT(DISTINCT {self._NEZ_INCIDENT}) AS incidents
+            FROM {from_sql}
+            WHERE {where}
+            GROUP BY 1
+            ORDER BY events DESC, target_class
+            """,
+            params,
+            fetch_all=True,
+        ) or []
+        dwell = await evidence_analytics.histogram(
+            self.db, **args, value_sql="ne.dwell_seconds", edges=self.NEZ_DWELL_EDGES,
+        )
+        return {"per_zone": per_zone, "by_target": by_target, "dwell_histogram": dwell}
+
     async def list_cameras(
         self, workspace_id: UUID, *, enabled_only: bool = True, stream_id: Optional[UUID] = None,
     ) -> List[Dict[str, Any]]:

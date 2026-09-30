@@ -313,3 +313,29 @@ async def test_chart_endpoints(client, mocker):
     assert r1.status_code == r2.status_code == 200, r2.text
     assert per_cam.await_args.kwargs["camera_id"] == str(cam)
     assert audit.await_args.kwargs["floor_level"] == "1"
+
+
+async def test_extra_chart_endpoints(client, mocker):
+    trend = mocker.patch.object(mod.blocked_exit_service, "trend", mocker.AsyncMock(
+        return_value={"bucket": "hour", "points": []}))
+    heat = mocker.patch.object(mod.blocked_exit_service, "heatmap", mocker.AsyncMock(return_value=[]))
+    resp = mocker.patch.object(mod.blocked_exit_service, "response_times", mocker.AsyncMock(return_value={
+        "summary": {"incidents": 0}, "per_camera": [],
+    }))
+    brk = mocker.patch.object(mod.blocked_exit_service, "breakdown", mocker.AsyncMock(return_value={
+        "per_camera": [{"camera_name": "exit-1", "episodes": 3, "total_blocked_s": 465, "fully_blocked": 2}],
+        "duration_histogram": [{"min": 0, "max": 30, "count": 1}],
+        "top_objects": [{"object": "box", "episodes": 2}],
+    }))
+    cam = uuid4()
+    async with client as c:
+        r1 = await c.get("/blocked-exit/analytics/trend", params={"camera_id": str(cam)})
+        r2 = await c.get("/blocked-exit/analytics/heatmap", params={"building": "B1"})
+        r3 = await c.get("/blocked-exit/analytics/response-times", params={"end_date": "2026-09-30"})
+        r4 = await c.get("/blocked-exit/analytics/breakdown", params={"floor_level": "1"})
+    assert [r.status_code for r in (r1, r2, r3, r4)] == [200] * 4, r4.text
+    assert trend.await_args.kwargs["camera_id"] == str(cam) and trend.await_args.kwargs["bucket"] is None
+    assert heat.await_args.kwargs["building"] == "B1"
+    assert resp.await_args.kwargs["end_date"] == "2026-09-30"
+    assert brk.await_args.kwargs["floor_level"] == "1"
+    assert r4.json()["per_camera"][0]["fully_blocked"] == 2

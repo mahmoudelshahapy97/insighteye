@@ -318,3 +318,34 @@ async def test_chart_endpoints_pass_filters(admin, mocker):
     assert r2.status_code == 200, r2.text
     assert per_cam.await_args.kwargs["area"] == "North"
     assert audit.await_args.kwargs["end_date"] == "2026-09-30"
+
+
+async def test_extra_chart_endpoints(admin, mocker):
+    trend = mocker.patch.object(mod.no_entry_zone_service, "trend", mocker.AsyncMock(return_value={
+        "bucket": "day", "points": [{"bucket_start": "2026-09-30T00:00:00", "incidents": 2, "resolved": 1}],
+    }))
+    heat = mocker.patch.object(mod.no_entry_zone_service, "heatmap", mocker.AsyncMock(
+        return_value=[{"weekday": 3, "hour": 7, "incidents": 2}]))
+    resp = mocker.patch.object(mod.no_entry_zone_service, "response_times", mocker.AsyncMock(return_value={
+        "summary": {"incidents": 2, "open": 2}, "per_camera": [],
+    }))
+    brk = mocker.patch.object(mod.no_entry_zone_service, "breakdown", mocker.AsyncMock(return_value={
+        "per_zone": [{"zone_name": "Default", "incidents": 2, "events": 411, "avg_dwell_s": 10.5}],
+        "by_target": [{"target_class": "person", "events": 411, "incidents": 2}],
+        "dwell_histogram": [{"min": 0, "max": 5, "count": 68}, {"min": 120, "max": None, "count": 0}],
+    }))
+    async with admin as c:
+        r1 = await c.get("/no-entry-zone/analytics/trend", params={"bucket": "day", "zone": "Zone 1"})
+        r2 = await c.get("/no-entry-zone/analytics/heatmap", params={"location": "Cairo,Giza"})
+        r3 = await c.get("/no-entry-zone/analytics/response-times", params={"start_time": "08:00"})
+        r4 = await c.get("/no-entry-zone/analytics/breakdown", params={"area": "North"})
+        bad = await c.get("/no-entry-zone/analytics/trend", params={"bucket": "week"})
+    assert [r.status_code for r in (r1, r2, r3, r4)] == [200] * 4, r4.text
+    assert r1.json()["points"][0]["incidents"] == 2
+    assert trend.await_args.kwargs["bucket"] == "day" and trend.await_args.kwargs["zone"] == "Zone 1"
+    assert heat.await_args.kwargs["location"] == "Cairo,Giza"
+    assert resp.await_args.kwargs["start_time"] == "08:00"
+    assert r3.json()["summary"]["ack_median_s"] is None
+    assert brk.await_args.kwargs["area"] == "North"
+    assert r4.json()["dwell_histogram"][-1]["max"] is None
+    assert bad.status_code == 422
