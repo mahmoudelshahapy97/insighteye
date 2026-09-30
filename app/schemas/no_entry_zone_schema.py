@@ -191,8 +191,10 @@ class NoEntryCamera(BaseModel):
     stream_id: UUID
     name: str
     location: Optional[str] = None
+    area: Optional[str] = None
     building: Optional[str] = None
     floor_level: Optional[str] = None
+    zone: Optional[str] = None  # the camera's location zone (hierarchy), not a no-entry zone
     status: Optional[str] = None
     is_streaming: bool = False
     is_no_entry_zone_camera: bool = False

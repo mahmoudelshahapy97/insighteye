@@ -577,7 +577,7 @@ class NoEntryZoneService:
         with credentials) for server-side use only — the router strips it."""
         return await self.db.execute_query(
             """
-            SELECT vs.stream_id, vs.name, vs.location, vs.building, vs.floor_level,
+            SELECT vs.stream_id, vs.name, vs.location, vs.area, vs.building, vs.floor_level, vs.zone,
                    vs.status, vs.is_streaming, vs.is_no_entry_zone_camera,
                    vs.type, vs.path, vs.last_activity, vs.stop_reason, vs.retry_count,
                    vs.auto_retry_enabled, vs.locked_by_server,

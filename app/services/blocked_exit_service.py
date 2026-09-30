@@ -467,7 +467,7 @@ class BlockedExitService:
         rows = await self.db.execute_query(
             f"""
             SELECT vs.stream_id, vs.name AS camera_name, vs.location AS camera_location,
-                   vs.building, vs.floor_level, vs.zone, vs.type, vs.status AS stream_status,
+                   vs.area AS camera_area, vs.building, vs.floor_level, vs.zone, vs.type, vs.status AS stream_status,
                    vs.is_streaming, vs.is_blocked_exit_camera, vs.last_activity, vs.stop_reason,
                    vs.retry_count, vs.auto_retry_enabled, vs.locked_by_server,
                    s.config_id, COALESCE(s.is_calibrated, FALSE) AS is_calibrated,

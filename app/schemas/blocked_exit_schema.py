@@ -241,6 +241,7 @@ class BlockedExitCamera(BaseModel):
     stream_id: UUID
     camera_name: Optional[str] = None
     camera_location: Optional[str] = None
+    camera_area: Optional[str] = None
     building: Optional[str] = None
     floor_level: Optional[str] = None
     zone: Optional[str] = None
