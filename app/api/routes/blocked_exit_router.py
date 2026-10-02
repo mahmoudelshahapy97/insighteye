@@ -137,6 +137,11 @@ async def _sign(path: Optional[str]) -> Optional[str]:
     return await s3_service.get_presigned_url(path, expiration=EVIDENCE_URL_TTL)
 
 
+async def _with_video_url(event: Dict) -> Dict:
+    """Like shoplifting: ``video_path`` becomes a presigned URL, falling back to the clip."""
+    return {**event, "video_path": await _sign(event.get("video_path") or event.get("clip_path"))}
+
+
 def _hot_reload(stream_id: UUID, cfg: Optional[Dict[str, Any]]) -> None:
     try:
         from app.services.blocked_exit_inference import blocked_exit_engine
@@ -213,6 +218,7 @@ async def get_blocked_exit_events(
         total = await blocked_exit_service.count_events(
             workspace_id=workspace_id, status=status_filter, **extra, **f,
         )
+        events = [await _with_video_url(ev) for ev in events]
         return BlockedExitEventListResponse(items=events, total=total, limit=limit, offset=offset)
     except HTTPException:
         raise
@@ -238,7 +244,7 @@ async def get_blocked_exit_event(
             url = await s3_service.get_presigned_url(path)
             if url and url.startswith("http"):
                 urls.append(url)
-    return {**event, "snapshot_urls": urls}
+    return {**(await _with_video_url(event)), "snapshot_urls": urls}
 
 
 @router.get("/events/{event_id}/evidence", response_model=BlockedExitEvidenceUrls)

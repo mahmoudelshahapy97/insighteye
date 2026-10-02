@@ -470,6 +470,7 @@ async def list_incidents(
             workspace_id, status=status_filter, limit=limit, offset=offset, **kw,
         )
         total = await no_entry_zone_service.count_incidents(workspace_id, status=status_filter, **kw)
+        items = [{**it, "video_path": await _sign(it.get("clip_path"))} for it in items]
         return NoEntryIncidentListResponse(items=items, total=total, limit=limit, offset=offset, page=page)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

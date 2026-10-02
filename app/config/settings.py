@@ -231,7 +231,7 @@ class Settings(BaseSettings):
     pt_gender_model_path: str = "models/gender.pt"
     pt_fire_model_path: str = "models/fire.pt"
     pt_shoplifting_model_path: str = "models/shoplifting.pt"
-    pt_blocked_exit_model_path: str = "models/yolo11n-seg.pt"
+    pt_blocked_exit_model_path: str = "models/yolo26n-seg.pt"
     pt_no_entry_zone_model_path: str = "models/yolo26n.pt"
 
     # ONNX Model Paths
@@ -239,7 +239,7 @@ class Settings(BaseSettings):
     onnx_gender_model_path: str = "models/gender.onnx"
     onnx_fire_model_path: str = "models/fire.onnx"
     onnx_shoplifting_model_path: str = "models/shoplifting.onnx"
-    onnx_blocked_exit_model_path: str = "models/yolo11n-seg.onnx"
+    onnx_blocked_exit_model_path: str = "models/yolo26n-seg.onnx"
     onnx_no_entry_zone_model_path: str = "models/yolo26n.onnx"
 
     # OpenVINO Model Paths
@@ -247,7 +247,7 @@ class Settings(BaseSettings):
     openvino_gender_model_path: str = "models/gender_openvino"
     openvino_fire_model_path: str = "models/fire_openvino"
     openvino_shoplifting_model_path: str = "models/shoplifting_openvino"
-    openvino_blocked_exit_model_path: str = "models/yolo11n-seg_openvino"
+    openvino_blocked_exit_model_path: str = "models/yolo26n-seg_openvino"
     openvino_no_entry_zone_model_path: str = "models/yolo26n_openvino"
 
     # TensorRT Model Paths
@@ -255,7 +255,7 @@ class Settings(BaseSettings):
     tensorrt_gender_model_path: str = "models/gender.engine"
     tensorrt_fire_model_path: str = "models/fire.engine"
     tensorrt_shoplifting_model_path: str = "models/shoplifting.engine"
-    tensorrt_blocked_exit_model_path: str = "models/yolo11n-seg.engine"
+    tensorrt_blocked_exit_model_path: str = "models/yolo26n-seg.engine"
     tensorrt_no_entry_zone_model_path: str = "models/yolo26n.engine"
 
     # Pose Model (for temporal sequence extraction)

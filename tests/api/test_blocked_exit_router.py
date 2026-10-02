@@ -339,3 +339,25 @@ async def test_extra_chart_endpoints(client, mocker):
     assert resp.await_args.kwargs["end_date"] == "2026-09-30"
     assert brk.await_args.kwargs["floor_level"] == "1"
     assert r4.json()["per_camera"][0]["fully_blocked"] == 2
+
+
+async def test_events_presign_video_path_like_shoplifting(client, mocker):
+    from app.services import s3_service as s3mod
+    base = {"event_timestamp": "2026-09-01T10:00:00Z", "status": "detected", "state": "blocked"}
+    events = [
+        {**base, "event_id": 1, "video_path": "s3://b/v.mp4", "clip_path": "s3://b/c.mp4"},
+        {**base, "event_id": 2, "video_path": None, "clip_path": "s3://b/c.mp4"},
+        {**base, "event_id": 3, "video_path": None, "clip_path": None},
+    ]
+    mocker.patch.object(mod.blocked_exit_service, "get_events", mocker.AsyncMock(return_value=events))
+    mocker.patch.object(mod.blocked_exit_service, "count_events", mocker.AsyncMock(return_value=3))
+    mocker.patch.object(mod.blocked_exit_service, "get_event", mocker.AsyncMock(return_value=events[0]))
+    mocker.patch.object(s3mod.s3_service, "get_presigned_url",
+                        mocker.AsyncMock(side_effect=lambda p, expiration=3600: f"https://signed/{p[-5:]}"))
+    async with client as c:
+        listed = await c.get("/blocked-exit/events")
+        detail = await c.get("/blocked-exit/events/1")
+    assert listed.status_code == 200, listed.text
+    assert [i["video_path"] for i in listed.json()["items"]] == ["https://signed/v.mp4", "https://signed/c.mp4", None]
+    assert listed.json()["items"][0]["clip_path"] == "s3://b/c.mp4"
+    assert detail.json()["video_path"] == "https://signed/v.mp4"

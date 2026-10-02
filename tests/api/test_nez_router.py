@@ -349,3 +349,22 @@ async def test_extra_chart_endpoints(admin, mocker):
     assert brk.await_args.kwargs["area"] == "North"
     assert r4.json()["dwell_histogram"][-1]["max"] is None
     assert bad.status_code == 422
+
+
+async def test_incidents_sign_clip_into_video_path(admin, mocker):
+    from app.services import s3_service as s3mod
+    base = {"started_at": "2026-09-30T04:25:40Z", "last_seen_at": "2026-09-30T04:42:40Z",
+            "is_ongoing": False, "event_count": 3, "status": "detected", "snapshot_path": None}
+    mocker.patch.object(mod.no_entry_zone_service, "list_incidents", mocker.AsyncMock(return_value=[
+        {**base, "incident_id": str(uuid4()), "event_id": 1, "clip_path": "s3://b/clips/1.mp4"},
+        {**base, "incident_id": str(uuid4()), "event_id": 2, "clip_path": None},
+    ]))
+    mocker.patch.object(mod.no_entry_zone_service, "count_incidents", mocker.AsyncMock(return_value=2))
+    sign = mocker.patch.object(s3mod.s3_service, "get_presigned_url", mocker.AsyncMock(return_value="https://signed"))
+    async with admin as c:
+        r = await c.get("/no-entry-zone/incidents")
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert items[0]["video_path"] == "https://signed" and items[0]["clip_path"] == "s3://b/clips/1.mp4"
+    assert items[1]["video_path"] is None
+    sign.assert_awaited_once()

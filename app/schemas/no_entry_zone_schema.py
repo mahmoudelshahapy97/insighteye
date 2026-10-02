@@ -75,6 +75,7 @@ class NoEntryIncidentResponse(BaseModel):
     status: EventStatus
     snapshot_path: Optional[str] = None
     clip_path: Optional[str] = None
+    video_path: Optional[str] = Field(None, description="Presigned HTTPS URL for clip_path")
 
 
 class NoEntryIncidentListResponse(BaseModel):
