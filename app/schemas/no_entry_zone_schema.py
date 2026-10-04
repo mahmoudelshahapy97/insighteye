@@ -28,6 +28,7 @@ class NoEntryEventBase(BaseModel):
     description: Optional[str] = None
     snapshot_path: Optional[str] = None
     clip_path: Optional[str] = None
+    video_path: Optional[str] = Field(None, description="Presigned HTTPS URL for clip_path")
     evidence_paths: Optional[List[str]] = None
     camera_location: Optional[str] = None
     camera_area: Optional[str] = None

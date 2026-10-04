@@ -145,6 +145,11 @@ async def _sign(path: Optional[str]) -> Optional[str]:
     return await s3_service.get_presigned_url(path, expiration=EVIDENCE_URL_TTL)
 
 
+async def _with_video_url(event: Dict) -> Dict:
+    """Like blocked exit: ``video_path`` is a presigned URL of the clip."""
+    return {**event, "video_path": await _sign(event.get("clip_path"))}
+
+
 async def _refresh_engine(stream_id) -> None:
     """Push a camera's zones into the in-process engine (applied on its next frame).
     Streams in other processes pick the change up on their periodic zone refresh."""
@@ -470,7 +475,7 @@ async def list_incidents(
             workspace_id, status=status_filter, limit=limit, offset=offset, **kw,
         )
         total = await no_entry_zone_service.count_incidents(workspace_id, status=status_filter, **kw)
-        items = [{**it, "video_path": await _sign(it.get("clip_path"))} for it in items]
+        items = [await _with_video_url(it) for it in items]
         return NoEntryIncidentListResponse(items=items, total=total, limit=limit, offset=offset, page=page)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -522,6 +527,7 @@ async def get_no_entry_events(
         )
         events = await no_entry_zone_service.get_events(workspace_id, limit=limit, offset=offset, **kw)
         total = await no_entry_zone_service.count_events(workspace_id, **kw)
+        events = [await _with_video_url(ev) for ev in events]
         return NoEntryEventListResponse(items=events, total=total, limit=limit, offset=offset, page=page)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -539,7 +545,7 @@ async def get_no_entry_event(
     event = await no_entry_zone_service.get_event(event_id, workspace_id)
     if not event:
         raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
-    return event
+    return await _with_video_url(event)
 
 
 @router.get("/events/{event_id}/evidence", response_model=EvidenceUrls)
