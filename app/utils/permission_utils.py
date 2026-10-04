@@ -6,6 +6,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# System roles (users.role) are hierarchical: user < admin < superadmin.
+# A superadmin must pass every system-admin check; comparing against the
+# literal "admin" alone locks superadmins out.
+#
+# Do NOT use this for workspace membership roles (workspace_members.role:
+# owner/admin/member). That is a separate namespace that happens to also
+# contain the string "admin".
+SYSTEM_ADMIN_ROLES = ("admin", "superadmin")
+
+
+def is_system_admin_role(role: Optional[str]) -> bool:
+    """True if a *system* role (users.role) carries admin privileges."""
+    return role in SYSTEM_ADMIN_ROLES
+
+
 async def check_workspace_access(
     db_manager,
     user_id: UUID,
@@ -21,16 +36,16 @@ async def check_workspace_access(
         user_id: User UUID
         workspace_id: Workspace UUID
         required_role: Required workspace role (member/admin/owner)
-        system_role: User's system role (user/admin)
-        
+        system_role: User's system role (user/admin/superadmin)
+
     Returns:
         Dict with user's workspace role
-        
+
     Raises:
         HTTPException: If access denied
     """
-    # System admins bypass checks
-    if system_role == "admin":
+    # System admins (including superadmins) bypass checks
+    if is_system_admin_role(system_role):
         return {"role": "admin", "system_override": True}
     
     # Check membership

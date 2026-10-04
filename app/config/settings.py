@@ -1,7 +1,7 @@
 # app/config/settings.py
-from typing import List, Optional, Literal
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from typing import Annotated, List, Optional, Literal
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic import Field, field_validator
 from dotenv import load_dotenv
 import uuid
 import platform
@@ -72,8 +72,10 @@ class Settings(BaseSettings):
     app_description: str = "Insighteye API with various ML capabilities"
     app_version: str = "1.0.0"
     app_api_prefix: str = "/api/v2"
-    app_debug: bool = True
-    app_reload: bool = True
+    # Currently read by nothing. Defaulted off so that wiring them up later
+    # (e.g. FastAPI(debug=config.app_debug)) cannot enable debug in production.
+    app_debug: bool = False
+    app_reload: bool = False
     app_host: str = "127.0.0.1"
     app_port: int = 8000
     app_log_level: str = "info"
@@ -92,21 +94,28 @@ class Settings(BaseSettings):
     # =============================================================================
     # CORS & HOSTS
     # =============================================================================
+    # A CORS origin must be scheme://host[:port]. Bare hosts such as "localhost" or
+    # "13.61.228.251" can never match a browser Origin header, so they are dropped
+    # by the validator below rather than silently doing nothing.
     cors_origins: List[str] = [
-        "13.61.228.251",
+        "https://te-s.xyz",
         "http://13.61.228.251",
         "http://localhost:8000",
         "http://localhost:3000",
-        "localhost",
     ]
 
-    allow_origins: List[str] = [
-        "13.61.228.251",
-        "http://13.61.228.251",
-        "http://localhost:8000",
-        "http://localhost:3000",
-        "localhost",
-    ]
+    @field_validator("cors_origins", mode="after")
+    @classmethod
+    def _drop_invalid_origins(cls, v: List[str]) -> List[str]:
+        valid = [o for o in v if "://" in o]
+        dropped = [o for o in v if "://" not in o]
+        if dropped:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Ignoring CORS origins without a scheme (they can never match an "
+                "Origin header): %s", ", ".join(dropped)
+            )
+        return valid
 
     trusted_hosts: List[str] = [
         "127.0.0.1",
@@ -116,7 +125,26 @@ class Settings(BaseSettings):
     cors_allow_credentials: bool = True
     cors_allow_methods: List[str] = ["GET", "POST", "PUT", "DELETE"]
     cors_allow_headers: List[str] = ["Content-Type", "Authorization", "X-Request-ID"]
-    cors_expose_headers: str = "X-Request-ID"
+    # Must be a sequence: Starlette does ", ".join(expose_headers), so a plain str
+    # would be joined character by character ("X, -, R, e, q, ...").
+    # NoDecode: pydantic-settings JSON-decodes complex types in the env source before
+    # field validators run. This field has historically been a bare string in .env
+    # ("X-Request-ID"), so parsing is handed to the validator below instead.
+    cors_expose_headers: Annotated[List[str], NoDecode] = ["X-Request-ID"]
+
+    @field_validator("cors_expose_headers", mode="before")
+    @classmethod
+    def _split_expose_headers(cls, v):
+        """Accept a JSON array, or a plain/comma-separated string, from .env."""
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            if v.startswith("["):
+                import json
+                return json.loads(v)
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
 
     force_hsts: bool = False
 
@@ -203,24 +231,32 @@ class Settings(BaseSettings):
     pt_gender_model_path: str = "models/gender.pt"
     pt_fire_model_path: str = "models/fire.pt"
     pt_shoplifting_model_path: str = "models/shoplifting.pt"
+    pt_blocked_exit_model_path: str = "models/yolo26n-seg.pt"
+    pt_no_entry_zone_model_path: str = "models/yolo26n.pt"
 
     # ONNX Model Paths
     onnx_people_model_path: str = "models/people.onnx"
     onnx_gender_model_path: str = "models/gender.onnx"
-    onnx_fire_model_path: str = "models/fire.onnx" 
+    onnx_fire_model_path: str = "models/fire.onnx"
     onnx_shoplifting_model_path: str = "models/shoplifting.onnx"
+    onnx_blocked_exit_model_path: str = "models/yolo26n-seg.onnx"
+    onnx_no_entry_zone_model_path: str = "models/yolo26n.onnx"
 
     # OpenVINO Model Paths
     openvino_people_model_path: str = "models/people_openvino"
     openvino_gender_model_path: str = "models/gender_openvino"
     openvino_fire_model_path: str = "models/fire_openvino"
     openvino_shoplifting_model_path: str = "models/shoplifting_openvino"
+    openvino_blocked_exit_model_path: str = "models/yolo26n-seg_openvino"
+    openvino_no_entry_zone_model_path: str = "models/yolo26n_openvino"
 
     # TensorRT Model Paths
     tensorrt_people_model_path: str = "models/people.engine"
     tensorrt_gender_model_path: str = "models/gender.engine"
     tensorrt_fire_model_path: str = "models/fire.engine"
     tensorrt_shoplifting_model_path: str = "models/shoplifting.engine"
+    tensorrt_blocked_exit_model_path: str = "models/yolo26n-seg.engine"
+    tensorrt_no_entry_zone_model_path: str = "models/yolo26n.engine"
 
     # Pose Model (for temporal sequence extraction)
     pt_pose_model_path: str = "models/yolo26m-pose.pt"
@@ -270,6 +306,26 @@ class Settings(BaseSettings):
         elif self.model_backend == "tensorrt":
             return self.tensorrt_shoplifting_model_path
         return self.pt_shoplifting_model_path
+
+    @property
+    def blocked_exit_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_blocked_exit_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_blocked_exit_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_blocked_exit_model_path
+        return self.pt_blocked_exit_model_path
+
+    @property
+    def no_entry_zone_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_no_entry_zone_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_no_entry_zone_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_no_entry_zone_model_path
+        return self.pt_no_entry_zone_model_path
 
     model_cache_dir: str = "./model_cache"
     model_device: Literal["cpu", "cuda"] = "cuda"
@@ -352,7 +408,9 @@ class Settings(BaseSettings):
     rtsp_reconnect_attempts: int = 10
     rtsp_buffer_size: int = 1
     max_reconnect_attempts: int = 5
-    min_reconnect_interval: float = 3.0
+    # 2.0, not 3.0: a second, unannotated `min_reconnect_interval = 2.0` further down
+    # used to shadow this one. Consolidated here keeping the value that was in effect.
+    min_reconnect_interval: float = 2.0
     
     # Frame processing
     target_fps: float = 15.0
@@ -372,8 +430,6 @@ class Settings(BaseSettings):
     
     # Transport settings
     prefer_tcp: bool = True
-    min_reconnect_interval = 2.0
-    use_hw_accel: bool = False
 
     # =============================================================================
     # GPU / HARDWARE ACCELERATION
@@ -399,6 +455,42 @@ class Settings(BaseSettings):
     gender_confidence: float = 0.5
     fire_confidence: float = 0.5
     shoplifting_confidence: float = 0.5
+    blocked_exit_confidence: float = 0.4
+    blocked_exit_clip_pre_seconds: float = 3.0       # evidence clip: seconds before the episode opens
+    blocked_exit_clip_post_seconds: float = 5.0      # ...and after
+    no_entry_zone_confidence: float = 0.4
+
+    # No-entry-zone violation rules (ported from features/no-entry-zone). Each zone
+    # may override consecutive_frames / min_dwell / cooldown / anchor; these are the
+    # defaults. See app/services/nez/zone_logic.py for what each rule suppresses.
+    no_entry_zone_consecutive_frames: int = 3        # frames inside before alerting
+    no_entry_zone_cooldown_seconds: float = 45.0     # per-track re-alert cooldown
+    no_entry_zone_dedup_radius_frac: float = 0.06    # neighbour suppression, fraction of frame diagonal
+    no_entry_zone_incident_gap_seconds: float = 15.0 # zone empty this long -> next alert is a new incident
+    no_entry_zone_track_ttl_seconds: float = 3.0     # drop tracks unseen this long (closes their event)
+    no_entry_zone_anchor: str = "bottom_center"      # bottom_center | center
+    no_entry_zone_timezone: str = "Africa/Cairo"     # zone schedules are evaluated in this zone
+    no_entry_zone_clip_pre_seconds: float = 3.0
+    no_entry_zone_clip_post_seconds: float = 4.0
+    no_entry_zone_zone_refresh_seconds: float = 10.0 # re-read camera flag + zones while streaming
+
+    # Standard 80-class COCO label list, index == class_id, used to translate
+    # the ModelFactory loaders' bare class_id detections into readable labels
+    # for blocked-exit/no-entry-zone risk scoring and target-class matching.
+    coco_class_names: List[str] = [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+        "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+        "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+        "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+        "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+        "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+        "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+        "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+        "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+        "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+        "toothbrush",
+    ]
     people_device: Literal["cpu", "cuda"] = "cpu"
 
     enable_batch_inference: bool = True

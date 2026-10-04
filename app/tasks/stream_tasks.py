@@ -77,7 +77,7 @@ def start_all_workspace_streams_task(
                 FROM video_stream vs
                 JOIN users u ON vs.user_id = u.user_id
                 WHERE vs.workspace_id = $1 AND vs.is_streaming = FALSE
-                    AND u.is_active = TRUE AND (u.is_subscribed = TRUE OR u.role = 'admin')
+                    AND u.is_active = TRUE AND (u.is_subscribed = TRUE OR u.role IN ('admin', 'superadmin'))
                 ORDER BY vs.created_at ASC
             """
             

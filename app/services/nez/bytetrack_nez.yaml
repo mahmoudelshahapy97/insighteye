@@ -1,0 +1,33 @@
+# ByteTrack tuned for restricted-zone monitoring.
+#
+# The stock profile is tuned for benchmark footage: short occlusions, few objects. A
+# fixed security camera watching a busy area is the opposite, and every identity switch
+# there costs us an alert — a re-acquired person arrives as a new track id with no
+# history, so the per-track cooldown cannot see that we already alerted on them.
+#
+# Widening the buffer and loosening the second association pass keeps identities alive
+# across the occlusions that a crowd produces. The spatial dedup rule in
+# app/services/nez/zone_logic.py catches whatever still slips through.
+
+tracker_type: bytetrack
+
+# Lost tracks are kept for track_buffer * frame_rate/30 processed frames. The zone logic
+# closes events on its own TTL, so this only decides whether a re-found person keeps their id.
+track_buffer: 90
+
+# First association: high-confidence boxes. Kept strict — this is the one that must not
+# hand an identity to the wrong person.
+track_high_thresh: 0.5
+match_thresh: 0.85
+
+# Second association: the low-confidence leftovers, which is exactly what a partly
+# occluded person looks like. Lower threshold so those are re-attached to an existing
+# track instead of starting a new one.
+track_low_thresh: 0.1
+
+# Deliberately below track_high_thresh: a track may be *started* from a weaker box once
+# the first pass has had its pick, which avoids a person entering the frame at an
+# awkward angle being dropped and then re-detected as somebody new.
+new_track_thresh: 0.45
+
+fuse_score: true

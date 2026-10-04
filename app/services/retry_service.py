@@ -178,7 +178,7 @@ class CameraRetryService:
               AND vs.next_retry_at <= NOW()
               AND u.is_active = TRUE
               AND w.is_active = TRUE
-              AND (u.is_subscribed = TRUE OR u.role = 'admin')
+              AND (u.is_subscribed = TRUE OR u.role IN ('admin', 'superadmin'))
             ORDER BY vs.next_retry_at ASC, vs.retry_count ASC
         """
         

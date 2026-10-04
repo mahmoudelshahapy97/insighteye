@@ -5,6 +5,10 @@ from decimal import Decimal
 from datetime import datetime
 from uuid import UUID
 
+# Fixed set of detection model tags a camera can be assigned. Keep this in sync
+# with cameraModelTypesArr in the frontend's StaticVariables.js.
+DETECTION_MODEL_TYPES = ['fire_smoke', 'shoplifting', 'people_counting', 'blocked_exit', 'no_entry_zone']
+
 class StreamQueryParams(BaseModel):
     frame_delay: Optional[float] = 0
     frame_skip: Optional[int] = 300
@@ -32,14 +36,31 @@ class StreamCreate(BaseModel):
     count_threshold_less: Optional[int] = Field(None, ge=0)
     alert_enabled: bool = Field(default=True)
     is_shoplifting_camera: bool = Field(default=False)
+    is_blocked_exit_camera: bool = Field(default=False)
+    is_no_entry_zone_camera: bool = Field(default=False)
+    is_people_counting_camera: bool = Field(default=False)
+    detection_models: Optional[List[str]] = Field(default=None)
+
+    @validator('detection_models')
+    def validate_detection_models(cls, v):
+        if v is None:
+            return v
+        invalid = [m for m in v if m not in DETECTION_MODEL_TYPES]
+        if invalid:
+            raise ValueError(f"Invalid detection model(s): {invalid}. Must be one of: {DETECTION_MODEL_TYPES}")
+        return v
 
 class StreamUpdate(BaseModel):
+    # Every field except id must default to None: the update paths only write
+    # fields that are not None, so a non-None default would silently overwrite
+    # the stored value on every partial update (e.g. a rename resetting type,
+    # status, is_streaming and alert_enabled).
     id: str = Field(...)
     name: Optional[str] = Field(None, max_length=50)
     path: Optional[str] = Field(None, max_length=255)
-    type: Optional[str] = Field(default='local', pattern='^(rtsp|http|local|other|video file)$')
-    status: Optional[str] = Field(default='inactive', pattern='^(active|inactive|error|processing)$')
-    is_streaming: Optional[bool] = Field(default=False)
+    type: Optional[str] = Field(default=None, pattern='^(rtsp|http|local|other|video file)$')
+    status: Optional[str] = Field(default=None, pattern='^(active|inactive|error|processing)$')
+    is_streaming: Optional[bool] = Field(default=None)
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -49,8 +70,21 @@ class StreamUpdate(BaseModel):
     longitude: Optional[Decimal] = Field(None, ge=-180, le=180, decimal_places=8)
     count_threshold_greater: Optional[int] = Field(None, ge=0)
     count_threshold_less: Optional[int] = Field(None, ge=0)
-    alert_enabled: bool = Field(default=True)
+    alert_enabled: Optional[bool] = Field(default=None)
     is_shoplifting_camera: Optional[bool] = Field(default=None)
+    is_blocked_exit_camera: Optional[bool] = Field(default=None)
+    is_no_entry_zone_camera: Optional[bool] = Field(default=None)
+    is_people_counting_camera: Optional[bool] = Field(default=None)
+    detection_models: Optional[List[str]] = Field(default=None)
+
+    @validator('detection_models')
+    def validate_detection_models(cls, v):
+        if v is None:
+            return v
+        invalid = [m for m in v if m not in DETECTION_MODEL_TYPES]
+        if invalid:
+            raise ValueError(f"Invalid detection model(s): {invalid}. Must be one of: {DETECTION_MODEL_TYPES}")
+        return v
 
 class StreamUpdateList(BaseModel):
     streams: List[StreamUpdate]
@@ -79,6 +113,9 @@ class StreamCreateWithLocation(BaseModel):
     status: str = Field("inactive", description="Status: active, inactive")
     is_streaming: bool = False
     is_shoplifting_camera: bool = False
+    is_blocked_exit_camera: bool = False
+    is_no_entry_zone_camera: bool = False
+    is_people_counting_camera: bool = False
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -95,6 +132,9 @@ class StreamUpdateWithLocation(BaseModel):
     status: Optional[str] = Field(None, description="Status: active, inactive")
     is_streaming: Optional[bool] = None
     is_shoplifting_camera: Optional[bool] = None
+    is_blocked_exit_camera: Optional[bool] = None
+    is_no_entry_zone_camera: Optional[bool] = None
+    is_people_counting_camera: Optional[bool] = None
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -165,6 +205,9 @@ class CameraDetailedResponse(BaseModel):
     count_threshold_less: Optional[int] = Field(None, description="Alert threshold for less count")
     alert_enabled: bool = Field(default=True, description="Whether alerts are enabled")
     is_shoplifting_camera: bool = Field(default=False, description="Whether shoplifting model is active for this camera")
+    is_blocked_exit_camera: bool = Field(default=False, description="Whether blocked-exit detection is active for this camera")
+    is_no_entry_zone_camera: bool = Field(default=False, description="Whether no-entry-zone detection is active for this camera")
+    is_people_counting_camera: bool = Field(default=False, description="Whether people-count threshold alerts are active for this camera")
     created_at: datetime = Field(..., description="Camera creation timestamp")
     updated_at: datetime = Field(..., description="Camera last update timestamp")
     last_activity: datetime = Field(..., description="Camera last activity timestamp")

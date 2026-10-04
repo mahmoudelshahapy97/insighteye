@@ -28,6 +28,7 @@ from app.services.location_service import location_service
 from app.services.database import db_manager
 from app.services.postgres_service import  postgres_service
 from app.utils import ensure_uuid_str, check_workspace_access, parse_string_or_list, encoded_string
+from app.utils.permission_utils import is_system_admin_role
 
 
 logger = logging.getLogger(__name__)
@@ -120,10 +121,13 @@ async def get_all_streams(
     try:
         # Build query based on workspace filter
         query_base = """
-            SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path, vs.type, vs.status, vs.is_streaming, 
+            SELECT vs.stream_id, vs.user_id, u.username as owner_username, vs.name, vs.path, vs.type, vs.status, vs.is_streaming,
                    vs.created_at, vs.updated_at, vs.workspace_id, w.name as workspace_name,
                    vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
-                   vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled
+                   vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
+                   vs.is_shoplifting_camera, vs.is_blocked_exit_camera, vs.is_no_entry_zone_camera,
+                   vs.is_people_counting_camera, vs.detection_models,
+                   w.enabled_features AS workspace_features
             FROM video_stream vs
             JOIN users u ON vs.user_id = u.user_id
             LEFT JOIN workspaces w ON vs.workspace_id = w.workspace_id
@@ -136,7 +140,7 @@ async def get_all_streams(
             target_workspace_id = ensure_uuid_str(workspace_id_str)
             
             # Check permissions for workspace
-            if user_system_role != "admin":
+            if not is_system_admin_role(user_system_role):
                 membership_details = await check_workspace_access(
                     db_manager,
                     user_id_obj,
@@ -148,7 +152,7 @@ async def get_all_streams(
             order_by = " ORDER BY u.username, vs.created_at DESC"
         else:
             # No workspace filter - system admin only
-            if user_system_role != "admin":
+            if not is_system_admin_role(user_system_role):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin role required.")
             order_by = " ORDER BY w.name, u.username, vs.created_at DESC"
         
@@ -171,6 +175,12 @@ async def get_all_streams(
                 "count_threshold_greater": s["count_threshold_greater"],
                 "count_threshold_less": s["count_threshold_less"],
                 "alert_enabled": s["alert_enabled"],
+                "is_shoplifting_camera": s["is_shoplifting_camera"],
+                "is_blocked_exit_camera": s["is_blocked_exit_camera"],
+                "is_no_entry_zone_camera": s["is_no_entry_zone_camera"],
+                "is_people_counting_camera": s["is_people_counting_camera"],
+                "detection_models": s["detection_models"],
+                "workspace_features": list(s["workspace_features"] or []),
                 "created_at": s["created_at"].isoformat() if s["created_at"] else None,
                 "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
                 "workspace_id": str(s["workspace_id"]) if s["workspace_id"] else None,
@@ -184,6 +194,83 @@ async def get_all_streams(
     except Exception as e:
         logger.error(f"Unexpected error retrieving all streams: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+
+_FLAG_FEATURES = {
+    "is_shoplifting_camera": "shoplifting",
+    "is_blocked_exit_camera": "blocked_exit",
+    "is_no_entry_zone_camera": "no_entry_zone",
+    "is_people_counting_camera": "people_counting",
+}
+
+
+class AdminStreamCreate(StreamCreate):
+    workspace_id: UUID
+    user_id: UUID  # camera owner; must be a member of workspace_id
+
+
+@router.post("/admin/source", status_code=status.HTTP_201_CREATED)
+async def admin_create_stream(
+    stream: AdminStreamCreate,
+    request: Request,
+    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
+):
+    """Create a camera in any workspace on behalf of one of its members (superadmin only)."""
+    if not workspace_service.is_superadmin(current_user_data):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This action requires superadmin privileges.")
+
+    ws = await db_manager.execute_query(
+        "SELECT enabled_features FROM workspaces WHERE workspace_id = $1 AND is_active = TRUE",
+        (stream.workspace_id,),
+        fetch_one=True,
+    )
+    if not ws:
+        raise HTTPException(status_code=404, detail="Workspace not found or inactive.")
+
+    requested = set(stream.detection_models or [])
+    requested |= {feat for flag, feat in _FLAG_FEATURES.items() if getattr(stream, flag, False)}
+    closed = sorted(requested - set(ws["enabled_features"] or []))
+    if closed:
+        raise HTTPException(status_code=400, detail=f"Not enabled for this workspace: {', '.join(closed)}")
+
+    await check_workspace_access(db_manager, stream.user_id, stream.workspace_id, required_role=None)
+    owner = await user_manager.get_user_by_id(str(stream.user_id))
+    owner_username = owner.get("username") if owner else None
+
+    stream_id = await camera_service.create_camera(
+        StreamCreate(**stream.model_dump(exclude={"workspace_id", "user_id"})),
+        stream.user_id,
+        stream.workspace_id,
+        owner_username,
+    )
+
+    await session_manager.log_action(
+        content=f"User '{current_user_data['username']}' added Camera '{stream.name}' (ID: {stream_id}) for user {stream.user_id} in workspace (ID: {stream.workspace_id})",
+        user_id=str(current_user_data["user_id"]),
+        workspace_id=str(stream.workspace_id),
+        action_type="Added_Camera",
+        ip_address=request.client.host if request.client else "Unknown",
+        user_agent=request.headers.get("user-agent", "Unknown")
+    )
+    return {"message": "Stream created successfully", "id": stream_id}
+
+
+async def _closed_features_requested(stream_update: StreamUpdate) -> List[str]:
+    """Features this update turns on that the camera's workspace has closed."""
+    requested = set(stream_update.detection_models or [])
+    requested |= {feat for flag, feat in _FLAG_FEATURES.items() if getattr(stream_update, flag, None)}
+    if not requested:
+        return []
+    row = await db_manager.execute_query(
+        """SELECT w.enabled_features FROM video_stream vs
+           JOIN workspaces w ON w.workspace_id = vs.workspace_id
+           WHERE vs.stream_id = $1""",
+        (UUID(ensure_uuid_str(stream_update.id)),),
+        fetch_one=True,
+    )
+    if not row:
+        return []  # unknown camera: let update_camera report it
+    return sorted(requested - set(row["enabled_features"] or []))
+
 
 @router.put("/source", status_code=status.HTTP_200_OK)
 async def update_streams(
@@ -203,6 +290,12 @@ async def update_streams(
         failed_ids = []
 
         for stream_update in streams:
+            closed = await _closed_features_requested(stream_update)
+            if closed:
+                failed_ids.append(
+                    f"{stream_update.id} (not enabled for this camera's workspace: {', '.join(closed)})"
+                )
+                continue
             success, error = await camera_service.update_camera(stream_update, user_id_obj, user_role)
             if success:
                 updated_ids.append(ensure_uuid_str(stream_update.id))
@@ -558,7 +651,7 @@ async def create_or_update_workspace_camera_params_post(
         if not workspace_id_obj:
             raise HTTPException(status_code=400, detail="No active workspace. Cannot save parameters.")
 
-        is_sys_admin = current_user_data.get("role") == "admin"
+        is_sys_admin = is_system_admin_role(current_user_data.get("role"))
         if not is_sys_admin:
             membership_details = await check_workspace_access(
                 db_manager,
@@ -641,7 +734,7 @@ async def delete_workspace_params(
         if not workspace_id_obj:
             raise HTTPException(status_code=400, detail="No active workspace found to delete parameters for.")
 
-        is_sys_admin = current_user_data.get("role") == "admin"
+        is_sys_admin = is_system_admin_role(current_user_data.get("role"))
         if not is_sys_admin:
             membership_details = await check_workspace_access(
                 db_manager,
@@ -677,7 +770,7 @@ async def get_all_workspace_params(
 ):
     """Get parameters for all workspaces (admin only)."""
     try:
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin role required.")
         
         return await parameter_service.get_all_workspace_params()
@@ -696,7 +789,7 @@ async def update_all_workspace_params(
 ):
     """Update parameters for all workspaces (admin only)."""
     try:
-        if current_admin_data.get("role") != 'admin':
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin privileges required.")
         
         user_id_obj = current_admin_data["user_id"]
@@ -751,7 +844,7 @@ async def delete_all_workspaces_params(
 ):
     """Delete all workspace stream parameters (admin only)."""
     try:
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System admin role required.")
 
         user_id_obj = current_admin_data["user_id"]
@@ -1533,7 +1626,7 @@ async def bulk_upload_cameras_with_location(
         user_system_role = user_db_details.get("role", "user")
 
         current_stream_count = 0
-        if user_system_role != 'admin':
+        if not is_system_admin_role(user_system_role):
             count_query = "SELECT COUNT(*) as stream_count FROM video_stream WHERE user_id = $1 AND workspace_id = $2"
             count_result = await db_manager.execute_query(count_query, params=(user_id_obj, workspace_id_obj), fetch_one=True)
             current_stream_count = count_result['stream_count'] if count_result else 0
@@ -1605,7 +1698,7 @@ async def bulk_upload_cameras_with_location(
                     continue
 
                 # Check camera limit
-                if user_system_role != 'admin':
+                if not is_system_admin_role(user_system_role):
                     if current_stream_count + len(successful_cameras) >= allowed_camera_count:
                         failed_cameras.append({
                             "row": row_idx,
@@ -1722,7 +1815,7 @@ async def update_user_camera_limit(
         admin_user_id = current_admin_data["user_id"]
         admin_username = current_admin_data["username"]
         
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="System admin privileges required to update camera limits."
@@ -1753,7 +1846,7 @@ async def update_user_camera_limit(
         target_username = user_info["username"]
         
         # Prevent modifying another admin's camera count (optional security check)
-        if user_info["role"] == "admin" and str(admin_user_id) != target_user_id:
+        if is_system_admin_role(user_info["role"]) and str(admin_user_id) != target_user_id:
             logger.warning(
                 f"Admin {admin_username} attempted to modify camera limit for another admin {target_username}"
             )
@@ -1846,7 +1939,7 @@ async def batch_update_user_camera_limits(
         admin_user_id = current_admin_data["user_id"]
         admin_username = current_admin_data["username"]
         
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="System admin privileges required to update camera limits."
@@ -1992,7 +2085,7 @@ async def get_user_camera_limit(
         target_user_id = ensure_uuid_str(user_id)
         
         # Check permissions
-        if requesting_user_role != "admin" and str(requesting_user_id) != target_user_id:
+        if not is_system_admin_role(requesting_user_role) and str(requesting_user_id) != target_user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You can only view your own camera limit."
@@ -2104,7 +2197,7 @@ async def get_all_users_camera_limits(
     """
     try:
         # Verify admin privileges
-        if current_admin_data.get("role") != "admin":
+        if not is_system_admin_role(current_admin_data.get("role")):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="System admin privileges required."

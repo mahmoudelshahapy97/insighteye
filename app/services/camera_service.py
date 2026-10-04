@@ -15,6 +15,7 @@ from app.utils import (
     ensure_uuid_str,
     check_workspace_access
 )
+from app.utils.permission_utils import is_system_admin_role
 from app.schemas import (
     StreamCreate, StreamUpdate,
     CameraState, CamerasStateResponse,
@@ -39,7 +40,7 @@ class CameraService:
 
     async def check_camera_limit(self, user_id: UUID, workspace_id: UUID, user_system_role: str, allowed_count: int) -> None:
         """Check if user has reached their camera limit."""
-        if user_system_role != 'admin':
+        if not is_system_admin_role(user_system_role):
             count_query = "SELECT COUNT(*) as stream_count FROM video_stream WHERE user_id = $1 AND workspace_id = $2"
             count_result = await self.db_manager.execute_query(count_query, params=(user_id, workspace_id), fetch_one=True)
             current_stream_count = count_result['stream_count'] if count_result else 0
@@ -73,9 +74,10 @@ class CameraService:
                 (stream_id, user_id, workspace_id, name, path, type, status, is_streaming,
                  location, area, building, floor_level, zone, latitude, longitude,
                  count_threshold_greater, count_threshold_less, alert_enabled,
-                 is_shoplifting_camera,
+                 is_shoplifting_camera, is_blocked_exit_camera, is_no_entry_zone_camera,
+                 is_people_counting_camera, detection_models,
                  created_at, updated_at, last_activity)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
             """
 
             await self.db_manager.execute_query(
@@ -89,6 +91,10 @@ class CameraService:
                     getattr(stream, 'longitude', None), getattr(stream, 'count_threshold_greater', None),
                     getattr(stream, 'count_threshold_less', None), getattr(stream, 'alert_enabled', True),
                     getattr(stream, 'is_shoplifting_camera', False),
+                    getattr(stream, 'is_blocked_exit_camera', False),
+                    getattr(stream, 'is_no_entry_zone_camera', False),
+                    getattr(stream, 'is_people_counting_camera', False),
+                    getattr(stream, 'detection_models', None) or [],
                     now_utc, now_utc, now_utc
                 )
             )
@@ -114,7 +120,8 @@ class CameraService:
                        vs.type, vs.status, vs.is_streaming, vs.created_at, vs.updated_at,
                        vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
                        vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
-                       vs.is_shoplifting_camera,
+                       vs.is_shoplifting_camera, vs.is_blocked_exit_camera, vs.is_no_entry_zone_camera,
+                       vs.is_people_counting_camera, vs.detection_models,
                        w.name as workspace_name
                 FROM video_stream vs
                 JOIN users u ON vs.user_id = u.user_id
@@ -151,6 +158,10 @@ class CameraService:
                     "count_threshold_less": s["count_threshold_less"],
                     "alert_enabled": s["alert_enabled"],
                     "is_shoplifting_camera": s["is_shoplifting_camera"],
+                    "is_blocked_exit_camera": s["is_blocked_exit_camera"],
+                    "is_no_entry_zone_camera": s["is_no_entry_zone_camera"],
+                    "is_people_counting_camera": s["is_people_counting_camera"],
+                    "detection_models": s["detection_models"],
                     "created_at": s["created_at"].isoformat() if s["created_at"] else None,
                     "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
                     "workspace_id": str(workspace_id), 
@@ -205,7 +216,7 @@ class CameraService:
                 except HTTPException:
                     pass
             
-            if not can_update and current_user_role == "admin":
+            if not can_update and is_system_admin_role(current_user_role):
                 can_update = True
 
             if not can_update:
@@ -259,6 +270,26 @@ class CameraService:
             if hasattr(stream_update, 'is_shoplifting_camera') and stream_update.is_shoplifting_camera is not None:
                 set_clauses.append(f"is_shoplifting_camera = ${param_idx}")
                 params.append(stream_update.is_shoplifting_camera)
+                param_idx += 1
+
+            if hasattr(stream_update, 'is_blocked_exit_camera') and stream_update.is_blocked_exit_camera is not None:
+                set_clauses.append(f"is_blocked_exit_camera = ${param_idx}")
+                params.append(stream_update.is_blocked_exit_camera)
+                param_idx += 1
+
+            if hasattr(stream_update, 'is_no_entry_zone_camera') and stream_update.is_no_entry_zone_camera is not None:
+                set_clauses.append(f"is_no_entry_zone_camera = ${param_idx}")
+                params.append(stream_update.is_no_entry_zone_camera)
+                param_idx += 1
+
+            if hasattr(stream_update, 'is_people_counting_camera') and stream_update.is_people_counting_camera is not None:
+                set_clauses.append(f"is_people_counting_camera = ${param_idx}")
+                params.append(stream_update.is_people_counting_camera)
+                param_idx += 1
+
+            if getattr(stream_update, 'detection_models', None) is not None:
+                set_clauses.append(f"detection_models = ${param_idx}")
+                params.append(stream_update.detection_models)
                 param_idx += 1
 
             if not set_clauses:
@@ -354,7 +385,7 @@ class CameraService:
                 except HTTPException:
                     pass
             
-            if not can_delete and current_user_role == "admin":
+            if not can_delete and is_system_admin_role(current_user_role):
                 can_delete = True
 
             if can_delete:
@@ -1032,8 +1063,10 @@ class CameraService:
         params = []
         param_count = 1
         
-        update_dict = updates.model_dump(exclude_none=True)
-        
+        # id identifies the row (WHERE stream_id = ...); it is not a column to SET,
+        # and video_stream has no "id" column.
+        update_dict = updates.model_dump(exclude_none=True, exclude={"id"})
+
         for field, value in update_dict.items():
             if field in ['latitude', 'longitude'] and value is not None:
                 value = float(value)

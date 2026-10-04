@@ -17,6 +17,7 @@ from app.schemas import (
     TimestampRangeResponse, CameraIdsResponse
 )
 from app.utils import parse_camera_ids, parse_string_or_list
+from app.utils.permission_utils import is_system_admin_role
 from app.services.s3_service import s3_service
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ async def workspace_search_results(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         
         system_role = user_db_info.get("role")
-        is_system_admin = (system_role == "admin")
+        is_system_admin = is_system_admin_role(system_role)
         
         # Get workspace using workspace_service
         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
@@ -179,7 +180,7 @@ async def workspace_search_results_with_location(
         
         # Check permissions
         workspace_role = None
-        if system_role != "admin":
+        if not is_system_admin_role(system_role):
             member_query = """
                 SELECT role FROM workspace_members 
                 WHERE user_id = $1 AND workspace_id = $2
@@ -295,7 +296,7 @@ async def workspace_prediction_endpoint(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         
         system_role = user_db_info.get("role")
-        is_system_admin = (system_role == "admin")
+        is_system_admin = is_system_admin_role(system_role)
         
         # Get workspace using workspace_service
         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
@@ -423,7 +424,7 @@ async def get_workspace_statistics(
         
         # Check permissions
         workspace_role = None
-        if system_role != "admin":
+        if not is_system_admin_role(system_role):
             member_query = """
                 SELECT role FROM workspace_members 
                 WHERE user_id = $1 AND workspace_id = $2
@@ -488,7 +489,7 @@ async def export_workspace_data(
         
         # Check permissions
         workspace_role = None
-        if system_role != "admin":
+        if not is_system_admin_role(system_role):
             member_query = """
                 SELECT role FROM workspace_members 
                 WHERE user_id = $1 AND workspace_id = $2
@@ -571,7 +572,7 @@ async def get_timestamp_range_endpoint(
         
         # Get workspace role
         workspace_role = None
-        if system_role != "admin":
+        if not is_system_admin_role(system_role):
             member_query = """
                 SELECT role FROM workspace_members 
                 WHERE user_id = $1 AND workspace_id = $2
@@ -655,7 +656,7 @@ async def get_unique_locations(
         
         # Check permissions
         workspace_role = None
-        if system_role != "admin":
+        if not is_system_admin_role(system_role):
             member_query = """
                 SELECT role FROM workspace_members 
                 WHERE user_id = $1 AND workspace_id = $2
@@ -709,7 +710,7 @@ async def delete_data_from_workspace(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         
         system_role = user_db_info.get("role")
-        is_system_admin = (system_role == "admin")
+        is_system_admin = is_system_admin_role(system_role)
         
         # Get workspace using workspace_service
         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
@@ -796,7 +797,7 @@ async def delete_all_workspace_data(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         
         system_role = user_db_info.get("role")
-        is_system_admin = (system_role == "admin")
+        is_system_admin = is_system_admin_role(system_role)
         
         # Get workspace using workspace_service
         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
@@ -876,7 +877,7 @@ async def preview_metadata_update_endpoint(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         
         system_role = user_db_info.get("role")
-        is_system_admin = (system_role == "admin")
+        is_system_admin = is_system_admin_role(system_role)
         
         # Get workspace using workspace_service
         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
@@ -943,7 +944,7 @@ async def update_camera_metadata_by_id(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         
         system_role = user_db_info.get("role")
-        is_system_admin = (system_role == "admin")
+        is_system_admin = is_system_admin_role(system_role)
         
         # Get workspace using workspace_service
         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
@@ -1030,7 +1031,7 @@ async def bulk_update_metadata(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         
         system_role = user_db_info.get("role")
-        is_system_admin = (system_role == "admin")
+        is_system_admin = is_system_admin_role(system_role)
         
         # Get workspace using workspace_service
         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
@@ -1130,7 +1131,7 @@ async def batch_update_metadata_for_cameras(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         
         system_role = user_db_info.get("role")
-        is_system_admin = (system_role == "admin")
+        is_system_admin = is_system_admin_role(system_role)
         
         # Get workspace using workspace_service
         _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
@@ -1238,482 +1239,9 @@ async def batch_update_metadata_for_cameras(
 
 # ========== Location Data Endpoints ==========
 
-@router.get("/locations/list")
-async def get_postgres_locations(
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get all unique locations from PostgreSQL data."""
-    try:
-        username = current_user_data["username"]
-        user_id = current_user_data["user_id"]
-        
-        user_db_info = await user_manager.get_user_by_id(user_id)
-        if not user_db_info:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-        
-        system_role = user_db_info.get("role")
-        
-        # Get workspace using workspace_service
-        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-        if not workspace_id_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
-        
-        
-        # Check workspace permissions
-        workspace_role = None
-        if system_role != "admin":
-            member_query = """
-                SELECT role FROM workspace_members 
-                WHERE user_id = $1 AND workspace_id = $2
-            """
-            member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id_obj), fetch_one=True
-            )
-            if not member_result:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not a member of this workspace."
-                )
-            workspace_role = member_result['role']
-        
-        # Get location data
-        result = await postgres_service.get_unique_locations(
-            workspace_id=workspace_id_obj,
-            user_system_role=system_role,
-            user_workspace_role=workspace_role,
-            requesting_username=username
-        )
-        
-        return JSONResponse(content=result)
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Error getting locations: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve locations."
-        )
-
-@router.get("/areas/list")
-async def get_postgres_areas(
-    locations: Optional[str] = Query(None, description="Filter by location(s)"),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get all unique areas, optionally filtered by location(s)."""
-    try:
-        parsed_locations = parse_string_or_list(locations)
-        
-        username = current_user_data["username"]
-        user_id = current_user_data["user_id"]
-        
-        user_db_info = await user_manager.get_user_by_id(user_id)
-        if not user_db_info:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-        
-        system_role = user_db_info.get("role")
-        
-        # Get workspace using workspace_service
-        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-        if not workspace_id_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
-        
-        # Check workspace permissions
-        workspace_role = None
-        if system_role != "admin":
-            member_query = """
-                SELECT role FROM workspace_members 
-                WHERE user_id = $1 AND workspace_id = $2
-            """
-            member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id_obj), fetch_one=True
-            )
-            if not member_result:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not a member of this workspace."
-                )
-            workspace_role = member_result['role']
-        
-        # Build query with location filter
-        conditions = ["workspace_id = $1"]
-        params = [workspace_id_obj]
-        param_count = 1
-        
-        if parsed_locations:
-            param_count += 1
-            if isinstance(parsed_locations, list):
-                conditions.append(f"location = ANY(${param_count})")
-                params.append(parsed_locations)
-            else:
-                conditions.append(f"location = ${param_count}")
-                params.append(parsed_locations)
-        
-        # User access control
-        if system_role != 'admin' and workspace_role not in ['admin', 'owner']:
-            param_count += 1
-            conditions.append(f"username = ${param_count}")
-            params.append(username)
-        
-        where_clause = " AND ".join(conditions)
-        
-        # Get areas grouped by location
-        query = f"""
-            SELECT 
-                area, location,
-                COUNT(DISTINCT camera_id) as camera_count,
-                ARRAY_AGG(DISTINCT camera_id) as camera_ids
-            FROM stream_results
-            WHERE {where_clause} AND area IS NOT NULL
-            GROUP BY area, location
-            ORDER BY area, location
-        """
-        
-        results = await db_manager.execute_query(query, tuple(params), fetch_all=True)
-        
-        areas = []
-        if results:
-            for row in results:
-                areas.append({
-                    'area': row['area'],
-                    'location': row['location'],
-                    'camera_count': row['camera_count'],
-                    'camera_ids': row['camera_ids']
-                })
-        
-        return JSONResponse(content={
-            "areas": areas,
-            "total_count": len(areas),
-            "filtered_by_locations": parsed_locations,
-            "workspace_id": str(workspace_id_obj),
-            "database": "postgresql"
-        })
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Error getting areas: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve areas."
-        )
-
-@router.get("/buildings/list")
-async def get_postgres_buildings(
-    areas: Optional[str] = Query(None, description="Filter by area(s)"),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get all unique buildings, optionally filtered by area(s)."""
-    try:
-        parsed_areas = parse_string_or_list(areas)
-        
-        username = current_user_data["username"]
-        user_id = current_user_data["user_id"]
-        
-        user_db_info = await user_manager.get_user_by_id(user_id)
-        if not user_db_info:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-        
-        system_role = user_db_info.get("role")
-        
-        # Get workspace using workspace_service
-        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-        if not workspace_id_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
-        
-        
-        # Check workspace permissions
-        workspace_role = None
-        if system_role != "admin":
-            member_query = """
-                SELECT role FROM workspace_members 
-                WHERE user_id = $1 AND workspace_id = $2
-            """
-            member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id_obj), fetch_one=True
-            )
-            if not member_result:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not a member of this workspace."
-                )
-            workspace_role = member_result['role']
-        
-        # Build query with area filter
-        conditions = ["workspace_id = $1"]
-        params = [workspace_id_obj]
-        param_count = 1
-        
-        if parsed_areas:
-            param_count += 1
-            if isinstance(parsed_areas, list):
-                conditions.append(f"area = ANY(${param_count})")
-                params.append(parsed_areas)
-            else:
-                conditions.append(f"area = ${param_count}")
-                params.append(parsed_areas)
-        
-        # User access control
-        if system_role != 'admin' and workspace_role not in ['admin', 'owner']:
-            param_count += 1
-            conditions.append(f"username = ${param_count}")
-            params.append(username)
-        
-        where_clause = " AND ".join(conditions)
-        
-        # Get buildings grouped by area and location
-        query = f"""
-            SELECT 
-                building, area, location,
-                COUNT(DISTINCT camera_id) as camera_count,
-                ARRAY_AGG(DISTINCT camera_id) as camera_ids
-            FROM stream_results
-            WHERE {where_clause} AND building IS NOT NULL
-            GROUP BY building, area, location
-            ORDER BY building, area, location
-        """
-        
-        results = await db_manager.execute_query(query, tuple(params), fetch_all=True)
-        
-        buildings = []
-        if results:
-            for row in results:
-                buildings.append({
-                    'building': row['building'],
-                    'area': row['area'],
-                    'location': row['location'],
-                    'camera_count': row['camera_count'],
-                    'camera_ids': row['camera_ids']
-                })
-        
-        return JSONResponse(content={
-            "buildings": buildings,
-            "total_count": len(buildings),
-            "filtered_by_areas": parsed_areas,
-            "workspace_id": str(workspace_id_obj),
-            "database": "postgresql"
-        })
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Error getting buildings: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve buildings."
-        )
-
-@router.get("/floor-levels/list")
-async def get_postgres_floor_levels(
-    buildings: Optional[str] = Query(None, description="Filter by building(s)"),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get all unique floor levels, optionally filtered by building(s)."""
-    try:
-        parsed_buildings = parse_string_or_list(buildings)
-        
-        username = current_user_data["username"]
-        user_id = current_user_data["user_id"]
-        
-        user_db_info = await user_manager.get_user_by_id(user_id)
-        if not user_db_info:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-        
-        system_role = user_db_info.get("role")
-        
-        # Get workspace using workspace_service
-        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-        if not workspace_id_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
-        
-        
-        # Check workspace permissions
-        workspace_role = None
-        if system_role != "admin":
-            member_query = """
-                SELECT role FROM workspace_members 
-                WHERE user_id = $1 AND workspace_id = $2
-            """
-            member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id_obj), fetch_one=True
-            )
-            if not member_result:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not a member of this workspace."
-                )
-            workspace_role = member_result['role']
-        
-        # Build query with building filter
-        conditions = ["workspace_id = $1"]
-        params = [workspace_id_obj]
-        param_count = 1
-        
-        if parsed_buildings:
-            param_count += 1
-            if isinstance(parsed_buildings, list):
-                conditions.append(f"building = ANY(${param_count})")
-                params.append(parsed_buildings)
-            else:
-                conditions.append(f"building = ${param_count}")
-                params.append(parsed_buildings)
-        
-        # User access control
-        if system_role != 'admin' and workspace_role not in ['admin', 'owner']:
-            param_count += 1
-            conditions.append(f"username = ${param_count}")
-            params.append(username)
-        
-        where_clause = " AND ".join(conditions)
-        
-        # Get floor levels
-        query = f"""
-            SELECT 
-                floor_level, building, area, location,
-                COUNT(DISTINCT camera_id) as camera_count,
-                ARRAY_AGG(DISTINCT camera_id) as camera_ids
-            FROM stream_results
-            WHERE {where_clause} AND floor_level IS NOT NULL
-            GROUP BY floor_level, building, area, location
-            ORDER BY floor_level, building, area, location
-        """
-        
-        results = await db_manager.execute_query(query, tuple(params), fetch_all=True)
-        
-        floor_levels = []
-        if results:
-            for row in results:
-                floor_levels.append({
-                    'floor_level': row['floor_level'],
-                    'building': row['building'],
-                    'area': row['area'],
-                    'location': row['location'],
-                    'camera_count': row['camera_count'],
-                    'camera_ids': row['camera_ids']
-                })
-        
-        return JSONResponse(content={
-            "floor_levels": floor_levels,
-            "total_count": len(floor_levels),
-            "filtered_by_buildings": parsed_buildings,
-            "workspace_id": str(workspace_id_obj),
-            "database": "postgresql"
-        })
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Error getting floor levels: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve floor levels."
-        )
-
-@router.get("/zones/list")
-async def get_postgres_zones(
-    floor_levels: Optional[str] = Query(None, description="Filter by floor level(s)"),
-    current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
-):
-    """Get all unique zones, optionally filtered by floor level(s)."""
-    try:
-        parsed_floor_levels = parse_string_or_list(floor_levels)
-        
-        username = current_user_data["username"]
-        user_id = current_user_data["user_id"]
-        
-        user_db_info = await user_manager.get_user_by_id(user_id)
-        if not user_db_info:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-        
-        system_role = user_db_info.get("role")
-        
-        # Get workspace using workspace_service
-        _, workspace_id_obj = await workspace_service.get_user_and_workspace(username)
-        if not workspace_id_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active workspace found.")
-        
-        # Check workspace permissions
-        workspace_role = None
-        if system_role != "admin":
-            member_query = """
-                SELECT role FROM workspace_members 
-                WHERE user_id = $1 AND workspace_id = $2
-            """
-            member_result = await db_manager.execute_query(
-                member_query, (user_id, workspace_id_obj), fetch_one=True
-            )
-            if not member_result:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not a member of this workspace."
-                )
-            workspace_role = member_result['role']
-        
-        # Build query with floor level filter
-        conditions = ["workspace_id = $1"]
-        params = [workspace_id_obj]
-        param_count = 1
-        
-        if parsed_floor_levels:
-            param_count += 1
-            if isinstance(parsed_floor_levels, list):
-                conditions.append(f"floor_level = ANY(${param_count})")
-                params.append(parsed_floor_levels)
-            else:
-                conditions.append(f"floor_level = ${param_count}")
-                params.append(parsed_floor_levels)
-        
-        # User access control
-        if system_role != 'admin' and workspace_role not in ['admin', 'owner']:
-            param_count += 1
-            conditions.append(f"username = ${param_count}")
-            params.append(username)
-        
-        where_clause = " AND ".join(conditions)
-        
-        # Get zones
-        query = f"""
-            SELECT 
-                zone, floor_level, building, area, location,
-                COUNT(DISTINCT camera_id) as camera_count,
-                ARRAY_AGG(DISTINCT camera_id) as camera_ids
-            FROM stream_results
-            WHERE {where_clause} AND zone IS NOT NULL
-            GROUP BY zone, floor_level, building, area, location
-            ORDER BY zone, floor_level, building, area, location
-        """
-        
-        results = await db_manager.execute_query(query, tuple(params), fetch_all=True)
-        
-        zones = []
-        if results:
-            for row in results:
-                zones.append({
-                    'zone': row['zone'],
-                    'floor_level': row['floor_level'],
-                    'building': row['building'],
-                    'area': row['area'],
-                    'location': row['location'],
-                    'camera_count': row['camera_count'],
-                    'camera_ids': row['camera_ids']
-                })
-        
-        return JSONResponse(content={
-            "zones": zones,
-            "total_count": len(zones),
-            "filtered_by_floor_levels": parsed_floor_levels,
-            "workspace_id": str(workspace_id_obj),
-            "database": "postgresql"
-        })
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Error getting zones: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve zones."
-        )
+# NOTE: /locations/list, /areas/list, /buildings/list, /floor-levels/list and
+# /zones/list are served by camera_router. Neither router has a prefix, so any
+# handler for those paths defined here is shadowed and can never run.
 
 @router.get("/locations/summary")
 async def get_location_summary_postgres(
@@ -1737,7 +1265,7 @@ async def get_location_summary_postgres(
         
         # Check workspace permissions
         workspace_role = None
-        if system_role != "admin":
+        if not is_system_admin_role(system_role):
             member_query = """
                 SELECT role FROM workspace_members 
                 WHERE user_id = $1 AND workspace_id = $2
@@ -1757,7 +1285,7 @@ async def get_location_summary_postgres(
         params = [workspace_id_obj]
         
         # User access control
-        if system_role != 'admin' and workspace_role not in ['admin', 'owner']:
+        if not is_system_admin_role(system_role) and workspace_role not in ['admin', 'owner']:
             conditions.append("username = $2")
             params.append(username)
         
@@ -1862,7 +1390,7 @@ async def search_location_data(
         
         # Check workspace permissions
         workspace_role = None
-        if system_role != "admin":
+        if not is_system_admin_role(system_role):
             try:
                 query = "SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2"
                 member_info = await db_manager.execute_query(

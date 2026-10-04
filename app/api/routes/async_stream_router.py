@@ -90,7 +90,7 @@ async def get_task_status(
         logger.error(f"Error getting task status: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get task status: {str(e)}"
+            detail="Failed to get task status."
         )
 
 
@@ -153,7 +153,7 @@ async def async_start_all_workspace_streams(
         logger.error(f"Error starting workspace streams: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to start workspace streams: {str(e)}"
+            detail="Failed to start workspace streams."
         )
 
 
@@ -212,7 +212,7 @@ async def async_stop_all_workspace_streams(
         logger.error(f"Error stopping workspace streams: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to stop workspace streams: {str(e)}"
+            detail="Failed to stop workspace streams."
         )
 
 
@@ -264,7 +264,7 @@ async def async_batch_start_streams(
         logger.error(f"Error in batch start: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Batch start failed: {str(e)}"
+            detail="Batch start failed."
         )
 
 
@@ -316,5 +316,5 @@ async def async_batch_stop_streams(
         logger.error(f"Error in batch stop: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Batch stop failed: {str(e)}"
+            detail="Batch stop failed."
         )

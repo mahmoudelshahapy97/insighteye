@@ -4,6 +4,7 @@ xgboost
 
 # Vision / YOLO
 ultralytics==8.4.7
+lap>=0.5.12
 
 # ONNX & inference
 onnxruntime-gpu==1.23.2
