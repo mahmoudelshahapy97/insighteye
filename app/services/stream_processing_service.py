@@ -1554,6 +1554,12 @@ class StreamProcessingService:
             is_people_counting_camera = cam_people_counting and 'people_counting' in allowed_features
             last_feature_refresh = time.monotonic()
 
+            # Like no-entry-zone below: the camera flag and door polygon are re-read
+            # periodically, so edits saved by another process (the API) reach this stream.
+            be_cfg_loaded = None
+            be_refresh_every = float(getattr(config, "blocked_exit_config_refresh_seconds", 10.0))
+            last_be_refresh = time.monotonic()
+
             if blocked_exit_enabled:
                 try:
                     from app.services.blocked_exit_service import blocked_exit_service
@@ -1562,6 +1568,7 @@ class StreamProcessingService:
                     await blocked_exit_service.close_open_episodes(stream_id)
                     zone_cfg = await blocked_exit_service.get_zone_config(stream_id)
                     self.blocked_exit_engine.set_zone_config(stream_id_str, zone_cfg)
+                    be_cfg_loaded = zone_cfg
                 except Exception as e:
                     logger.error(f"[blocked-exit] failed to load zone config for {stream_id_str}: {e}")
 
@@ -1653,13 +1660,14 @@ class StreamProcessingService:
                                     from app.services.blocked_exit_service import blocked_exit_service
                                     # Either way the engine's open episode can't continue.
                                     await self._release_blocked_exit_stream(stream_id, stream_id_str, workspace_id)
+                                    be_cfg_loaded = None
                                     if be_now:
-                                        self.blocked_exit_engine.set_zone_config(
-                                            stream_id_str, await blocked_exit_service.get_zone_config(stream_id),
-                                        )
+                                        be_cfg_loaded = await blocked_exit_service.get_zone_config(stream_id)
+                                        self.blocked_exit_engine.set_zone_config(stream_id_str, be_cfg_loaded)
                                 except Exception as e:
                                     logger.error(f"[blocked-exit] feature toggle failed for {stream_id_str}: {e}")
                                 blocked_exit_enabled = be_now
+                            last_be_refresh = 0.0
                             # no-entry-zone follows on its own refresh below
                             last_nez_refresh = 0.0
                     # (no per-frame shoplifting counter needed — dedup is time-based now)
@@ -1736,6 +1744,33 @@ class StreamProcessingService:
                             logger.error(f"Shoplifting detection error for stream {stream_id_str}: {e}")
 
                     # ===== BLOCKED-EXIT DETECTION (independent rate, gated by is_blocked_exit_camera) =====
+                    if time.monotonic() - last_be_refresh >= be_refresh_every:
+                        last_be_refresh = time.monotonic()
+                        try:
+                            from app.services.blocked_exit_service import blocked_exit_service
+                            cam_blocked_exit = await blocked_exit_service.is_camera_enabled(stream_id)
+                            be_now = cam_blocked_exit and 'blocked_exit' in allowed_features
+                            cfg = await blocked_exit_service.get_zone_config(stream_id) if be_now else None
+                            usable = bool(cfg and cfg.get("door_polygon") and cfg.get("is_active") is not False)
+                            was_usable = bool(
+                                blocked_exit_enabled and be_cfg_loaded and be_cfg_loaded.get("door_polygon")
+                                and be_cfg_loaded.get("is_active") is not False
+                            )
+                            if was_usable and not usable:
+                                # Switched off, or the door polygon was removed/deactivated:
+                                # flush clips and close the open episode.
+                                logger.info(f"[blocked-exit] stopped on {stream_id_str}, closing open episode")
+                                await self._release_blocked_exit_stream(stream_id, stream_id_str, workspace_id)
+                                be_cfg_loaded = None
+                            # set_zone_config restarts the debounce timers, so only push real changes.
+                            if usable and (not blocked_exit_enabled or cfg != be_cfg_loaded):
+                                logger.info(f"[blocked-exit] door polygon/config reloaded for {stream_id_str}")
+                                self.blocked_exit_engine.set_zone_config(stream_id_str, cfg)
+                                be_cfg_loaded = cfg
+                            blocked_exit_enabled = be_now
+                        except Exception as e:
+                            logger.error(f"[blocked-exit] config refresh failed for {stream_id_str}: {e}")
+
                     if blocked_exit_enabled and frame_count % shoplifting_frame_rate == 0 and self.blocked_exit_engine.has_config(stream_id_str):
                         engine = self.blocked_exit_engine
                         if not engine.is_loaded and not blocked_exit_engine_load_attempted:

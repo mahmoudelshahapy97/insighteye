@@ -141,6 +141,14 @@ async def lifespan(app: FastAPI):
         logger.warning("Could not create stream_results index: %s", e)
 
     try:
+        # One-time backfills for data created before an update (see app/services/migrations.py).
+        from app.services.database import db_manager as _db
+        from app.services.migrations import run_pending_migrations
+        await run_pending_migrations(_db)
+    except Exception as e:
+        logger.warning("Could not run data migrations: %s", e)
+
+    try:
         stream_processing_service._initialize_models()
         logger.info("Stream manager initialized and background tasks started.")
     except Exception as e:

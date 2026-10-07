@@ -240,3 +240,87 @@ class TestSecurityFeatures:
         # This would require creating a token with a different secret
         # Implementation depends on your setup
         pass
+
+
+class TestWorkspaceSwitch:
+    """Test switching the session's workspace"""
+
+    @staticmethod
+    def _queries(mock_db_manager):
+        return [c.args[0] for c in mock_db_manager.execute_query.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_switch_issues_tokens_for_new_workspace(self, session_manager, mock_db_manager):
+        user_id, old_ws, new_ws = uuid4(), uuid4(), uuid4()
+        old_pair = session_manager.create_token_pair(user_id, old_ws)
+        refresh_exp = datetime.now(ZoneInfo("Africa/Cairo")) + timedelta(days=7)
+
+        async def db_side_effect(query, params=None, **kwargs):
+            if "RETURNING old.refresh_token" in query:
+                assert params[7] == old_pair.access_token  # only the calling session's row
+                return {"old_refresh_token": old_pair.refresh_token, "old_refresh_expires_at": refresh_exp}
+            return None
+        mock_db_manager.execute_query.side_effect = db_side_effect
+
+        new_pair = await session_manager.switch_session_workspace(old_pair.access_token, user_id, new_ws)
+
+        payload = session_manager.decode_token_without_verification(new_pair.access_token)
+        assert payload["workspace_id"] == str(new_ws)
+        assert new_pair.refresh_token != old_pair.refresh_token
+
+        blacklisted = [c.args[1][2] for c in mock_db_manager.execute_query.call_args_list
+                       if "INSERT INTO token_blacklist" in c.args[0]]
+        assert set(blacklisted) == {old_pair.access_token, old_pair.refresh_token}
+        assert not any("INSERT INTO user_tokens" in q for q in self._queries(mock_db_manager))
+        # other sessions follow the new workspace without new tokens
+        assert any("SET workspace_id = $1" in q and "access_token <> $3" in q for q in self._queries(mock_db_manager))
+
+    @pytest.mark.asyncio
+    async def test_switch_without_session_row_stores_new_session(self, session_manager, mock_db_manager):
+        user_id = uuid4()
+        old_pair = session_manager.create_token_pair(user_id, uuid4())
+        mock_db_manager.execute_query.return_value = None
+
+        await session_manager.switch_session_workspace(old_pair.access_token, user_id, uuid4())
+
+        queries = self._queries(mock_db_manager)
+        assert any("INSERT INTO user_tokens" in q for q in queries)
+        assert sum("INSERT INTO token_blacklist" in q for q in queries) == 1  # old access token only
+
+    @pytest.mark.asyncio
+    async def test_refresh_prefers_session_row_workspace(self, session_manager, mock_db_manager):
+        user_id, claim_ws, row_ws = uuid4(), uuid4(), uuid4()
+        pair = session_manager.create_token_pair(user_id, claim_ws)
+
+        async def db_side_effect(query, params=None, **kwargs):
+            if "SELECT workspace_id FROM user_tokens" in query:
+                return {"workspace_id": row_ws}
+            return None
+        mock_db_manager.execute_query.side_effect = db_side_effect
+
+        refreshed = await session_manager.refresh_access_token(pair.refresh_token)
+
+        payload = session_manager.decode_token_without_verification(refreshed.access_token)
+        assert payload["workspace_id"] == str(row_ws)
+
+    @pytest.mark.asyncio
+    async def test_refresh_falls_back_to_claim(self, session_manager, mock_db_manager):
+        user_id, claim_ws = uuid4(), uuid4()
+        pair = session_manager.create_token_pair(user_id, claim_ws)
+        mock_db_manager.execute_query.return_value = None
+
+        refreshed = await session_manager.refresh_access_token(pair.refresh_token)
+
+        payload = session_manager.decode_token_without_verification(refreshed.access_token)
+        assert payload["workspace_id"] == str(claim_ws)
+
+    @pytest.mark.asyncio
+    async def test_set_active_workspace_keeps_tokens(self, session_manager, mock_db_manager):
+        user_id, ws = uuid4(), uuid4()
+        mock_db_manager.execute_query.return_value = None
+
+        await session_manager.set_active_workspace(user_id, ws)
+
+        queries = self._queries(mock_db_manager)
+        assert len(queries) == 1 and "UPDATE user_tokens SET workspace_id" in queries[0]
+        assert not any("token_blacklist" in q for q in queries)

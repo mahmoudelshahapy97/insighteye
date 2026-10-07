@@ -120,3 +120,15 @@ def test_streams_do_not_share_tracks_or_incidents(engine):
     rb = [t for r in run(engine, "b", 4) for t in r["triggers"] if t["kind"] == "entry"]
     assert len(ra) == 1 and len(rb) == 1
     assert ra[0]["incident_id"] != rb[0]["incident_id"]
+
+
+def test_process_frame_does_not_draw_on_the_callers_frame(engine):
+    """Frames at or below the clip width aren't resized; the zone overlay must still go
+    on a copy, or it leaks into other detectors (e.g. blocked exit) on the same stream."""
+    engine.set_zones("s1", [ZONE])
+    engine.model.boxes = [PERSON_INSIDE]
+    for _ in range(4):
+        f = frame()
+        engine.process_frame("s1", f)
+        assert not f.any()
+        time.sleep(0.01)

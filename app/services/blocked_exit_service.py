@@ -567,6 +567,14 @@ class BlockedExitService:
             fetch_one=True,
         )
 
+    async def is_camera_enabled(self, stream_id: UUID) -> bool:
+        row = await self.db.execute_query(
+            "SELECT is_blocked_exit_camera FROM video_stream WHERE stream_id = $1",
+            (stream_id,),
+            fetch_one=True,
+        )
+        return bool(row and row.get("is_blocked_exit_camera"))
+
     async def get_camera_sources(self, workspace_id: UUID) -> List[Dict[str, Any]]:
         """Internal only: every blocked-exit camera's source, for connection checks."""
         return await self.db.execute_query(
@@ -635,6 +643,37 @@ class BlockedExitService:
             fetch_one=True,
         )
         return {"days": days, **(row or {})}
+
+    async def overview(self, workspace_id: UUID) -> Dict[str, Any]:
+        """Landing-page counters, like no-entry-zone's overview. Each episode is one incident."""
+        row = await self.db.execute_query(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM blocked_exit_events
+                  WHERE workspace_id = $1 AND event_timestamp >= NOW() - INTERVAL '24 hours') AS events_24h,
+                (SELECT COUNT(*) FROM blocked_exit_events
+                  WHERE workspace_id = $1 AND status <> 'resolved')                         AS open_events,
+                (SELECT COUNT(*) FROM blocked_exit_events
+                  WHERE workspace_id = $1 AND status = 'detected')                          AS unacknowledged_events,
+                (SELECT COUNT(*) FROM blocked_exit_events
+                  WHERE workspace_id = $1 AND ended_at IS NULL AND status <> 'resolved')    AS ongoing_events,
+                (SELECT COUNT(*) FROM blocked_exit_events
+                  WHERE workspace_id = $1 AND status <> 'resolved'
+                    AND risk_level IN ('high', 'critical'))                                 AS high_risk_open_events,
+                (SELECT COUNT(*) FROM v_blocked_exit_camera_status s
+                  WHERE s.workspace_id = $1)                                                AS cameras_total,
+                (SELECT COUNT(*) FROM v_blocked_exit_camera_status s
+                  WHERE s.workspace_id = $1 AND s.is_streaming)                             AS cameras_streaming,
+                (SELECT COUNT(*) FROM v_blocked_exit_camera_status s
+                  WHERE s.workspace_id = $1 AND s.is_calibrated)                            AS cameras_calibrated,
+                (SELECT COUNT(*) FROM v_blocked_exit_camera_status s
+                  WHERE s.workspace_id = $1 AND s.open_event_id IS NOT NULL)                AS currently_blocked
+            """,
+            (workspace_id,),
+            fetch_one=True,
+        ) or {}
+        latest = await self.get_events(workspace_id, limit=6, offset=0)
+        return {**row, "latest_events": latest}
 
     async def most_blocked(self, workspace_id: UUID, days: int = 7, limit: int = 10) -> List[Dict[str, Any]]:
         return await self.db.execute_query(

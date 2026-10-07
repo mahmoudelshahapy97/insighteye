@@ -15,6 +15,7 @@ from app.schemas import (
     WorkspaceUpdate, 
     WorkspaceMemberCreate,
     WorkspaceMemberUpdate,
+    WorkspaceSwitchRequest,
     UserResponse
 )
 
@@ -153,6 +154,49 @@ async def get_active_workspace(
         "name": ws["name"],
         "member_role": ws["member_role"],
     }
+
+
+async def _switch_workspace(workspace_id: UUID, current_user_data: Dict, access_token: str, request: Request) -> Dict:
+    """Shared body of /workspaces/switch and /workspaces/{id}/activate."""
+    current_user_id = current_user_data['user_id']
+    username = current_user_data['username']
+
+    target = await workspace_service.assert_can_activate(
+        workspace_id,
+        current_user_id,
+        current_user_data.get('role')
+    )
+    token_pair = await session_manager.switch_session_workspace(access_token, current_user_id, workspace_id)
+
+    await session_manager.log_action(
+        content=f"User '{username}' switched to workspace '{target['workspace_name']}' (ID: {workspace_id}).",
+        user_id=str(current_user_id),
+        workspace_id=str(workspace_id),
+        action_type="Workspace_Switched",
+        ip_address=request.client.host if request.client else "N/A",
+        user_agent=request.headers.get("user-agent")
+    )
+
+    return {
+        "access_token": token_pair.access_token,
+        "refresh_token": token_pair.refresh_token,
+        "token_type": token_pair.token_type,
+        "expires_at": token_pair.expires_at,
+        "workspace_id": str(workspace_id),
+        "workspace_name": target['workspace_name'],
+        "role_in_workspace": target['role_in_workspace'],
+    }
+
+
+@router.post("/workspaces/switch", response_model=dict)
+async def switch_workspace(
+    switch_data: WorkspaceSwitchRequest,
+    request: Request,
+    current_user_data: Dict = Depends(get_current_user_full_data_dependency),
+    access_token: str = Depends(session_manager.get_token_from_header)
+):
+    """Switch to another workspace. Returns a new token pair; the old tokens are revoked."""
+    return await _switch_workspace(switch_data.workspace_id, current_user_data, access_token, request)
 
 
 @router.get("/features/me")
@@ -386,33 +430,43 @@ async def activate_workspace(
     request: Request,
     current_user_data: Dict = Depends(get_current_user_full_data_dependency)
 ):
-    """Activate a workspace for the current user."""
+    """Activate a workspace for the current user, keeping the current tokens valid.
+
+    Unlike POST /workspaces/switch, no tokens are re-issued or revoked, so clients
+    that keep their existing token stay logged in.
+    """
     try:
         workspace_id = UUID(workspace_id_str)
-        current_user_id = current_user_data['user_id']
-        username = current_user_data['username']
-        
-        result = await workspace_service.activate_workspace(
-            workspace_id,
-            current_user_id,
-            current_user_data.get('role')
-        )
-        
-        await session_manager.log_action(
-            content=f"User '{username}' activated workspace '{result['workspace_name']}' (ID: {workspace_id}).",
-            user_id=str(current_user_id),
-            workspace_id=str(workspace_id),
-            action_type="Workspace_Activated",
-            ip_address=request.client.host if request.client else "N/A",
-            user_agent=request.headers.get("user-agent")
-        )
-        
-        return {"message": f"Workspace '{result['workspace_name']}' is now active."}
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid workspace ID format."
         )
+    current_user_id = current_user_data['user_id']
+    username = current_user_data['username']
+
+    target = await workspace_service.assert_can_activate(
+        workspace_id,
+        current_user_id,
+        current_user_data.get('role')
+    )
+    await session_manager.set_active_workspace(current_user_id, workspace_id)
+
+    await session_manager.log_action(
+        content=f"User '{username}' activated workspace '{target['workspace_name']}' (ID: {workspace_id}).",
+        user_id=str(current_user_id),
+        workspace_id=str(workspace_id),
+        action_type="Workspace_Activated",
+        ip_address=request.client.host if request.client else "N/A",
+        user_agent=request.headers.get("user-agent")
+    )
+
+    return {
+        "message": f"Workspace '{target['workspace_name']}' is now active.",
+        "workspace_id": str(workspace_id),
+        "workspace_name": target['workspace_name'],
+        "role_in_workspace": target['role_in_workspace'],
+    }
 
 
 @router.get("/admin/all-workspaces", response_model=List[dict])

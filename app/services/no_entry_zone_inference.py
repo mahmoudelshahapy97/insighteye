@@ -213,9 +213,12 @@ class NoEntryZoneEngine:
         needs_frames = bool(armed) or state.clips.busy
         small = None
         if needs_frames:
-            small = self._annotate(
-                _resize_max_width(frame, CLIP_MAX_WIDTH), frame_size, state, detections, None
-            )
+            small = _resize_max_width(frame, CLIP_MAX_WIDTH)
+            if small is frame:
+                # Not resized: draw on a copy, or the zone overlay leaks into the
+                # caller's frame (other detectors and the live view on this stream).
+                small = frame.copy()
+            small = self._annotate(small, frame_size, state, detections, None)
             state.clips.push(ts, small, float(getattr(config, "no_entry_zone_clip_pre_seconds", 3.0)))
 
         post = float(getattr(config, "no_entry_zone_clip_post_seconds", 4.0))

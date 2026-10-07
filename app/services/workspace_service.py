@@ -797,17 +797,15 @@ class WorkspaceService:
                 detail="Failed to remove member."
             )
 
-    async def activate_workspace(
+    async def assert_can_activate(
         self,
         workspace_id: UUID,
         current_user_id: UUID,
         system_role: Optional[str] = None
     ) -> Dict:
-        """Set a workspace as active for the current user (all their active sessions)."""
+        """Check the user may switch into an active workspace; return its name and the user's role there."""
         try:
-            if system_role == "superadmin":
-                pass  # superadmins may work in any workspace
-            else:
+            if system_role != "superadmin":  # superadmins may work in any workspace
                 await check_workspace_access(
                     self.db_manager,
                     current_user_id,
@@ -815,17 +813,21 @@ class WorkspaceService:
                 )
             workspace_details = await self.get_workspace_by_id(workspace_id, check_active=True)
 
-            await self.db_manager.execute_query(
-                """UPDATE user_tokens SET workspace_id = $1, updated_at = $2 
-                   WHERE user_id = $3 AND is_active = TRUE""",
-                (workspace_id, datetime.now(ZoneInfo("Africa/Cairo")), current_user_id)
+            membership = await self.db_manager.execute_query(
+                "SELECT role FROM workspace_members WHERE user_id = $1 AND workspace_id = $2",
+                (current_user_id, workspace_id),
+                fetch_one=True
             )
 
-            return {"workspace_name": workspace_details['name']}
+            return {
+                "workspace_id": workspace_details["workspace_id"],
+                "workspace_name": workspace_details["name"],
+                "role_in_workspace": membership["role"] if membership else None,
+            }
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error activating workspace {workspace_id}: {e}", exc_info=True)
+            logger.error(f"Error checking access to workspace {workspace_id}: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to activate workspace."

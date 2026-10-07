@@ -51,6 +51,20 @@ class BlockedExitEventListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+    page: int = 1
+
+
+class BlockedExitOverviewResponse(BaseModel):
+    events_24h: int = 0
+    open_events: int = 0
+    unacknowledged_events: int = 0
+    ongoing_events: int = 0
+    high_risk_open_events: int = 0
+    cameras_total: int = 0
+    cameras_streaming: int = 0
+    cameras_calibrated: int = 0
+    currently_blocked: int = 0
+    latest_events: List[BlockedExitEventResponse] = []
 
 
 class BlockedExitEventDetail(BlockedExitEventResponse):

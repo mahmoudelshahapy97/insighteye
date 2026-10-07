@@ -252,6 +252,16 @@ class SessionManager:
         user_id_str = token_data.user_id
         workspace_id_str = token_data.workspace_id
 
+        # The session row is the source of truth for the workspace (it may have been
+        # switched after this refresh token was issued); fall back to the claim.
+        session_row = await self.db_manager.execute_query(
+            "SELECT workspace_id FROM user_tokens WHERE user_id = $1 AND refresh_token = $2 AND is_active = TRUE",
+            (UUID(user_id_str), refresh_token),
+            fetch_one=True
+        )
+        if session_row and session_row.get("workspace_id"):
+            workspace_id_str = str(session_row["workspace_id"])
+
         new_access_token = self.create_token( # create_token now returns str
             {"user_id": user_id_str, "workspace_id": workspace_id_str},
             "access"
@@ -311,17 +321,95 @@ class SessionManager:
             logger.error(f"Error revoking token: {e}", exc_info=True)
             return False
 
-    async def store_token_pair(self, user_id: Union[str, UUID], access_token: str, refresh_token: str, workspace_id: Optional[Union[str, UUID]] = None) -> str:
-        """Store a token pair in the database."""
-        token_id = uuid4()
-        now = datetime.now(ZoneInfo("Africa/Cairo"))
-        
+    def _token_expiries(self, access_token: str, refresh_token: str) -> tuple:
+        """Return (access_expires_at, refresh_expires_at) decoded from a token pair."""
         access_token_payload = jwt.decode(access_token, self.SECRET_KEY, algorithms=[self.ALGORITHM], options={"verify_exp": False})
         refresh_token_payload = jwt.decode(refresh_token, self.SECRET_KEY, algorithms=[self.ALGORITHM], options={"verify_exp": False})
 
         access_expires = datetime.fromtimestamp(access_token_payload["exp"], tz=ZoneInfo("Africa/Cairo"))
         refresh_expires = datetime.fromtimestamp(refresh_token_payload["exp"], tz=ZoneInfo("Africa/Cairo"))
-        
+        return access_expires, refresh_expires
+
+    async def set_active_workspace(self, user_id: Union[str, UUID], workspace_id: Union[str, UUID]) -> None:
+        """Move all of the user's active sessions to a workspace without touching their tokens.
+
+        Existing tokens stay valid; refresh_access_token picks the new workspace
+        up from the session row. Access to the workspace must be checked by the caller.
+        """
+        await self.db_manager.execute_query(
+            """UPDATE user_tokens SET workspace_id = $1, updated_at = $2
+               WHERE user_id = $3 AND is_active = TRUE""",
+            (UUID(str(workspace_id)), datetime.now(ZoneInfo("Africa/Cairo")), UUID(str(user_id)))
+        )
+
+    async def switch_session_workspace(self, current_access_token: str, user_id: Union[str, UUID], workspace_id: Union[str, UUID]) -> TokenPair:
+        """Switch the user's active workspace and re-issue the calling session's tokens.
+
+        Issues a fresh token pair carrying the new workspace_id, swaps it into the
+        session's user_tokens row and blacklists the old pair. The user's other
+        active sessions keep their tokens but move to the new workspace too: the
+        data endpoints resolve the workspace from the most recently updated
+        session row (WorkspaceService.get_user_and_workspace), so sessions on
+        different workspaces would flip-flop between them. Access to the
+        workspace must be checked by the caller.
+        """
+        db_user_id = UUID(str(user_id))
+        db_workspace_id = UUID(str(workspace_id))
+        now = datetime.now(ZoneInfo("Africa/Cairo"))
+
+        new_pair = self.create_token_pair(db_user_id, db_workspace_id)
+        access_expires, refresh_expires = self._token_expiries(new_pair.access_token, new_pair.refresh_token)
+
+        old_row = await self.db_manager.execute_query(
+            """
+            UPDATE user_tokens t
+            SET access_token = $1, refresh_token = $2, access_expires_at = $3,
+                refresh_expires_at = $4, workspace_id = $5, updated_at = $6
+            FROM (SELECT token_id, refresh_token, refresh_expires_at FROM user_tokens
+                  WHERE user_id = $7 AND access_token = $8 AND is_active = TRUE
+                  LIMIT 1) old
+            WHERE t.token_id = old.token_id
+            RETURNING old.refresh_token AS old_refresh_token, old.refresh_expires_at AS old_refresh_expires_at
+            """,
+            (new_pair.access_token, new_pair.refresh_token, access_expires, refresh_expires,
+             db_workspace_id, now, db_user_id, current_access_token),
+            fetch_one=True
+        )
+
+        if old_row is None:
+            # Session row not found (e.g. tokens issued before sessions were stored): start a new one.
+            logger.warning(f"No active session row for user {db_user_id} during workspace switch; storing a new one.")
+            await self.store_token_pair(db_user_id, new_pair.access_token, new_pair.refresh_token, db_workspace_id)
+
+        # Keep other sessions on the same workspace; updated_at stays older than this
+        # session's so this one remains the most recent.
+        await self.db_manager.execute_query(
+            """UPDATE user_tokens SET workspace_id = $1
+               WHERE user_id = $2 AND is_active = TRUE AND access_token <> $3""",
+            (db_workspace_id, db_user_id, new_pair.access_token)
+        )
+
+        old_access_payload = self.decode_token_without_verification(current_access_token) or {}
+        await self.blacklist_token(
+            current_access_token, db_user_id,
+            datetime.fromtimestamp(old_access_payload.get("exp", now.timestamp()), tz=ZoneInfo("Africa/Cairo")),
+            reason="workspace_switch"
+        )
+        if old_row is not None and old_row["old_refresh_token"]:
+            await self.blacklist_token(
+                old_row["old_refresh_token"], db_user_id, old_row["old_refresh_expires_at"],
+                reason="workspace_switch"
+            )
+
+        return new_pair
+
+    async def store_token_pair(self, user_id: Union[str, UUID], access_token: str, refresh_token: str, workspace_id: Optional[Union[str, UUID]] = None) -> str:
+        """Store a token pair in the database."""
+        token_id = uuid4()
+        now = datetime.now(ZoneInfo("Africa/Cairo"))
+
+        access_expires, refresh_expires = self._token_expiries(access_token, refresh_token)
+
         db_user_id = UUID(str(user_id))
         db_workspace_id = UUID(str(workspace_id)) if workspace_id else None
 

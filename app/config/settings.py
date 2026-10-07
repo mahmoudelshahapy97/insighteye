@@ -458,6 +458,7 @@ class Settings(BaseSettings):
     blocked_exit_confidence: float = 0.4
     blocked_exit_clip_pre_seconds: float = 3.0       # evidence clip: seconds before the episode opens
     blocked_exit_clip_post_seconds: float = 5.0      # ...and after
+    blocked_exit_config_refresh_seconds: float = 10.0  # re-read camera flag + door polygon while streaming
     no_entry_zone_confidence: float = 0.4
 
     # No-entry-zone violation rules (ported from features/no-entry-zone). Each zone

@@ -305,6 +305,11 @@ class WorkspaceMemberUpdate(BaseModel):
         return v
 
 
+class WorkspaceSwitchRequest(BaseModel):
+    """Schema for switching the current session to another workspace."""
+    workspace_id: UUID = Field(..., description="Workspace to switch to")
+
+
 class WorkspaceMemberInDB(WorkspaceMemberBase):
     """Workspace member as stored in database."""
     membership_id: UUID = Field(..., description="Unique membership identifier")

@@ -104,6 +104,7 @@ from app.schemas.workspace_schemas import (
     WorkspaceMemberUpdate,
     WorkspaceMemberInDB,
     WorkspaceMemberResponse,
+    WorkspaceSwitchRequest,
 )
 
 # OTP Management
@@ -315,6 +316,7 @@ __all__ = [
     'WorkspaceWithMemberInfo', 'WorkspaceResponse', 'WorkspaceMemberBase',
     'WorkspaceMemberCreate', 'WorkspaceMemberUpdate', 'WorkspaceMemberInDB',
     'WorkspaceMemberResponse',
+    'WorkspaceSwitchRequest',
     
     # OTP
     'OTPRequest', 'OTPVerification', 'OTPDeletion', 'OTPSendEmail',

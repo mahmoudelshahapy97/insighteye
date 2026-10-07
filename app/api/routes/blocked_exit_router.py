@@ -68,6 +68,7 @@ from app.schemas.blocked_exit_schema import (
     BlockedExitEventResponse,
     BlockedExitEventDetail,
     BlockedExitEventListResponse,
+    BlockedExitOverviewResponse,
     ResolveBlockedExitRequest,
     BlockedExitDailySummary,
     ActiveBlockedExitEventSummary,
@@ -184,6 +185,25 @@ def _filters(
 
 
 # ─────────────────────────────────────────────
+# Overview
+# ─────────────────────────────────────────────
+
+@router.get("/overview", response_model=BlockedExitOverviewResponse)
+async def get_overview(
+    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
+):
+    """Landing-page counters and the latest events, like no-entry-zone's overview."""
+    workspace_id = await get_workspace_id_for_user(current_user["username"])
+    try:
+        overview = await blocked_exit_service.overview(workspace_id)
+        overview["latest_events"] = [await _with_video_url(ev) for ev in overview["latest_events"]]
+        return overview
+    except Exception as e:
+        logger.error(f"blocked-exit overview error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error retrieving blocked-exit overview.")
+
+
+# ─────────────────────────────────────────────
 # Events
 # ─────────────────────────────────────────────
 
@@ -219,9 +239,11 @@ async def get_blocked_exit_events(
             workspace_id=workspace_id, status=status_filter, **extra, **f,
         )
         events = [await _with_video_url(ev) for ev in events]
-        return BlockedExitEventListResponse(items=events, total=total, limit=limit, offset=offset)
+        return BlockedExitEventListResponse(items=events, total=total, limit=limit, offset=offset, page=page)
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"get_blocked_exit_events error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving blocked-exit events.")
@@ -630,17 +652,22 @@ async def get_camera_snapshot(
     camera when it isn't streaming (so a door can be drawn on a stopped camera)."""
     workspace_id = await get_workspace_id_for_user(current_user["username"])
     source = await _source_for(stream_id, workspace_id)
+    if not source.get("path"):
+        raise HTTPException(status_code=502, detail="Camera has no source configured")
     jpeg, info = await camera_runtime.live_or_grab_jpeg(source["path"])
     if jpeg is None:
         raise HTTPException(status_code=502, detail=f"Camera unreachable: {info['error']}")
+    # Same headers as the no-entry-zone snapshot, so the UI can share one zone editor.
     return Response(
         content=jpeg,
         media_type="image/jpeg",
         headers={
             "Cache-Control": "no-store",
             "X-Frame-Source": info["frame_source"],
+            "X-Frame-Size": f"{info['width']}x{info['height']}",
             "X-Frame-Width": str(info["width"]),
             "X-Frame-Height": str(info["height"]),
+            "Access-Control-Expose-Headers": "X-Frame-Source, X-Frame-Size, X-Frame-Width, X-Frame-Height",
         },
     )
 
