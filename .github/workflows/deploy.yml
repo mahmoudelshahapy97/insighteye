@@ -56,7 +56,6 @@ jobs:
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
           envs: DEPLOY_PATH,SHA
-          script_stop: true
           # A rebuild of the CUDA image can take a long time.
           command_timeout: 90m
           script: |
