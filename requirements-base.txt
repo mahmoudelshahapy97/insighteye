@@ -43,10 +43,12 @@ hiredis==2.2.3
 apscheduler
 
 # LangChain ecosystem (CPU-safe)
-langchain
-langchain-core
-langchain_community
-langchain-ollama
+# Pinned to the versions in the working image: langchain_community 0.4
+# dropped ChatOpenAI, which app/utils/llm_utils.py imports.
+langchain==1.4.2
+langchain-core==1.6.5
+langchain_community==0.3.31
+langchain-ollama==1.1.0
 chromadb
 
 # Utils
