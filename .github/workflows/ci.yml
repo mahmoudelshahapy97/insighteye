@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       PYTHONPATH: ${{ github.workspace }}
       # pytest.ini's addopts enforce --cov-fail-under; CI reports coverage
@@ -45,5 +45,6 @@ jobs:
         run: PYTHONPATH="$PYTHONPATH:tests" python -m pytest tests/unit -p known_failures_plugin --cov=app --cov-report=term
 
       - name: Known failures (advisory)
-        continue-on-error: true
-        run: grep -vE '^\s*(#|$)' tests/known_failures.txt | xargs python -m pytest -q
+        run: |
+          grep -vE '^\s*(#|$)' tests/known_failures.txt | xargs python -m pytest -q \
+            || echo "::warning::Known failures still fail (advisory, see tests/known_failures.txt)"
