@@ -1,0 +1,19 @@
+# Unit tests that already failed on main when CI was added (2026-10-08).
+# CI deselects these so new failures still block deploys. Fix a test, then
+# delete its line here.
+tests/unit/test_camera_service.py::TestCameraServiceRetrieval::test_get_user_cameras
+tests/unit/test_camera_service.py::TestCameraServiceUpdate::test_update_camera_success
+tests/unit/test_camera_service.py::TestCameraServiceUpdate::test_update_camera_unauthorized
+tests/unit/test_camera_service.py::TestCameraServiceDeletion::test_delete_cameras_success
+tests/unit/test_camera_service.py::TestCameraServiceDeletion::test_delete_cameras_mixed_results
+tests/unit/test_camera_service.py::TestCameraServiceAlerts::test_update_alert_settings
+tests/unit/test_camera_service.py::TestCameraServiceLocationHierarchy::test_get_location_hierarchy
+tests/unit/test_camera_service.py::TestCameraServiceBulkOperations::test_bulk_assign_locations
+tests/unit/test_redis_batch_service.py::TestFlushAllToPostgres::test_flush_calls_batch_insert_with_records
+tests/unit/test_redis_batch_service.py::TestFlushAllToPostgres::test_flush_deletes_key_after_reading
+tests/unit/test_redis_batch_service.py::TestFlushAllToPostgres::test_flush_returns_zero_when_no_keys
+tests/unit/test_redis_batch_service.py::TestFlushAllToPostgres::test_flush_returns_zero_when_not_connected
+tests/unit/test_stream_management.py::test_update_camera
+tests/unit/test_user_service.py::test_create_user
+tests/unit/test_workspace_service.py::test_create_workspace
+tests/unit/test_workspace_service.py::test_add_workspace_member

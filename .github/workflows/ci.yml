@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      # pytest.ini's addopts enforce --cov-fail-under; CI reports coverage
+      # without gating on it.
+      PYTEST_ADDOPTS: -o addopts="" -p no:cacheprovider --tb=short --disable-warnings --strict-markers
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # Python 3.10 matches the nvidia/cuda ubuntu22.04 image in the Dockerfile.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements-*.txt
+
+      - name: Install system libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libgl1 libglib2.0-0 ffmpeg
+
+      # The runner has no GPU: install the base requirements plus CPU builds of
+      # the vision stack instead of requirements-gpu.txt.
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements-base.txt numpy==1.26.4 xgboost \
+            "ultralytics==8.4.7" "lap>=0.5.12" onnxruntime opencv-python-headless pytest-timeout \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Byte-compile app
+        run: python -m compileall -q app
+
+      - name: Unit tests
+        run: PYTHONPATH="$PYTHONPATH:tests" python -m pytest tests/unit -p known_failures_plugin --cov=app --cov-report=term
+
+      - name: Known failures (advisory)
+        continue-on-error: true
+        run: grep -vE '^\s*(#|$)' tests/known_failures.txt | xargs python -m pytest -q

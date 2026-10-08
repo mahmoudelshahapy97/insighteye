@@ -1,0 +1,108 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  PUBLIC_HEALTH_URL: https://te-s.xyz/insighteye/health
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://te-s.xyz/insighteye/
+    steps:
+      - name: Deploy to EC2 over SSH
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
+          envs: DEPLOY_PATH,SHA
+          script_stop: true
+          # A rebuild of the CUDA image can take a long time.
+          command_timeout: 90m
+          script: |
+            set -euo pipefail
+            cd "$DEPLOY_PATH"
+            IMAGE=insighteye_app:latest
+            PREV=insighteye_app:previous
+
+            OLD=$(git rev-parse HEAD)
+            git fetch --prune origin
+            git reset --hard "$SHA"
+            echo "Deploying $OLD -> $(git rev-parse HEAD)"
+            PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2 | tr -d '"' || true)
+            URL="http://localhost:${PORT:-8000}/health"
+
+            healthy() {
+              # Model loading and the DB pool can take a few minutes on start.
+              for _ in $(seq 1 60); do
+                curl -fsS -o /dev/null "$URL" && return 0
+                sleep 5
+              done
+              return 1
+            }
+
+            # Code is bind-mounted into the containers (.:/app), so only image
+            # inputs need a rebuild; anything else just needs a restart.
+            rebuilt=0
+            if git diff --name-only "$OLD" HEAD | grep -qxE 'Dockerfile|\.dockerignore|requirements(-base|-gpu)?\.txt|docker-compose\.yml'; then
+              echo "==> Image inputs changed: rebuilding"
+              docker image inspect "$IMAGE" >/dev/null 2>&1 && docker tag "$IMAGE" "$PREV"
+              docker compose build app
+              rebuilt=1
+            else
+              echo "==> Image inputs unchanged: no rebuild"
+            fi
+
+            echo "==> Restart app and worker"
+            docker compose up -d --remove-orphans redis
+            docker compose up -d --force-recreate app celery_worker
+
+            echo "==> Health check $URL"
+            if ! healthy; then
+              echo "ERROR: not healthy, rolling back to $OLD"
+              docker compose logs --tail 100 app || true
+              git reset --hard "$OLD"
+              if [ "$rebuilt" = 1 ] && docker image inspect "$PREV" >/dev/null 2>&1; then
+                docker tag "$PREV" "$IMAGE"
+              fi
+              docker compose up -d --force-recreate app celery_worker
+              healthy || echo "ERROR: rollback is not healthy either"
+              exit 1
+            fi
+            docker image prune -f
+            echo "Deployed $(git rev-parse --short HEAD)"
+
+      - name: Health check through the load balancer
+        run: |
+          for _ in $(seq 1 30); do
+            if body=$(curl -fsS -m 10 "$PUBLIC_HEALTH_URL"); then
+              echo "$body"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "ERROR: $PUBLIC_HEALTH_URL not healthy" >&2
+          exit 1
