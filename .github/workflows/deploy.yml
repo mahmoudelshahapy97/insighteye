@@ -63,12 +63,14 @@ jobs:
             cd "$DEPLOY_PATH"
             IMAGE=insighteye_app:latest
             PREV=insighteye_app:previous
-            # Free space a rebuild needs on / (the app image alone is ~20 GB).
-            MIN_FREE_GB=25
+            # A rebuild adds ~11 GB of layers plus build cache next to the old image.
+            MIN_FREE_GB=15
 
-            # A manual prune can leave the running image tagged only :previous.
+            free_gb() { df --output=avail -BG / | tail -1 | tr -dc 0-9; }
+
+            # A manual `docker system prune -a` can untag :latest while :previous survives.
             if ! docker image inspect "$IMAGE" >/dev/null 2>&1 && docker image inspect "$PREV" >/dev/null 2>&1; then
-              echo "==> $IMAGE missing: re-tagging from $PREV"
+              echo "==> $IMAGE missing: restoring it from $PREV"
               docker tag "$PREV" "$IMAGE"
             fi
 
@@ -88,61 +90,69 @@ jobs:
               return 1
             }
 
-            free_gb() { df --output=avail -BG / | tail -1 | tr -dc '0-9'; }
+            rollback() {
+              echo "ERROR: $1, rolling back to $OLD"
+              df -h /
+              docker compose logs --tail 100 app celery_worker || true
+              git reset --hard "$OLD"
+              if [ "$rebuilt" = 1 ] && docker image inspect "$PREV" >/dev/null 2>&1; then
+                docker tag "$PREV" "$IMAGE"
+              fi
+              docker compose up -d --force-recreate app celery_worker || true
+              healthy || echo "ERROR: rollback is not healthy either"
+            }
 
-            # Never --volumes or system prune -a: redis_data and the running
-            # image must stay.
-            echo "==> Disk before cleanup"; df -h /
+            echo "==> Docker cleanup"
             docker container prune -f
-            docker image prune -f # dangling only; keeps :latest/:previous
+            docker image prune -f
             docker builder prune -f --filter until=168h
+            df -h /
 
             # Code is bind-mounted into the containers (.:/app), so only image
             # inputs need a rebuild; anything else just needs a restart.
             rebuilt=0
             if git diff --name-only "$OLD" HEAD | grep -qxE 'Dockerfile|\.dockerignore|requirements(-base|-gpu)?\.txt|docker-compose\.yml'; then
               echo "==> Image inputs changed: rebuilding"
-              # Check space before touching anything, so a full disk can't
-              # leave the running containers half-built.
               if [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; then
-                echo "==> Only $(free_gb)G free on /, pruning all build cache"
                 docker builder prune -af
               fi
               if [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; then
-                df -h /
-                echo "::error::Only $(free_gb)G free on /, need ${MIN_FREE_GB}G to rebuild. Containers left untouched."
+                echo "ERROR: only $(free_gb)G free on /, need ${MIN_FREE_GB}G to rebuild; nothing changed"
+                git reset --hard "$OLD"
                 exit 1
               fi
               docker image inspect "$IMAGE" >/dev/null 2>&1 && docker tag "$IMAGE" "$PREV"
-              docker compose build app
+              if ! docker compose build app; then
+                echo "ERROR: build failed; running containers untouched"
+                df -h /
+                git reset --hard "$OLD"
+                exit 1
+              fi
               rebuilt=1
             else
               echo "==> Image inputs unchanged: no rebuild"
             fi
 
-            # A failed `up` must roll back too, not just exit under set -e.
             echo "==> Restart app and worker"
-            if ! { docker compose up -d --remove-orphans redis &&
-                   docker compose up -d --force-recreate app celery_worker &&
-                   echo "==> Health check $URL" && healthy; }; then
-              echo "ERROR: start or health check failed, rolling back to $OLD"
-              df -h / || true
-              docker compose logs --tail 100 app || true
-              git reset --hard "$OLD"
-              if [ "$rebuilt" = 1 ] && docker image inspect "$PREV" >/dev/null 2>&1; then
-                docker tag "$PREV" "$IMAGE"
-              fi
-              docker compose up -d --force-recreate app celery_worker
-              healthy || echo "ERROR: rollback is not healthy either"
+            docker compose up -d --remove-orphans redis
+            if ! docker compose up -d --force-recreate app celery_worker; then
+              rollback "docker compose up failed"
               exit 1
             fi
 
-            # :previous only matters for rollback within this deploy; each
-            # rebuild re-tags it, so drop it once healthy (~20 GB).
-            if [ "$rebuilt" = 1 ]; then docker image rm "$PREV" 2>/dev/null || true; fi
+            echo "==> Health check $URL"
+            if ! healthy; then
+              rollback "not healthy"
+              exit 1
+            fi
+
+            # :previous only exists to roll back within this deploy.
+            if [ "$rebuilt" = 1 ]; then
+              docker image rm "$PREV" || true
+            fi
             docker image prune -f
             docker builder prune -f --filter until=168h
-            echo "==> Disk after deploy"; df -h /
+            df -h /
             echo "Deployed $(git rev-parse --short HEAD)"
 
       - name: Health check through the load balancer
