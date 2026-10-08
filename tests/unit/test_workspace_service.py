@@ -107,16 +107,11 @@ async def test_assert_can_activate_non_member_forbidden(workspace_service, mock_
 
 
 @pytest.mark.asyncio
-async def test_assert_can_activate_superadmin_non_member(workspace_service, mock_db_manager):
-    workspace_id = uuid4()
+async def test_assert_can_activate_superadmin_non_member_forbidden(workspace_service, mock_db_manager):
+    # Superadmins, like everyone else, may only switch into workspaces they are assigned to.
+    from fastapi import HTTPException
+    mock_db_manager.execute_query.return_value = None
 
-    async def db_side_effect(query, *args, **kwargs):
-        if "FROM workspaces" in query:
-            return {"workspace_id": workspace_id, "name": "WS", "description": None,
-                    "created_at": None, "updated_at": None, "is_active": True}
-        return None
-    mock_db_manager.execute_query.side_effect = db_side_effect
-
-    result = await workspace_service.assert_can_activate(workspace_id, uuid4(), "superadmin")
-
-    assert result["role_in_workspace"] is None
+    with pytest.raises(HTTPException) as exc:
+        await workspace_service.assert_can_activate(uuid4(), uuid4(), "superadmin")
+    assert exc.value.status_code == 403

@@ -183,11 +183,9 @@ class WorkspaceService:
                 w.is_active, COALESCE(wm.role, 'admin') as member_role
             FROM workspaces w
             JOIN user_tokens ut ON w.workspace_id = ut.workspace_id 
-            JOIN users u ON u.user_id = ut.user_id
-            LEFT JOIN workspace_members wm ON w.workspace_id = wm.workspace_id 
+            JOIN workspace_members wm ON w.workspace_id = wm.workspace_id 
                 AND ut.user_id = wm.user_id
             WHERE ut.user_id = $1 AND ut.is_active = TRUE AND w.is_active = TRUE
-              AND (wm.user_id IS NOT NULL OR u.role = 'superadmin')
             ORDER BY ut.updated_at DESC LIMIT 1 
         """
         workspace_data = await self.db_manager.execute_query(
@@ -803,14 +801,14 @@ class WorkspaceService:
         current_user_id: UUID,
         system_role: Optional[str] = None
     ) -> Dict:
-        """Check the user may switch into an active workspace; return its name and the user's role there."""
+        """Check the user is a member of an active workspace; return its name and the user's role there."""
         try:
-            if system_role != "superadmin":  # superadmins may work in any workspace
-                await check_workspace_access(
-                    self.db_manager,
-                    current_user_id,
-                    workspace_id,
-                )
+            # Everyone, superadmins included, works only in workspaces they are assigned to.
+            await check_workspace_access(
+                self.db_manager,
+                current_user_id,
+                workspace_id,
+            )
             workspace_details = await self.get_workspace_by_id(workspace_id, check_active=True)
 
             membership = await self.db_manager.execute_query(

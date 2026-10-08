@@ -104,6 +104,7 @@ async def create_workspace(
     current_user_data: Dict = Depends(get_current_user_id_dependency)
 ):
     """Create a new workspace."""
+    _require_superadmin(current_user_data)
     current_user_id = current_user_data['user_id']
     username = current_user_data['username']
     
@@ -134,9 +135,7 @@ async def get_user_workspaces(
     include_inactive: bool = Query(False, description="Include inactive workspaces"),
     current_user_data: Dict = Depends(get_current_user_id_dependency)
 ):
-    """Get all workspaces for the current user (superadmin: every workspace)."""
-    if workspace_service.is_superadmin(current_user_data):
-        return await workspace_service.get_all_workspaces(include_inactive)
+    """Get the workspaces the current user is a member of (superadmins included)."""
     current_user_id = current_user_data['user_id']
     return await workspace_service.get_user_workspaces(current_user_id, include_inactive)
 
@@ -243,6 +242,7 @@ async def update_workspace(
     current_user_data: Dict = Depends(get_current_user_id_dependency)
 ):
     """Update workspace information."""
+    _require_superadmin(current_user_data)
     try:
         workspace_id = UUID(workspace_id_str)
         current_user_id = current_user_data['user_id']
@@ -306,6 +306,7 @@ async def add_workspace_member(
     current_user_data: Dict = Depends(get_current_user_id_dependency)
 ):
     """Add a new member to a workspace."""
+    _require_superadmin(current_user_data)
     try:
         workspace_id = UUID(workspace_id_str)
         current_user_id = current_user_data['user_id']
@@ -351,6 +352,7 @@ async def update_workspace_member_role(
     current_user_data: Dict = Depends(get_current_user_full_data_dependency)
 ):
     """Update a workspace member's role."""
+    _require_superadmin(current_user_data)
     try:
         workspace_id = UUID(workspace_id_str)
         target_user_id = UUID(target_user_id_str)
@@ -392,6 +394,7 @@ async def remove_workspace_member(
     current_user_data: Dict = Depends(get_current_user_full_data_dependency)
 ):
     """Remove a member from a workspace."""
+    _require_superadmin(current_user_data)
     try:
         workspace_id = UUID(workspace_id_str)
         target_user_id = UUID(target_user_id_str)
