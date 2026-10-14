@@ -152,8 +152,6 @@ async def workspace_search_results_with_location(
     end_time: Optional[str] = Query(None),
     location: Optional[str] = Query(None),
     area: Optional[str] = Query(None),
-    locations: Optional[str] = Query(None, description="Alias for location"),
-    areas: Optional[str] = Query(None, description="Alias for area"),
     building: Optional[str] = Query(None),
     floor_level: Optional[str] = Query(None),
     zone: Optional[str] = Query(None),
@@ -214,10 +212,6 @@ async def workspace_search_results_with_location(
 
         if full_data:
             processed_per_page = None
-
-        # Accept the plural param names sent by the UI
-        location = location or locations
-        area = area or areas
 
         # Parse camera IDs
         parsed_camera_ids = parse_camera_ids(camera_id_param) if camera_id_param else None
