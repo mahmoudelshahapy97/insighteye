@@ -159,7 +159,7 @@ async def workspace_search_results_with_location(
     per_page: Optional[str] = Query(None),
     include_frame: bool = Query(True),
     base64: Optional[bool] = Query(None, description="Alias for include_frame used by the frame-search UI"),
-    full_data: Optional[bool] = Query(None, description="Return all matching rows (no pagination)"),
+    full_data: Optional[bool] = Query(None, description="Return up to 10000 rows per page; use page for the rest"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Enhanced search with location-based filtering using detection_data_service"""
@@ -210,8 +210,9 @@ async def workspace_search_results_with_location(
         elif per_page is None:
             processed_per_page = 10
 
+        # Capped: an unfiltered workspace can be millions of rows in one response.
         if full_data:
-            processed_per_page = None
+            processed_per_page = 10000
 
         # Parse camera IDs
         parsed_camera_ids = parse_camera_ids(camera_id_param) if camera_id_param else None
