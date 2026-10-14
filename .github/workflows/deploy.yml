@@ -76,7 +76,35 @@ jobs:
 
             OLD=$(git rev-parse HEAD)
             git fetch --prune origin
-            git reset --hard "$SHA"
+            # Keep work made by hand on the server on top of $SHA when it applies
+            # cleanly; otherwise deploy $SHA as-is and leave that work in a backup.
+            STAMP=$(date +%Y%m%d-%H%M%S)
+            G="git -c user.name=deploy -c user.email=deploy@localhost"
+            stashed=0
+            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+              $G stash push -m "pre-deploy $STAMP"
+              stashed=1
+            fi
+            if [ -n "$(git rev-list "$SHA..HEAD")" ]; then
+              git branch "server-backup-$STAMP" HEAD
+              if $G rebase "$SHA"; then
+                echo "==> Kept server commits on top of $SHA (backup: server-backup-$STAMP)"
+              else
+                $G rebase --abort || true
+                git reset --hard "$SHA"
+                echo "WARNING: server commits conflict with $SHA; deployed $SHA, they are on branch server-backup-$STAMP"
+              fi
+            else
+              git reset --hard "$SHA"
+            fi
+            if [ "$stashed" = 1 ]; then
+              if $G stash apply; then
+                echo "==> Kept uncommitted server changes (copy in git stash list)"
+              else
+                git reset --hard HEAD
+                echo "WARNING: uncommitted server changes conflict; they are in git stash list (pre-deploy $STAMP)"
+              fi
+            fi
             echo "Deploying $OLD -> $(git rev-parse HEAD)"
             PORT=$(grep -E '^APP_PORT=' .env | cut -d= -f2 | tr -d '"' || true)
             URL="http://localhost:${PORT:-8000}/health"
@@ -133,6 +161,7 @@ jobs:
               echo "==> Image inputs unchanged: no rebuild"
             fi
 
+            # A failed `up` must roll back too, not just exit under set -e.
             echo "==> Restart app and worker"
             docker compose up -d --remove-orphans redis
             if ! docker compose up -d --force-recreate app celery_worker; then
