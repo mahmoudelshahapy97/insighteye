@@ -152,6 +152,8 @@ async def workspace_search_results_with_location(
     end_time: Optional[str] = Query(None),
     location: Optional[str] = Query(None),
     area: Optional[str] = Query(None),
+    locations: Optional[str] = Query(None, description="Alias for location"),
+    areas: Optional[str] = Query(None, description="Alias for area"),
     building: Optional[str] = Query(None),
     floor_level: Optional[str] = Query(None),
     zone: Optional[str] = Query(None),
@@ -159,7 +161,7 @@ async def workspace_search_results_with_location(
     per_page: Optional[str] = Query(None),
     include_frame: bool = Query(True),
     base64: Optional[bool] = Query(None, description="Alias for include_frame used by the frame-search UI"),
-    full_data: Optional[bool] = Query(None, description="Accepted for compatibility; no effect beyond per_page=null"),
+    full_data: Optional[bool] = Query(None, description="Return all matching rows (no pagination)"),
     current_user_data: Dict = Depends(session_manager.get_current_user_full_data_dependency)
 ):
     """Enhanced search with location-based filtering using detection_data_service"""
@@ -211,8 +213,12 @@ async def workspace_search_results_with_location(
             processed_per_page = 10
 
         if full_data:
-            processed_per_page = 100
-        
+            processed_per_page = None
+
+        # Accept the plural param names sent by the UI
+        location = location or locations
+        area = area or areas
+
         # Parse camera IDs
         parsed_camera_ids = parse_camera_ids(camera_id_param) if camera_id_param else None
 
