@@ -1,5 +1,5 @@
 # app/config/settings.py
-from typing import Annotated, List, Optional, Literal
+from typing import Annotated, Dict, List, Optional, Literal
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic import Field, field_validator
 from dotenv import load_dotenv
@@ -233,6 +233,7 @@ class Settings(BaseSettings):
     pt_shoplifting_model_path: str = "models/shoplifting.pt"
     pt_blocked_exit_model_path: str = "models/yolo26n-seg.pt"
     pt_no_entry_zone_model_path: str = "models/yolo26n.pt"
+    pt_lost_found_model_path: str = "models/yolo26l.pt"
 
     # ONNX Model Paths
     onnx_people_model_path: str = "models/people.onnx"
@@ -241,6 +242,7 @@ class Settings(BaseSettings):
     onnx_shoplifting_model_path: str = "models/shoplifting.onnx"
     onnx_blocked_exit_model_path: str = "models/yolo26n-seg.onnx"
     onnx_no_entry_zone_model_path: str = "models/yolo26n.onnx"
+    onnx_lost_found_model_path: str = "models/yolo26l.onnx"
 
     # OpenVINO Model Paths
     openvino_people_model_path: str = "models/people_openvino"
@@ -249,6 +251,7 @@ class Settings(BaseSettings):
     openvino_shoplifting_model_path: str = "models/shoplifting_openvino"
     openvino_blocked_exit_model_path: str = "models/yolo26n-seg_openvino"
     openvino_no_entry_zone_model_path: str = "models/yolo26n_openvino"
+    openvino_lost_found_model_path: str = "models/yolo26l_openvino"
 
     # TensorRT Model Paths
     tensorrt_people_model_path: str = "models/people.engine"
@@ -257,6 +260,7 @@ class Settings(BaseSettings):
     tensorrt_shoplifting_model_path: str = "models/shoplifting.engine"
     tensorrt_blocked_exit_model_path: str = "models/yolo26n-seg.engine"
     tensorrt_no_entry_zone_model_path: str = "models/yolo26n.engine"
+    tensorrt_lost_found_model_path: str = "models/yolo26l.engine"
 
     # Pose Model (for temporal sequence extraction)
     pt_pose_model_path: str = "models/yolo26m-pose.pt"
@@ -326,6 +330,16 @@ class Settings(BaseSettings):
         elif self.model_backend == "tensorrt":
             return self.tensorrt_no_entry_zone_model_path
         return self.pt_no_entry_zone_model_path
+
+    @property
+    def lost_found_model_path(self) -> str:
+        if self.model_backend == "onnx":
+            return self.onnx_lost_found_model_path
+        elif self.model_backend == "openvino":
+            return self.openvino_lost_found_model_path
+        elif self.model_backend == "tensorrt":
+            return self.tensorrt_lost_found_model_path
+        return self.pt_lost_found_model_path
 
     model_cache_dir: str = "./model_cache"
     model_device: Literal["cpu", "cuda"] = "cuda"
@@ -474,6 +488,50 @@ class Settings(BaseSettings):
     no_entry_zone_clip_pre_seconds: float = 3.0
     no_entry_zone_clip_post_seconds: float = 4.0
     no_entry_zone_zone_refresh_seconds: float = 10.0 # re-read camera flag + zones while streaming
+
+    # Lost & found (abandoned objects; ported from the standalone lost-found app).
+    # Detection runs at a low confidence on purpose: ByteTrack's thresholds in
+    # app/services/lost_found/bytetrack_lostfound.yaml decide what starts a track.
+    lost_found_confidence: float = 0.05
+    lost_found_process_fps: float = 5.0              # frames per second fed to the engine
+    lost_found_config_refresh_seconds: float = 10.0  # re-read camera flag + ROI while streaming
+    lost_found_agnostic_nms_iou: float = 0.7         # one box per object across classes
+    lost_found_object_class_ids: List[int] = [24, 25, 26, 28, 67]  # backpack, umbrella, handbag, suitcase, cell phone
+    lost_found_class_name_map: Dict[str, str] = {
+        "backpack": "bag", "handbag": "bag", "suitcase": "bag", "cell phone": "mobile_phone",
+    }
+    lost_found_loose_track_iou: float = 0.5          # follow unconfirmed still objects by overlap
+    lost_found_loose_track_max_gap_frames: int = 10
+    lost_found_clip_pre_seconds: float = 40.0        # covers the drop, ~abandon_seconds before the alert
+    lost_found_clip_post_seconds: float = 10.0
+    lost_found_crop_context_ratio: float = 0.15
+    lost_found_max_upload_bytes: int = 10 * 1024 * 1024
+    # Abandonment rules (each overridable per camera in lost_found_camera_config.settings).
+    lost_found_static_tolerance_px: float = 25.0
+    lost_found_static_tolerance_ratio: float = 0.5
+    lost_found_static_window_seconds: float = 3.0
+    lost_found_owner_distance_px: float = 180.0
+    lost_found_abandon_distance_px: float = 260.0
+    lost_found_owner_radius_heights: float = 1.0
+    lost_found_abandon_radius_heights: float = 1.5
+    lost_found_stand_in_seconds: float = 3.0
+    lost_found_abandon_seconds: float = 30.0
+    lost_found_require_owner: bool = True
+    lost_found_min_object_size_px: float = 10.0
+    lost_found_track_max_misses: int = 30
+    lost_found_reid_iou: float = 0.5
+    lost_found_event_cooldown_seconds: float = 300.0
+    # Lost-report matching.
+    lost_found_match_top_k: int = 10
+    lost_found_match_class_weight: float = 0.5
+    lost_found_match_color_weight: float = 0.3
+    lost_found_match_time_weight: float = 0.2
+    lost_found_match_visual_weight: float = 0.3
+    lost_found_match_hash_share: float = 0.3
+    lost_found_match_photo_keep: float = 0.8
+    lost_found_match_window_hours: float = 72.0
+    lost_found_match_min_score: float = 0.3
+    lost_found_match_dedupe_iou: float = 0.6
 
     # Standard 80-class COCO label list, index == class_id, used to translate
     # the ModelFactory loaders' bare class_id detections into readable labels

@@ -34,6 +34,7 @@ from app.services.fire_detection_service import fire_detection_service
 from app.services.people_count_service import people_count_service
 from app.services.blocked_exit_inference import blocked_exit_engine
 from app.services.no_entry_zone_inference import no_entry_zone_engine
+from app.services.lost_found_inference import lost_found_engine
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,7 @@ class StreamProcessingService:
             self.shoplifting_engine = shoplifting_engine
             self.blocked_exit_engine = blocked_exit_engine
             self.no_entry_zone_engine = no_entry_zone_engine
+            self.lost_found_engine = lost_found_engine
 
             # Load models immediately to fail fast if there's an issue
             self.people_model.load_model()
@@ -1457,6 +1459,125 @@ class StreamProcessingService:
         except Exception as e:
             logger.error(f"Error sending no-entry-zone notification: {e}", exc_info=True)
 
+    async def _handle_lost_found_result(
+        self,
+        stream_id: UUID,
+        stream_id_str: str,
+        result: Dict[str, Any],
+        camera_name: str,
+        workspace_id: UUID,
+        owner_id: UUID,
+    ):
+        """Persist abandoned objects from LostFoundEngine and upload their evidence.
+
+        The event and its found item are inserted inline so the clip, which always
+        finishes on a later frame, finds the row; the snapshot / crop / clip uploads run
+        in the background so a slow S3 never stalls the frame loop.
+        """
+        from app.services.lost_found_service import lost_found_service
+
+        for record in result.get("events", []):
+            try:
+                event_id = UUID(record["event_id"])
+                created = await lost_found_service.insert_event(
+                    stream_id=stream_id, workspace_id=workspace_id, camera_name=camera_name, record=record,
+                )
+                if not created:
+                    continue  # this object was already recorded
+                found_id = await lost_found_service.insert_found_item(
+                    event_id=event_id, stream_id=stream_id, workspace_id=workspace_id, record=record,
+                )
+                self._nez_spawn(self._lost_found_upload_images(
+                    event_id, found_id, workspace_id, stream_id_str,
+                    record.get("snapshot_jpeg"), record.get("crop_jpeg"),
+                ))
+                await self._notify_lost_found(stream_id_str, record, camera_name, workspace_id, owner_id)
+                logger.warning(
+                    f"🧳 Abandoned {record['class_name']} recorded on {stream_id_str} (event {event_id})"
+                )
+            except Exception as e:
+                logger.error(f"Error recording lost & found event: {e}", exc_info=True)
+
+        for clip in result.get("clips", []):
+            self._nez_spawn(self._lost_found_upload_clip(
+                UUID(clip["event_id"]), workspace_id, stream_id_str, clip["jpegs"], clip["fps"],
+            ))
+
+    async def _lost_found_upload_images(
+        self, event_id: UUID, found_id: Optional[UUID], workspace_id: UUID, stream_id_str: str,
+        snapshot_jpeg: Optional[bytes], crop_jpeg: Optional[bytes],
+    ):
+        from app.services.lost_found_service import lost_found_service, s3_key, upload_jpeg
+        try:
+            path = await upload_jpeg(snapshot_jpeg, s3_key(workspace_id, stream_id_str, "frames", event_id, "jpg"))
+            if path:
+                await lost_found_service.set_event_evidence(event_id, snapshot_path=path)
+            if found_id:
+                path = await upload_jpeg(crop_jpeg, s3_key(workspace_id, stream_id_str, "crops", found_id, "jpg"))
+                if path:
+                    await lost_found_service.set_found_crop(found_id, path)
+        except Exception as e:
+            logger.error(f"[lost-found] image upload failed for event {event_id}: {e}", exc_info=True)
+
+    async def _lost_found_upload_clip(
+        self, event_id: UUID, workspace_id: UUID, stream_id_str: str, jpegs: List[bytes], fps: float,
+    ):
+        """The engine buffers clip frames as JPEGs; decode them off the loop, then encode
+        and upload like the other features' clips."""
+        from app.services.lost_found.imaging import decode_jpeg
+        from app.services.lost_found_service import lost_found_service, s3_key
+        frames = await asyncio.to_thread(lambda: [f for f in (decode_jpeg(j) for j in jpegs) if f is not None])
+        await self._upload_clip(
+            frames, fps,
+            key=s3_key(workspace_id, stream_id_str, "clips", event_id, "mp4"),
+            on_uploaded=lambda path: lost_found_service.set_event_evidence(event_id, video_path=path),
+            tag="lost-found",
+        )
+
+    async def _notify_lost_found(
+        self,
+        stream_id_str: str,
+        record: Dict[str, Any],
+        camera_name: str,
+        workspace_id: UUID,
+        owner_id: UUID,
+    ):
+        try:
+            what = (record.get("class_name") or "object").replace("_", " ")
+            unattended = record.get("unattended_seconds")
+            suffix = f" (unattended {unattended:.0f}s)" if unattended else ""
+            message = f"🧳 ABANDONED OBJECT: {what} left on '{camera_name}'{suffix}"
+            notification = await notification_service.create_notification(
+                workspace_id=workspace_id,
+                user_id=owner_id,
+                status="warning",
+                message=message,
+                stream_id=UUID(stream_id_str),
+                camera_name=camera_name,
+            )
+            if not notification:
+                return
+            ts = notification.get("timestamp")
+            await self._broadcast_to_workspace(owner_id, workspace_id, {
+                "type": "new_notification",
+                "notification": {
+                    "id": str(notification.get("notification_id")),
+                    "user_id": str(notification.get("user_id")),
+                    "workspace_id": str(notification.get("workspace_id")),
+                    "stream_id": stream_id_str,
+                    "camera_name": camera_name,
+                    "status": notification.get("status"),
+                    "message": message,
+                    "timestamp": ts.timestamp() if ts else datetime.now(ZoneInfo("Africa/Cairo")).timestamp(),
+                    "read": False,
+                    "module": "lost_found",
+                    "event_id": record["event_id"],
+                    "class_name": record.get("class_name"),
+                },
+            }, feature="lost_found")
+        except Exception as e:
+            logger.error(f"Error sending lost & found notification: {e}", exc_info=True)
+
     async def process_stream_with_sharing(
         self,
         stream_id: UUID,
@@ -1487,6 +1608,7 @@ class StreamProcessingService:
         shoplifting_engine_load_attempted = False  # throttle: only retry once per stream session
         blocked_exit_engine_load_attempted = False
         no_entry_zone_engine_load_attempted = False
+        lost_found_engine_load_attempted = False
 
         last_db_update_activity = datetime.now(ZoneInfo("Africa/Cairo"))
         last_heartbeat = datetime.now(ZoneInfo("Africa/Cairo"))
@@ -1537,6 +1659,7 @@ class StreamProcessingService:
             blocked_exit_enabled = bool(_stream_db.get('is_blocked_exit_camera', False)) if _stream_db else False
             no_entry_zone_enabled = bool(_stream_db.get('is_no_entry_zone_camera', False)) if _stream_db else False
             is_people_counting_camera = bool(_stream_db.get('is_people_counting_camera', False)) if _stream_db else False
+            lost_found_enabled = bool(_stream_db.get('is_lost_found_camera', False)) if _stream_db else False
 
             # Superadmin feature access (camera owner ∩ workspace) further gates every
             # detection. Re-checked in the main loop so opening/closing a feature takes
@@ -1552,6 +1675,7 @@ class StreamProcessingService:
             blocked_exit_enabled = cam_blocked_exit and 'blocked_exit' in allowed_features
             no_entry_zone_enabled = no_entry_zone_enabled and 'no_entry_zone' in allowed_features
             is_people_counting_camera = cam_people_counting and 'people_counting' in allowed_features
+            lost_found_enabled = lost_found_enabled and 'lost_found' in allowed_features
             last_feature_refresh = time.monotonic()
 
             # Like no-entry-zone below: the camera flag and door polygon are re-read
@@ -1584,6 +1708,22 @@ class StreamProcessingService:
             # stream restart.
             nez_refresh_every = float(getattr(config, "no_entry_zone_zone_refresh_seconds", 10.0))
             last_nez_refresh = time.monotonic()
+
+            # Lost & found: no ROI is needed (whole frame by default), so the camera flag
+            # alone turns it on; flag and config are re-read like no-entry-zone's.
+            if lost_found_enabled:
+                try:
+                    from app.services.lost_found_service import lost_found_service
+                    self.lost_found_engine.set_config(
+                        stream_id_str, await lost_found_service.get_config(stream_id),
+                    )
+                except Exception as e:
+                    logger.error(f"[lost-found] failed to load config for {stream_id_str}: {e}")
+                    lost_found_enabled = False
+            lf_refresh_every = float(getattr(config, "lost_found_config_refresh_seconds", 10.0))
+            last_lf_refresh = time.monotonic()
+            lf_interval = 1.0 / max(0.1, float(getattr(config, "lost_found_process_fps", 5.0)))
+            last_lf_frame = 0.0
 
             # -------------------- SOURCE --------------------
             if not source.startswith("rtsp://"):
@@ -1668,8 +1808,9 @@ class StreamProcessingService:
                                     logger.error(f"[blocked-exit] feature toggle failed for {stream_id_str}: {e}")
                                 blocked_exit_enabled = be_now
                             last_be_refresh = 0.0
-                            # no-entry-zone follows on its own refresh below
+                            # no-entry-zone and lost & found follow on their own refresh below
                             last_nez_refresh = 0.0
+                            last_lf_refresh = 0.0
                     # (no per-frame shoplifting counter needed — dedup is time-based now)
                     
                     # Buffer resized frame to save memory
@@ -1837,6 +1978,54 @@ class StreamProcessingService:
                                 )
                         except Exception as e:
                             logger.error(f"No-entry-zone detection error for stream {stream_id_str}: {e}")
+
+                    # ===== LOST & FOUND (time-throttled, gated by is_lost_found_camera) =====
+                    if time.monotonic() - last_lf_refresh >= lf_refresh_every:
+                        last_lf_refresh = time.monotonic()
+                        try:
+                            from app.services.lost_found_service import lost_found_service
+                            lf_now = (
+                                'lost_found' in allowed_features
+                                and await lost_found_service.is_camera_enabled(stream_id)
+                            )
+                            if lf_now:
+                                self.lost_found_engine.set_config(
+                                    stream_id_str, await lost_found_service.get_config(stream_id),
+                                )
+                            elif lost_found_enabled:
+                                logger.info(f"[lost-found] disabled on {stream_id_str}, flushing clips")
+                                await self._handle_lost_found_result(
+                                    stream_id, stream_id_str,
+                                    self.lost_found_engine.release_stream(stream_id_str),
+                                    camera_name, workspace_id, owner_id,
+                                )
+                            lost_found_enabled = lf_now
+                        except Exception as e:
+                            logger.error(f"[lost-found] config refresh failed for {stream_id_str}: {e}")
+
+                    if (
+                        lost_found_enabled
+                        and time.monotonic() - last_lf_frame >= lf_interval
+                        and self.lost_found_engine.has_stream(stream_id_str)
+                    ):
+                        last_lf_frame = time.monotonic()
+                        engine = self.lost_found_engine
+                        if not engine.is_loaded and not lost_found_engine_load_attempted:
+                            lost_found_engine_load_attempted = True
+                            try:
+                                await loop.run_in_executor(thread_pool, engine.load_models)
+                            except Exception as _le:
+                                logger.error(f"[lost-found] lazy load_models failed: {_le}")
+                        try:
+                            lf_result = await loop.run_in_executor(
+                                thread_pool, engine.process_frame, stream_id_str, frame,
+                            )
+                            if lf_result["events"] or lf_result["clips"]:
+                                await self._handle_lost_found_result(
+                                    stream_id, stream_id_str, lf_result, camera_name, workspace_id, owner_id,
+                                )
+                        except Exception as e:
+                            logger.error(f"Lost & found detection error for stream {stream_id_str}: {e}")
 
                     # ---------- Shoplifting Event DB Insertion ----------
                     # Save at most once per 5 minutes per stream (matches DB dedup window)
@@ -2157,6 +2346,16 @@ class StreamProcessingService:
                     )
             except Exception as cleanup_err:
                 logger.error(f"Error closing no-entry-zone events: {cleanup_err}")
+
+            # Flush lost & found's partial evidence clips for events already recorded.
+            try:
+                lf_final = self.lost_found_engine.release_stream(stream_id_str)
+                if lf_final["clips"]:
+                    await self._handle_lost_found_result(
+                        stream_id, stream_id_str, lf_final, camera_name, workspace_id, owner_id,
+                    )
+            except Exception as cleanup_err:
+                logger.error(f"Error flushing lost & found clips: {cleanup_err}")
 
             try:
                 if shared_stream:
