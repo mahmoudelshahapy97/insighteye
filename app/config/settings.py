@@ -493,7 +493,7 @@ class Settings(BaseSettings):
     # Detection runs at a low confidence on purpose: ByteTrack's thresholds in
     # app/services/lost_found/bytetrack_lostfound.yaml decide what starts a track.
     lost_found_confidence: float = 0.05
-    lost_found_process_fps: float = 5.0              # frames per second fed to the engine
+    lost_found_frame_stride: int = 2                 # feed every Nth captured frame (independent of frame_skip, like shoplifting)
     lost_found_config_refresh_seconds: float = 10.0  # re-read camera flag + ROI while streaming
     lost_found_agnostic_nms_iou: float = 0.7         # one box per object across classes
     lost_found_object_class_ids: List[int] = [24, 25, 26, 28, 67]  # backpack, umbrella, handbag, suitcase, cell phone
@@ -506,7 +506,7 @@ class Settings(BaseSettings):
     lost_found_clip_post_seconds: float = 10.0
     lost_found_crop_context_ratio: float = 0.15
     lost_found_max_upload_bytes: int = 10 * 1024 * 1024
-    # Abandonment rules (each overridable per camera in lost_found_camera_config.settings).
+    # Abandonment rules (applied to every Lost & Found camera).
     lost_found_static_tolerance_px: float = 25.0
     lost_found_static_tolerance_ratio: float = 0.5
     lost_found_static_window_seconds: float = 3.0

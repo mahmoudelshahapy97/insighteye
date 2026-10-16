@@ -91,49 +91,16 @@ async def test_resolve_rejects_unknown_status(client, mocker):
     resolve.assert_not_awaited()
 
 
-ROI = {"polygon": [[0, 0], [100, 0], [100, 100]], "ref_width": 640, "ref_height": 360}
-
-
-@pytest.mark.parametrize("camera, status", [
-    (None, 404),                                            # not in the workspace
-    ({"name": "cam", "is_lost_found_camera": False}, 409),  # Lost & Found not enabled
+@pytest.mark.parametrize("method, suffix", [
+    ("get", "polygon"), ("put", "polygon"), ("delete", "polygon"),
+    ("get", "settings"), ("put", "settings"),
+    ("get", "snapshot"), ("get", "live"), ("get", "status"),
 ])
-async def test_roi_needs_a_workspace_camera_with_lost_found_enabled(client, mocker, camera, status):
-    mocker.patch.object(mod, "_require_role", mocker.AsyncMock())
-    mocker.patch.object(mod.lost_found_service, "get_camera", mocker.AsyncMock(return_value=camera))
-    upsert = mocker.patch.object(mod.lost_found_service, "upsert_config", mocker.AsyncMock())
+async def test_per_camera_roi_and_settings_endpoints_are_gone(client, method, suffix):
+    """Detection always covers the whole frame with the default rules."""
     async with client as c:
-        assert (await c.put(f"/lost-found/cameras/{uuid4()}/polygon", json=ROI)).status_code == status
-    upsert.assert_not_awaited()
-
-
-async def test_roi_save_keeps_settings_and_hot_reloads(client, mocker):
-    mocker.patch.object(mod, "_require_role", mocker.AsyncMock())
-    mocker.patch.object(mod.lost_found_service, "get_camera",
-                        mocker.AsyncMock(return_value={"name": "cam", "is_lost_found_camera": True}))
-    stream = uuid4()
-    saved = {"stream_id": stream, "roi": [[0, 0], [100, 0], [100, 100]], "ref_width": 640, "ref_height": 360,
-             "settings": {"abandon_seconds": 60}, "is_active": True}
-    upsert = mocker.patch.object(mod.lost_found_service, "upsert_config", mocker.AsyncMock(return_value=saved))
-    reload = mocker.patch.object(mod, "_hot_reload")
-    async with client as c:
-        r = await c.put(f"/lost-found/cameras/{stream}/polygon",
-                        json={"polygon": saved["roi"], "ref_width": 640, "ref_height": 360})
-    assert r.status_code == 200
-    assert r.json()["point_count"] == 3
-    kw = upsert.await_args.kwargs
-    assert kw["replace_roi"] is True and kw["replace_settings"] is False and kw["workspace_id"] == WORKSPACE
-    reload.assert_called_once_with(stream, saved)
-
-
-async def test_settings_reject_unknown_and_negative_rules(client, mocker):
-    mocker.patch.object(mod, "_require_role", mocker.AsyncMock())
-    upsert = mocker.patch.object(mod.lost_found_service, "upsert_config", mocker.AsyncMock())
-    async with client as c:
-        r1 = await c.put(f"/lost-found/cameras/{uuid4()}/settings", json={"settings": {"nope": 1}})
-        r2 = await c.put(f"/lost-found/cameras/{uuid4()}/settings", json={"settings": {"abandon_seconds": -1}})
-    assert r1.status_code == 422 and r2.status_code == 422
-    upsert.assert_not_awaited()
+        r = await c.request(method.upper(), f"/lost-found/cameras/{uuid4()}/{suffix}", json={})
+    assert r.status_code in (404, 405)
 
 
 async def test_lost_report_needs_a_photo_or_a_description(client, mocker):
