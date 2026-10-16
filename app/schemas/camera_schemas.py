@@ -7,7 +7,7 @@ from uuid import UUID
 
 # Fixed set of detection model tags a camera can be assigned. Keep this in sync
 # with cameraModelTypesArr in the frontend's StaticVariables.js.
-DETECTION_MODEL_TYPES = ['fire_smoke', 'shoplifting', 'people_counting', 'blocked_exit', 'no_entry_zone']
+DETECTION_MODEL_TYPES = ['fire_smoke', 'shoplifting', 'people_counting', 'blocked_exit', 'no_entry_zone', 'lost_found']
 
 class StreamQueryParams(BaseModel):
     frame_delay: Optional[float] = 0
@@ -39,6 +39,7 @@ class StreamCreate(BaseModel):
     is_blocked_exit_camera: bool = Field(default=False)
     is_no_entry_zone_camera: bool = Field(default=False)
     is_people_counting_camera: bool = Field(default=False)
+    is_lost_found_camera: bool = Field(default=False)
     detection_models: Optional[List[str]] = Field(default=None)
 
     @validator('detection_models')
@@ -75,6 +76,7 @@ class StreamUpdate(BaseModel):
     is_blocked_exit_camera: Optional[bool] = Field(default=None)
     is_no_entry_zone_camera: Optional[bool] = Field(default=None)
     is_people_counting_camera: Optional[bool] = Field(default=None)
+    is_lost_found_camera: Optional[bool] = Field(default=None)
     detection_models: Optional[List[str]] = Field(default=None)
 
     @validator('detection_models')
@@ -116,6 +118,7 @@ class StreamCreateWithLocation(BaseModel):
     is_blocked_exit_camera: bool = False
     is_no_entry_zone_camera: bool = False
     is_people_counting_camera: bool = False
+    is_lost_found_camera: bool = False
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -135,6 +138,7 @@ class StreamUpdateWithLocation(BaseModel):
     is_blocked_exit_camera: Optional[bool] = None
     is_no_entry_zone_camera: Optional[bool] = None
     is_people_counting_camera: Optional[bool] = None
+    is_lost_found_camera: Optional[bool] = None
     location: Optional[str] = Field(None, max_length=100)
     area: Optional[str] = Field(None, max_length=100)
     building: Optional[str] = Field(None, max_length=100)
@@ -208,6 +212,7 @@ class CameraDetailedResponse(BaseModel):
     is_blocked_exit_camera: bool = Field(default=False, description="Whether blocked-exit detection is active for this camera")
     is_no_entry_zone_camera: bool = Field(default=False, description="Whether no-entry-zone detection is active for this camera")
     is_people_counting_camera: bool = Field(default=False, description="Whether people-count threshold alerts are active for this camera")
+    is_lost_found_camera: bool = Field(default=False, description="Whether lost & found (abandoned-object) detection is active for this camera")
     created_at: datetime = Field(..., description="Camera creation timestamp")
     updated_at: datetime = Field(..., description="Camera last update timestamp")
     last_activity: datetime = Field(..., description="Camera last activity timestamp")

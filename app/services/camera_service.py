@@ -75,9 +75,9 @@ class CameraService:
                  location, area, building, floor_level, zone, latitude, longitude,
                  count_threshold_greater, count_threshold_less, alert_enabled,
                  is_shoplifting_camera, is_blocked_exit_camera, is_no_entry_zone_camera,
-                 is_people_counting_camera, detection_models,
+                 is_people_counting_camera, is_lost_found_camera, detection_models,
                  created_at, updated_at, last_activity)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
             """
 
             await self.db_manager.execute_query(
@@ -94,6 +94,7 @@ class CameraService:
                     getattr(stream, 'is_blocked_exit_camera', False),
                     getattr(stream, 'is_no_entry_zone_camera', False),
                     getattr(stream, 'is_people_counting_camera', False),
+                    getattr(stream, 'is_lost_found_camera', False),
                     getattr(stream, 'detection_models', None) or [],
                     now_utc, now_utc, now_utc
                 )
@@ -121,7 +122,7 @@ class CameraService:
                        vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
                        vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
                        vs.is_shoplifting_camera, vs.is_blocked_exit_camera, vs.is_no_entry_zone_camera,
-                       vs.is_people_counting_camera, vs.detection_models,
+                       vs.is_people_counting_camera, vs.is_lost_found_camera, vs.detection_models,
                        w.name as workspace_name
                 FROM video_stream vs
                 JOIN users u ON vs.user_id = u.user_id
@@ -161,6 +162,7 @@ class CameraService:
                     "is_blocked_exit_camera": s["is_blocked_exit_camera"],
                     "is_no_entry_zone_camera": s["is_no_entry_zone_camera"],
                     "is_people_counting_camera": s["is_people_counting_camera"],
+                    "is_lost_found_camera": s["is_lost_found_camera"],
                     "detection_models": s["detection_models"],
                     "created_at": s["created_at"].isoformat() if s["created_at"] else None,
                     "updated_at": s["updated_at"].isoformat() if s["updated_at"] else None,
@@ -285,6 +287,11 @@ class CameraService:
             if hasattr(stream_update, 'is_people_counting_camera') and stream_update.is_people_counting_camera is not None:
                 set_clauses.append(f"is_people_counting_camera = ${param_idx}")
                 params.append(stream_update.is_people_counting_camera)
+                param_idx += 1
+
+            if hasattr(stream_update, 'is_lost_found_camera') and stream_update.is_lost_found_camera is not None:
+                set_clauses.append(f"is_lost_found_camera = ${param_idx}")
+                params.append(stream_update.is_lost_found_camera)
                 param_idx += 1
 
             if getattr(stream_update, 'detection_models', None) is not None:
@@ -1214,4 +1221,4 @@ class CameraService:
         )
         return rows_affected > 0
                 
-camera_service = CameraService()
+camera_service = CameraService()

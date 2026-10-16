@@ -26,6 +26,7 @@ FEATURES: Tuple[str, ...] = (
     "no_entry_zone",
     "blocked_exit",
     "gender",
+    "lost_found",
 )
 ALL_FEATURES: FrozenSet[str] = frozenset(FEATURES)
 

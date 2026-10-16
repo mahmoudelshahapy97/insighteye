@@ -126,7 +126,7 @@ async def get_all_streams(
                    vs.location, vs.area, vs.building, vs.floor_level, vs.zone, vs.latitude, vs.longitude,
                    vs.count_threshold_greater, vs.count_threshold_less, vs.alert_enabled,
                    vs.is_shoplifting_camera, vs.is_blocked_exit_camera, vs.is_no_entry_zone_camera,
-                   vs.is_people_counting_camera, vs.detection_models,
+                   vs.is_people_counting_camera, vs.is_lost_found_camera, vs.detection_models,
                    w.enabled_features AS workspace_features
             FROM video_stream vs
             JOIN users u ON vs.user_id = u.user_id
@@ -179,6 +179,7 @@ async def get_all_streams(
                 "is_blocked_exit_camera": s["is_blocked_exit_camera"],
                 "is_no_entry_zone_camera": s["is_no_entry_zone_camera"],
                 "is_people_counting_camera": s["is_people_counting_camera"],
+                "is_lost_found_camera": s["is_lost_found_camera"],
                 "detection_models": s["detection_models"],
                 "workspace_features": list(s["workspace_features"] or []),
                 "created_at": s["created_at"].isoformat() if s["created_at"] else None,
@@ -200,6 +201,7 @@ _FLAG_FEATURES = {
     "is_blocked_exit_camera": "blocked_exit",
     "is_no_entry_zone_camera": "no_entry_zone",
     "is_people_counting_camera": "people_counting",
+    "is_lost_found_camera": "lost_found",
 }
 
 
