@@ -4,12 +4,7 @@ Lost & Found API
 ================
 Abandoned-object detection, the found-items gallery, lost-item reports and matching.
 
-/cameras                          - workspace cameras with their lost & found config
-/cameras/{stream_id}/polygon      - get / replace / clear the region of interest (shared polygon-editor shape)
-/cameras/{stream_id}/settings     - abandonment rule overrides (+ server defaults)
-/cameras/{stream_id}/snapshot     - JPEG still for drawing the ROI
-/cameras/{stream_id}/live         - latest annotated frame (tracked objects coloured by status)
-/cameras/{stream_id}/status       - tracked objects and their abandonment status
+/cameras                          - workspace cameras and their Lost & Found flag (filter dropdowns)
 /events                           - abandoned events (IncidentVideosTab contract)
 /events/stats                     - counters for the tab header
 /events/{event_id}                - one event with presigned media
@@ -24,21 +19,20 @@ Abandoned-object detection, the found-items gallery, lost-item reports and match
 /analytics/incidents-per-camera   - shared chart: events per camera
 /analytics/confidence-audit       - shared chart: model confidence audit
 
-The ROI and settings can only be changed on cameras with Lost & Found enabled.
+Detection always covers the whole frame with the default abandonment rules; it is
+turned on per camera with the is_lost_found_camera flag (Workspace -> Cameras).
 """
 
 import asyncio
 import logging
-from dataclasses import asdict
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
 from app.config.settings import config
-from app.schemas.evidence_schema import CameraPolygonRequest
 from app.schemas.lost_found_schema import (
     ConfirmMatchRequest,
     EventStatus,
@@ -46,18 +40,13 @@ from app.schemas.lost_found_schema import (
     FoundStatusRequest,
     LostStatus,
     LostStatusRequest,
-    LostFoundSettingsRequest,
     ResolveLostFoundEventRequest,
 )
-from app.services import camera_runtime
-from app.services.database import db_manager
 from app.services.feature_service import require_feature
-from app.services.lost_found.abandonment import AbandonmentParams
 from app.services.lost_found.imaging import decode_jpeg
 from app.services.lost_found_service import lost_found_service
 from app.services.session_service import session_manager
 from app.services.workspace_service import workspace_service
-from app.utils.permission_utils import check_workspace_access
 
 logger = logging.getLogger(__name__)
 
@@ -80,29 +69,6 @@ async def get_workspace_id_for_user(username: str) -> UUID:
     return workspace_id_obj
 
 
-async def _require_camera(stream_id: UUID, workspace_id: UUID) -> Dict[str, Any]:
-    """404 unless the camera belongs to the caller's workspace."""
-    camera = await lost_found_service.get_camera(workspace_id, stream_id)
-    if not camera:
-        raise HTTPException(status_code=404, detail="Camera not found in this workspace.")
-    return camera
-
-
-async def _require_enabled_camera(stream_id: UUID, workspace_id: UUID) -> Dict[str, Any]:
-    """404 outside the workspace; 409 when Lost & Found is not enabled on the camera."""
-    camera = await _require_camera(stream_id, workspace_id)
-    if not camera.get("is_lost_found_camera"):
-        raise HTTPException(status_code=409, detail="Lost & Found is not enabled on this camera.")
-    return camera
-
-
-async def _require_role(current_user: Dict, workspace_id: UUID, role: str) -> None:
-    await check_workspace_access(
-        db_manager, current_user["user_id"], workspace_id,
-        required_role=role, system_role=current_user.get("role"),
-    )
-
-
 async def _sign(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
@@ -116,14 +82,6 @@ async def _signed(row: Dict[str, Any], *columns: str) -> Dict[str, Any]:
     for column in columns:
         row[column] = await _sign(row.get(column))
     return row
-
-
-def _hot_reload(stream_id: UUID, cfg: Optional[Dict[str, Any]]) -> None:
-    try:
-        from app.services.lost_found_inference import lost_found_engine
-        lost_found_engine.reload_config(str(stream_id), cfg)
-    except Exception as e:
-        logger.warning(f"Failed to hot-reload lost & found config for {stream_id}: {e}")
 
 
 def _to_json_safe(obj):
@@ -160,30 +118,8 @@ def _filters(
     )
 
 
-def _polygon_response(stream_id: UUID, camera_name: Optional[str], cfg: Optional[Dict[str, Any]]) -> Dict:
-    roi = (cfg or {}).get("roi")
-    return {
-        "stream_id": stream_id, "camera_name": camera_name, "id": stream_id,
-        "polygon": roi or None,
-        "ref_width": (cfg or {}).get("ref_width") if roi else None,
-        "ref_height": (cfg or {}).get("ref_height") if roi else None,
-        "point_count": len(roi or []),
-        "is_active": (cfg or {}).get("is_active"),
-        "updated_at": (cfg or {}).get("updated_at"),
-    }
-
-
-def _settings_response(cfg: Optional[Dict[str, Any]]) -> Dict:
-    return {
-        "settings": (cfg or {}).get("settings") or {},
-        "is_active": (cfg or {}).get("is_active", True),
-        "defaults": asdict(AbandonmentParams()),
-        "updated_at": (cfg or {}).get("updated_at"),
-    }
-
-
 # ─────────────────────────────────────────────
-# Cameras & configuration
+# Cameras
 # ─────────────────────────────────────────────
 
 @router.get("/cameras")
@@ -193,157 +129,6 @@ async def list_cameras(
 ):
     workspace_id = await get_workspace_id_for_user(current_user["username"])
     return _to_json_safe(await lost_found_service.list_cameras(workspace_id, enabled_only=enabled_only))
-
-
-@router.get("/cameras/{stream_id}/polygon")
-async def get_camera_polygon(
-    stream_id: UUID,
-    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
-):
-    """The camera's region of interest in the shared editor shape; ``polygon`` is null
-    when detection covers the whole frame."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    camera = await _require_camera(stream_id, workspace_id)
-    cfg = await lost_found_service.get_config(stream_id, workspace_id)
-    return _to_json_safe(_polygon_response(stream_id, camera.get("name"), cfg))
-
-
-@router.put("/cameras/{stream_id}/polygon")
-async def set_camera_polygon(
-    stream_id: UUID,
-    request: CameraPolygonRequest,
-    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
-):
-    """Replace the region of interest (settings are kept). Workspace admins only, and
-    only on cameras with Lost & Found enabled."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    await _require_role(current_user, workspace_id, "admin")
-    camera = await _require_enabled_camera(stream_id, workspace_id)
-    row = await lost_found_service.upsert_config(
-        stream_id=stream_id, workspace_id=workspace_id, roi=request.polygon,
-        ref_width=request.ref_width, ref_height=request.ref_height, settings=None,
-        is_active=request.is_active, replace_roi=True, replace_settings=False,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Camera not found in this workspace.")
-    _hot_reload(stream_id, row)
-    return _to_json_safe(_polygon_response(stream_id, camera.get("name"), row))
-
-
-@router.delete("/cameras/{stream_id}/polygon")
-async def clear_camera_polygon(
-    stream_id: UUID,
-    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
-):
-    """Remove the region of interest: detection covers the whole frame again."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    await _require_role(current_user, workspace_id, "admin")
-    camera = await _require_enabled_camera(stream_id, workspace_id)
-    row = await lost_found_service.upsert_config(
-        stream_id=stream_id, workspace_id=workspace_id, roi=None, ref_width=None, ref_height=None,
-        settings=None, is_active=None, replace_roi=True, replace_settings=False,
-    )
-    _hot_reload(stream_id, row)
-    return _to_json_safe(_polygon_response(stream_id, camera.get("name"), row))
-
-
-@router.get("/cameras/{stream_id}/settings")
-async def get_camera_settings(
-    stream_id: UUID,
-    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
-):
-    """The camera's abandonment rule overrides, plus the server defaults they replace."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    await _require_camera(stream_id, workspace_id)
-    return _to_json_safe(_settings_response(await lost_found_service.get_config(stream_id, workspace_id)))
-
-
-@router.put("/cameras/{stream_id}/settings")
-async def set_camera_settings(
-    stream_id: UUID,
-    request: LostFoundSettingsRequest,
-    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
-):
-    """Replace the camera's rule overrides (the ROI is kept). Workspace admins only."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    await _require_role(current_user, workspace_id, "admin")
-    await _require_enabled_camera(stream_id, workspace_id)
-    row = await lost_found_service.upsert_config(
-        stream_id=stream_id, workspace_id=workspace_id, roi=None, ref_width=None, ref_height=None,
-        settings=request.settings, is_active=request.is_active, replace_roi=False, replace_settings=True,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Camera not found in this workspace.")
-    _hot_reload(stream_id, row)
-    return _to_json_safe(_settings_response(row))
-
-
-@router.get("/cameras/{stream_id}/snapshot", response_class=Response)
-async def get_camera_snapshot(
-    stream_id: UUID,
-    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
-):
-    """A JPEG still: the running stream's latest frame, or a one-off grab from the
-    camera when it isn't streaming (so an ROI can be drawn on a stopped camera)."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    source = await lost_found_service.get_camera_source(stream_id, workspace_id)
-    if not source:
-        raise HTTPException(status_code=404, detail="Camera not found in this workspace.")
-    if not source.get("path"):
-        raise HTTPException(status_code=502, detail="Camera has no source configured")
-    jpeg, info = await camera_runtime.live_or_grab_jpeg(source["path"])
-    if jpeg is None:
-        raise HTTPException(status_code=502, detail=f"Camera unreachable: {info['error']}")
-    # Same headers as the blocked-exit / no-entry-zone snapshot, so the UI shares one editor.
-    return Response(
-        content=jpeg,
-        media_type="image/jpeg",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Frame-Source": info["frame_source"],
-            "X-Frame-Size": f"{info['width']}x{info['height']}",
-            "X-Frame-Width": str(info["width"]),
-            "X-Frame-Height": str(info["height"]),
-            "Access-Control-Expose-Headers": "X-Frame-Source, X-Frame-Size, X-Frame-Width, X-Frame-Height",
-        },
-    )
-
-
-@router.get("/cameras/{stream_id}/live", response_class=Response)
-async def get_camera_live(
-    stream_id: UUID,
-    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
-):
-    """The latest annotated frame: every tracked object coloured by status (moving,
-    attended, unattended, abandoned). 404 unless detection runs on this server."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    await _require_camera(stream_id, workspace_id)
-    from app.services.lost_found_inference import lost_found_engine
-    jpeg = await asyncio.to_thread(lost_found_engine.live_jpeg, str(stream_id))
-    if jpeg is None:
-        raise HTTPException(status_code=404, detail="Lost & Found is not running on this camera.")
-    return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
-
-
-@router.get("/cameras/{stream_id}/status")
-async def get_camera_status(
-    stream_id: UUID,
-    current_user: Dict = Depends(session_manager.get_current_user_full_data_dependency),
-):
-    """Tracked objects and their abandonment status (``running`` false when detection
-    does not run on this server)."""
-    workspace_id = await get_workspace_id_for_user(current_user["username"])
-    camera = await _require_camera(stream_id, workspace_id)
-    from app.services.lost_found_inference import lost_found_engine
-    objects = lost_found_engine.tracked_objects(str(stream_id))
-    return _to_json_safe({
-        "stream_id": stream_id,
-        "camera_name": camera.get("name"),
-        "is_streaming": camera.get("is_streaming"),
-        "is_lost_found_camera": camera.get("is_lost_found_camera"),
-        "running": objects is not None,
-        "tracked_objects": objects or [],
-    })
 
 
 # ─────────────────────────────────────────────

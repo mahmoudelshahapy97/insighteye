@@ -1709,21 +1709,16 @@ class StreamProcessingService:
             nez_refresh_every = float(getattr(config, "no_entry_zone_zone_refresh_seconds", 10.0))
             last_nez_refresh = time.monotonic()
 
-            # Lost & found: no ROI is needed (whole frame by default), so the camera flag
-            # alone turns it on; flag and config are re-read like no-entry-zone's.
+            # Lost & found always watches the whole frame with the default rules (no ROI or
+            # per-camera overrides), so the camera flag alone turns it on; the flag is
+            # re-read like no-entry-zone's.
             if lost_found_enabled:
-                try:
-                    from app.services.lost_found_service import lost_found_service
-                    self.lost_found_engine.set_config(
-                        stream_id_str, await lost_found_service.get_config(stream_id),
-                    )
-                except Exception as e:
-                    logger.error(f"[lost-found] failed to load config for {stream_id_str}: {e}")
-                    lost_found_enabled = False
+                self.lost_found_engine.set_config(stream_id_str, None)
             lf_refresh_every = float(getattr(config, "lost_found_config_refresh_seconds", 10.0))
             last_lf_refresh = time.monotonic()
-            lf_interval = 1.0 / max(0.1, float(getattr(config, "lost_found_process_fps", 5.0)))
-            last_lf_frame = 0.0
+            # Like shoplifting: a frame-count stride, never gated by frame_skip, so the
+            # tracker sees the drop and the owner walking away instead of sparse snapshots.
+            lf_frame_stride = max(1, int(getattr(config, "lost_found_frame_stride", 2)))
 
             # -------------------- SOURCE --------------------
             if not source.startswith("rtsp://"):
@@ -1979,7 +1974,7 @@ class StreamProcessingService:
                         except Exception as e:
                             logger.error(f"No-entry-zone detection error for stream {stream_id_str}: {e}")
 
-                    # ===== LOST & FOUND (time-throttled, gated by is_lost_found_camera) =====
+                    # ===== LOST & FOUND (every lf_frame_stride frames, gated by is_lost_found_camera) =====
                     if time.monotonic() - last_lf_refresh >= lf_refresh_every:
                         last_lf_refresh = time.monotonic()
                         try:
@@ -1988,11 +1983,9 @@ class StreamProcessingService:
                                 'lost_found' in allowed_features
                                 and await lost_found_service.is_camera_enabled(stream_id)
                             )
-                            if lf_now:
-                                self.lost_found_engine.set_config(
-                                    stream_id_str, await lost_found_service.get_config(stream_id),
-                                )
-                            elif lost_found_enabled:
+                            if lf_now and not lost_found_enabled:
+                                self.lost_found_engine.set_config(stream_id_str, None)
+                            elif not lf_now and lost_found_enabled:
                                 logger.info(f"[lost-found] disabled on {stream_id_str}, flushing clips")
                                 await self._handle_lost_found_result(
                                     stream_id, stream_id_str,
@@ -2005,10 +1998,9 @@ class StreamProcessingService:
 
                     if (
                         lost_found_enabled
-                        and time.monotonic() - last_lf_frame >= lf_interval
+                        and frame_count % lf_frame_stride == 0
                         and self.lost_found_engine.has_stream(stream_id_str)
                     ):
-                        last_lf_frame = time.monotonic()
                         engine = self.lost_found_engine
                         if not engine.is_loaded and not lost_found_engine_load_attempted:
                             lost_found_engine_load_attempted = True

@@ -156,29 +156,8 @@ class LostFoundService:
         return conditions, params
 
     # =========================================================
-    # Cameras & config
+    # Cameras
     # =========================================================
-
-    async def get_camera(self, workspace_id: UUID, stream_id: UUID) -> Optional[Dict[str, Any]]:
-        return await self.db.execute_query(
-            """
-            SELECT stream_id, workspace_id, name, location, area, building, floor_level, zone,
-                   status, is_streaming, is_lost_found_camera
-            FROM video_stream
-            WHERE stream_id = $1 AND workspace_id = $2
-            """,
-            (stream_id, workspace_id),
-            fetch_one=True,
-        )
-
-    async def get_camera_source(self, stream_id: UUID, workspace_id: UUID) -> Optional[Dict[str, Any]]:
-        """Internal only: the camera's source path, which may embed credentials.
-        Callers must never return it to a client."""
-        return await self.db.execute_query(
-            "SELECT stream_id, name, path, type FROM video_stream WHERE stream_id = $1 AND workspace_id = $2",
-            (stream_id, workspace_id),
-            fetch_one=True,
-        )
 
     async def is_camera_enabled(self, stream_id: UUID) -> bool:
         row = await self.db.execute_query(
@@ -189,80 +168,25 @@ class LostFoundService:
         return bool(row and row.get("is_lost_found_camera"))
 
     async def list_cameras(self, workspace_id: UUID, *, enabled_only: bool = True) -> List[Dict[str, Any]]:
-        """Workspace cameras with their lost & found config and event counts."""
+        """Workspace cameras with their lost & found flag and event counts."""
         where = "vs.workspace_id = $1" + (" AND vs.is_lost_found_camera" if enabled_only else "")
         rows = await self.db.execute_query(
             f"""
             SELECT vs.stream_id, vs.name AS camera_name, vs.location AS camera_location,
                    vs.area AS camera_area, vs.building, vs.floor_level, vs.zone,
                    vs.status AS stream_status, vs.is_streaming, vs.is_lost_found_camera,
-                   cfg.roi, cfg.ref_width, cfg.ref_height, cfg.settings,
-                   COALESCE(cfg.is_active, TRUE) AS config_active, cfg.updated_at AS config_updated_at,
                    (SELECT COUNT(*) FROM lost_found_events e
                      WHERE e.stream_id = vs.stream_id AND e.status = 'open')  AS open_events,
                    (SELECT MAX(e.event_timestamp) FROM lost_found_events e
                      WHERE e.stream_id = vs.stream_id)                         AS last_event_at
             FROM video_stream vs
-            LEFT JOIN lost_found_camera_config cfg ON cfg.stream_id = vs.stream_id
             WHERE {where}
             ORDER BY vs.is_lost_found_camera DESC, vs.name
             """,
             (workspace_id,),
             fetch_all=True,
         ) or []
-        return [_decode(r, "roi", "settings") for r in rows]
-
-    async def get_config(self, stream_id: UUID, workspace_id: Optional[UUID] = None) -> Optional[Dict[str, Any]]:
-        params: tuple = (stream_id,) if workspace_id is None else (stream_id, workspace_id)
-        row = await self.db.execute_query(
-            "SELECT stream_id, workspace_id, roi, ref_width, ref_height, settings, is_active, updated_at "
-            "FROM lost_found_camera_config WHERE stream_id = $1"
-            + ("" if workspace_id is None else " AND workspace_id = $2"),
-            params,
-            fetch_one=True,
-        )
-        return _decode(row, "roi", "settings")
-
-    async def upsert_config(
-        self,
-        *,
-        stream_id: UUID,
-        workspace_id: UUID,
-        roi: Optional[List[List[float]]],
-        ref_width: Optional[int],
-        ref_height: Optional[int],
-        settings: Optional[Dict[str, Any]],
-        is_active: Optional[bool],
-        replace_roi: bool = True,
-        replace_settings: bool = True,
-    ) -> Optional[Dict[str, Any]]:
-        """Create or update a camera's config. ``replace_roi`` / ``replace_settings``
-        false keeps the stored value, so the ROI editor and the threshold form can save
-        independently."""
-        row = await self.db.execute_query(
-            """
-            INSERT INTO lost_found_camera_config
-                (stream_id, workspace_id, roi, ref_width, ref_height, settings, is_active)
-            SELECT vs.stream_id, vs.workspace_id, $3::jsonb, $4::int, $5::int, COALESCE($6::jsonb, '{}'::jsonb),
-                   COALESCE($7::boolean, TRUE)
-            FROM video_stream vs WHERE vs.stream_id = $1 AND vs.workspace_id = $2
-            ON CONFLICT (stream_id) DO UPDATE SET
-                roi        = CASE WHEN $8::boolean THEN EXCLUDED.roi        ELSE lost_found_camera_config.roi END,
-                ref_width  = CASE WHEN $8 THEN EXCLUDED.ref_width  ELSE lost_found_camera_config.ref_width END,
-                ref_height = CASE WHEN $8 THEN EXCLUDED.ref_height ELSE lost_found_camera_config.ref_height END,
-                settings   = CASE WHEN $9::boolean THEN EXCLUDED.settings   ELSE lost_found_camera_config.settings END,
-                is_active  = COALESCE($7, lost_found_camera_config.is_active)
-            RETURNING stream_id, workspace_id, roi, ref_width, ref_height, settings, is_active, updated_at
-            """,
-            (
-                stream_id, workspace_id,
-                json.dumps(roi) if roi else None, ref_width, ref_height,
-                json.dumps(settings) if settings is not None else None, is_active,
-                replace_roi, replace_settings,
-            ),
-            fetch_one=True,
-        )
-        return _decode(row, "roi", "settings")
+        return [dict(r) for r in rows]
 
     # =========================================================
     # Events (written by the stream processor)
